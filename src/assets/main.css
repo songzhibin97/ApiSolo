@@ -1,0 +1,187 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --bg-primary: #1a1a2e;
+  --bg-secondary: #16213e;
+  --bg-surface: #0f3460;
+  --accent: #e94560;
+  --text-primary: #eaeaea;
+  --text-secondary: #94a3b8;
+  --border: #2a2a4a;
+  --app-font-size: 14px;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg-primary: #1a1a2e;
+  --bg-secondary: #16213e;
+  --bg-surface: #0f3460;
+  --accent: #e94560;
+  --text-primary: #eaeaea;
+  --text-secondary: #94a3b8;
+  --border: #2a2a4a;
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+  --bg-primary: #ffffff;
+  --bg-secondary: #f8fafc;
+  --bg-surface: #e2e8f0;
+  --accent: #e94560;
+  --text-primary: #1e293b;
+  --text-secondary: #64748b;
+  --border: #e2e8f0;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+body {
+  margin: 0;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: var(--app-font-size);
+  font-family:
+    "IBM Plex Sans",
+    "SF Pro Text",
+    "Segoe UI",
+    sans-serif;
+  line-height: 1.45;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+#app {
+  height: 100%;
+}
+
+.splitpanes {
+  background: var(--bg-primary);
+}
+
+.splitpanes__pane {
+  background: transparent;
+}
+
+.splitpanes--vertical > .splitpanes__splitter {
+  width: 2px;
+  background: var(--border);
+  position: relative;
+  transition:
+    background-color 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.splitpanes--vertical > .splitpanes__splitter::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: transparent;
+  transition: background-color 160ms ease;
+}
+
+.splitpanes--vertical > .splitpanes__splitter:hover,
+.splitpanes--vertical > .splitpanes__splitter:focus-visible {
+  background: color-mix(in srgb, var(--accent) 68%, white 32%);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.splitpanes--vertical > .splitpanes__splitter:hover::before,
+.splitpanes--vertical > .splitpanes__splitter:focus-visible::before {
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+.splitpanes--horizontal > .splitpanes__splitter {
+  height: 2px;
+  background: var(--border);
+  position: relative;
+  transition:
+    background-color 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.splitpanes--horizontal > .splitpanes__splitter:hover,
+.splitpanes--horizontal > .splitpanes__splitter:focus-visible {
+  background: color-mix(in srgb, var(--accent) 68%, white 32%);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.cm-editor .cm-scroller {
+  display: flex !important;
+  align-items: flex-start !important;
+  font-size: 13px !important;
+  line-height: 1.5 !important;
+}
+
+.cm-editor,
+.cm-editor *,
+.cm-editor.cm-focused,
+.cm-editor .cm-content,
+.cm-editor .cm-scroller {
+  outline: none !important;
+  box-shadow: none !important;
+}
+
+.cm-editor .cm-gutters {
+  display: flex !important;
+  align-items: stretch !important;
+  flex-shrink: 0 !important;
+  padding: 0.75rem 0 1rem !important;
+  background: var(--bg-primary) !important;
+  border-right: 1px solid color-mix(in srgb, var(--border) 52%, transparent) !important;
+}
+
+.cm-editor .cm-gutter {
+  display: flex !important;
+  flex-direction: column !important;
+  flex-shrink: 0 !important;
+}
+
+.cm-editor .cm-content {
+  flex-grow: 1 !important;
+  min-width: 0 !important;
+  padding: 0.75rem 0 1rem !important;
+}
+
+.cm-editor .cm-line {
+  padding: 0 1rem 0 0.75rem !important;
+}
+
+.cm-editor .cm-lineNumbers .cm-gutterElement {
+  min-width: 2.25rem !important;
+  padding: 0 0.6rem 0 0.75rem !important;
+  text-align: right !important;
+}
+
+.cm-editor .cm-foldGutter {
+  width: 1.15rem !important;
+}
+
+.cm-editor .cm-foldGutter .cm-gutterElement {
+  width: 1.15rem !important;
+  padding: 0 !important;
+  text-align: center !important;
+  color: color-mix(in srgb, var(--text-secondary) 58%, transparent) !important;
+}

@@ -1,0 +1,60 @@
+[package]
+name = "apisolo"
+version = "0.1.0"
+description = "A desktop API client for HTTP and WebSocket workflows"
+authors = ["Song Zhibin"]
+license = "Apache-2.0"
+edition = "2021"
+rust-version = "1.88"
+default-run = "apisolo"
+
+[features]
+default = []
+devtools = ["tauri/devtools"]
+dev-bridge = []
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "apisolo_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+axum = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "socks"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+uuid = { version = "1", features = ["v4"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+tower-http = { version = "0.6", features = ["cors"] }
+base64 = "0.22"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["linux-native-sync-persistent"] }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.5"
+
+[[example]]
+name = "dev_server"
+path = "examples/dev_server.rs"
+required-features = ["dev-bridge"]

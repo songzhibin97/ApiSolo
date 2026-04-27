@@ -1,0 +1,53 @@
+{
+  "name": "apisolo",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "PATH=\"$(dirname \"$(rustup which rustc)\"):$PATH\" tauri dev --features devtools,dev-bridge",
+    "dev:web": "node scripts/dev-web.mjs",
+    "dev:web:client": "vite",
+    "dev:web:api": "PATH=\"$(dirname \"$(rustup which rustc)\"):$PATH\" cargo run --manifest-path src-tauri/Cargo.toml --features dev-bridge --example dev_server",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:rust": "PATH=\"$(dirname \"$(rustup which rustc)\"):$PATH\" cargo test --manifest-path src-tauri/Cargo.toml -- --test-threads=1",
+    "audit": "npm audit --registry=https://registry.npmjs.org",
+    "audit:cargo": "cd src-tauri && PATH=\"$(dirname \"$(rustup which rustc)\"):$PATH\" cargo audit",
+    "tauri:build": "CI=true PATH=\"$(dirname \"$(rustup which rustc)\"):$PATH\" tauri build",
+    "release:check": "npm run test && npm run build && npm run test:rust && npm run audit && npm run audit:cargo",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@codemirror/lang-javascript": "^6.2.5",
+    "@codemirror/lang-json": "^6.0.2",
+    "@codemirror/lang-xml": "^6.1.0",
+    "@codemirror/search": "^6.6.0",
+    "@codemirror/state": "^6.6.0",
+    "@codemirror/theme-one-dark": "^6.1.3",
+    "@codemirror/view": "^6.40.0",
+    "@jitl/quickjs-wasmfile-release-sync": "^0.31.0",
+    "@tauri-apps/api": "^2",
+    "@vueuse/core": "^13.9.0",
+    "codemirror": "^6.0.2",
+    "lucide-vue-next": "^0.542.0",
+    "pinia": "^3.0.3",
+    "quickjs-emscripten-core": "^0.31.0",
+    "splitpanes": "^4.0.4",
+    "vue": "^3.5.13",
+    "vue-i18n": "^11.3.0",
+    "vue-router": "^4.6.3",
+    "yaml": "^2.8.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.2.2",
+    "@tauri-apps/cli": "^2",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "tailwindcss": "^4.2.2",
+    "typescript": "~5.6.2",
+    "vite": "^6.4.2",
+    "vitest": "^4.1.2",
+    "vue-tsc": "^2.1.10"
+  }
+}
