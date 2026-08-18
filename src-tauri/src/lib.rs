@@ -1218,7 +1218,39 @@ fn read_env_variables(file_path: &Path, secret: bool) -> Result<Vec<EnvVariable>
     Ok(variables)
 }
 
+/// Escapes a vault-key component so the three-part key stays unambiguously
+/// splittable: afterwards ':' only ever occurs as "\\:" and '\\' only as
+/// "\\\\". The third component is base64url, which contains neither.
+fn escape_vault_component(value: &str) -> String {
+    value.replace('\\', "\\\\").replace(':', "\\:")
+}
+
+/// `project : environment-slug : base64url(variable name)`.
+///
+/// The previous scheme replaced every non-ASCII-alphanumeric character with
+/// '_', which collapsed 生产 and 测试 to the same "__". Two visibly separate
+/// environments then shared one vault slot: saving one overwrote the other's
+/// credential, and deleting one deleted both. Names now survive verbatim, and
+/// slugifying here removes the old three-way disagreement between the save,
+/// load and delete paths over which spelling of the name to hash.
 fn vault_key_for(project_dir: &Path, env_name: &str, variable_key: &str) -> String {
+    let project = project_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("project");
+    let encoded_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(variable_key);
+
+    format!(
+        "{}:{}:{}",
+        escape_vault_component(project),
+        escape_vault_component(&slugify(env_name)),
+        encoded_key
+    )
+}
+
+/// The pre-D03 key shape. Kept for one purpose only — finding an existing
+/// entry so it can be copied forward. Nothing writes with it.
+fn legacy_vault_key_for(project_dir: &Path, env_name: &str, variable_key: &str) -> String {
     let project = project_dir
         .file_name()
         .and_then(|value| value.to_str())
@@ -9269,5 +9301,60 @@ mod tests {
             .map(|node| node.name.as_str())
             .collect();
         assert_eq!(children, vec!["List Users"]);
+    }
+
+    // ---------------------------------------------------------------- D03 §一
+    // Secret identity. Two CJK-named environments used to share one vault slot.
+
+    fn d03_project_dir(slug: &str) -> PathBuf {
+        PathBuf::from("/tmp/ApiSolo/projects").join(slug)
+    }
+
+    #[test]
+    fn test_vault_keys_are_distinct_for_cjk_environment_names() {
+        let project = d03_project_dir("my-api");
+        let production = vault_key_for(&project, "生产", "token");
+        let staging = vault_key_for(&project, "测试", "token");
+
+        assert_ne!(
+            production, staging,
+            "两个中文环境名共用了同一个密钥槽: {production}"
+        );
+    }
+
+    #[test]
+    fn test_vault_keys_are_distinct_for_cjk_project_names() {
+        let orders = vault_key_for(&d03_project_dir("订单服务"), "dev", "token");
+        let users = vault_key_for(&d03_project_dir("用户服务"), "dev", "token");
+
+        assert_ne!(orders, users, "两个中文项目名共用了同一个密钥槽: {orders}");
+    }
+
+    #[test]
+    fn test_vault_key_keeps_readable_non_ascii_components() {
+        assert_eq!(
+            vault_key_for(&d03_project_dir("my-api"), "生产", "token"),
+            "my-api:生产:dG9rZW4"
+        );
+    }
+
+    #[test]
+    fn test_vault_key_is_derived_from_environment_slug() {
+        let project = d03_project_dir("my-api");
+        let canonical = vault_key_for(&project, "staging", "token");
+
+        for spelling in ["Staging", "STAGING", "  staging  "] {
+            assert_eq!(
+                vault_key_for(&project, spelling, "token"),
+                canonical,
+                "{spelling} should address the same secret as staging"
+            );
+        }
+
+        assert_eq!(
+            vault_key_for(&project, "my env", "token"),
+            vault_key_for(&project, "my_env", "token"),
+            "my env and my_env slugify to the same environment"
+        );
     }
 }
