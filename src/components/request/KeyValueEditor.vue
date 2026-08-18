@@ -3,6 +3,7 @@ import { computed } from "vue";
 import { Trash2 } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
 
+import { applyPairEdit } from "../../utils/redaction";
 import type { KeyValuePair } from "../../types";
 
 const props = defineProps<{
@@ -45,8 +46,7 @@ function commitRows(nextRows: KeyValuePair[]) {
 }
 
 function updateRow(id: string, patch: Partial<KeyValuePair>) {
-  const nextRows = rows.value.map((row) => (row.id === id ? { ...row, ...patch } : row));
-  commitRows(nextRows);
+  commitRows(applyPairEdit(rows.value, id, patch));
 }
 
 function removeRow(id: string) {
@@ -106,9 +106,10 @@ function updateText(id: string, field: "key" | "value" | "description", event: E
         />
 
         <input
-          class="h-9 w-full rounded border border-[var(--border)] bg-[var(--bg-primary)] px-3 font-mono text-sm text-[var(--text-primary)] outline-none transition placeholder:text-[color-mix(in_srgb,var(--text-secondary)_75%,transparent)] focus:border-[color-mix(in_srgb,var(--accent)_70%,white)]"
+          class="h-9 w-full rounded border bg-[var(--bg-primary)] px-3 font-mono text-sm text-[var(--text-primary)] outline-none transition placeholder:text-[color-mix(in_srgb,var(--text-secondary)_75%,transparent)] focus:border-[color-mix(in_srgb,var(--accent)_70%,white)]"
+          :class="row.redacted ? 'border-amber-500' : 'border-[var(--border)]'"
           type="text"
-          :placeholder="t('keyValue.value')"
+          :placeholder="row.redacted ? t('keyValue.redactedPlaceholder') : t('keyValue.value')"
           :value="row.value"
           @input="updateText(row.id, 'value', $event)"
         />

@@ -3,6 +3,11 @@ import { defineStore } from "pinia";
 
 import i18n from "../i18n";
 import { useWebSocketStore } from "./websocket"
+import {
+  bodyKindFromBodyType,
+  clearSentinelBody,
+  clearSentinelPairs,
+} from "../utils/redaction"
 import type {
   AuthType,
   BodyType,
@@ -397,6 +402,15 @@ export const useTabsStore = defineStore("tabs", () => {
         timings: entry.timings ?? { dnsLookup: 0, tcpConnect: 0, tlsHandshake: 0, ttfb: 0, download: 0, total: entry.time },
       }
     }
+
+    // History stores sensitive values as the sentinel. Restore them as empty,
+    // marked rows so replaying can never put the placeholder back on the wire.
+    tab.params = clearSentinelPairs(tab.params)
+    tab.headers = clearSentinelPairs(tab.headers)
+    tab.body.formData = clearSentinelPairs(tab.body.formData)
+    const cleared = clearSentinelBody(bodyKindFromBodyType(tab.body.type), tab.body.content)
+    tab.body.content = cleared.content
+    tab.bodyRedacted = cleared.cleared
 
     const matchingEmptyTab = tabs.value.find(
       (candidate) =>

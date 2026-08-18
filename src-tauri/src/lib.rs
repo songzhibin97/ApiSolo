@@ -21,7 +21,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::ToSocketAddrs;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard, OnceLock};
 use std::time::Instant;
 use tauri::{Emitter, Manager, PhysicalSize, WebviewWindow, WindowEvent};
 use tokio::net::TcpStream;
@@ -648,7 +648,60 @@ fn register_window_state_persistence(window: WebviewWindow) {
     });
 }
 
+/// Process-wide mutex for the history file. Every read-modify-write command
+/// takes it as its first statement, *before* any file I/O — taking it after the
+/// read would leave the lost-update window wide open.
+fn history_lock() -> &'static StdMutex<()> {
+    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| StdMutex::new(()))
+}
+
+fn lock_history() -> MutexGuard<'static, ()> {
+    history_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Test-only rendezvous point at the start of each history file I/O, used by
+/// the lock tests to park a command inside its first I/O and probe the lock.
+/// Compiles away entirely outside `cfg(test)`.
+#[cfg(not(test))]
+#[inline(always)]
+fn io_checkpoint(_tag: &'static str) {}
+
+#[cfg(test)]
+struct IoCheckpoint {
+    notify: std::sync::mpsc::Sender<&'static str>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+fn checkpoint_slot() -> &'static StdMutex<Option<IoCheckpoint>> {
+    static SLOT: OnceLock<StdMutex<Option<IoCheckpoint>>> = OnceLock::new();
+    SLOT.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn io_checkpoint(tag: &'static str) {
+    // take() ⇒ each installed checkpoint fires at most once; a command's second
+    // I/O passes straight through instead of deadlocking against a test that
+    // only resumes once. The inner block releases the slot guard before we
+    // block, otherwise the test thread could not reach the slot.
+    let taken = {
+        checkpoint_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    };
+
+    if let Some(checkpoint) = taken {
+        let _ = checkpoint.notify.send(tag);
+        let _ = checkpoint.resume.recv();
+    }
+}
+
 fn read_history_entries() -> Result<Vec<HistoryEntry>, String> {
+    io_checkpoint("read");
     let history_path = history_file_path()?;
     let file = fs::File::open(&history_path)
         .map_err(|error| format!("Failed to open history file: {error}"))?;
@@ -670,6 +723,7 @@ fn read_history_entries() -> Result<Vec<HistoryEntry>, String> {
 }
 
 fn write_history_entries(entries: &[HistoryEntry]) -> Result<(), String> {
+    io_checkpoint("write");
     let history_path = history_file_path()?;
     let mut file = fs::File::create(&history_path)
         .map_err(|error| format!("Failed to write history file: {error}"))?;
@@ -1483,6 +1537,9 @@ fn is_sensitive_key(key: &str) -> bool {
         "api-key",
         "apikey",
         "x-api-key",
+        "subscription-key",
+        "signature",
+        "credential",
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
@@ -2022,6 +2079,8 @@ fn resolve_variables(template: String, variables: Vec<EnvVariable>) -> Result<St
 
 #[tauri::command]
 fn append_history(mut entry: HistoryEntry) -> Result<(), String> {
+    let _guard = lock_history();
+
     if entry.id.trim().is_empty() {
         entry.id = Uuid::new_v4().to_string();
     }
@@ -2039,6 +2098,7 @@ fn append_history(mut entry: HistoryEntry) -> Result<(), String> {
 
 #[tauri::command]
 fn load_history() -> Result<Vec<HistoryEntry>, String> {
+    let _guard = lock_history();
     let mut entries = read_history_entries()?;
     entries.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
     Ok(entries)
@@ -2046,14 +2106,34 @@ fn load_history() -> Result<Vec<HistoryEntry>, String> {
 
 #[tauri::command]
 fn clear_history() -> Result<(), String> {
+    let _guard = lock_history();
     write_history_entries(&[])
 }
 
 #[tauri::command]
 fn delete_history_entry(id: String) -> Result<(), String> {
+    let _guard = lock_history();
     let mut entries = read_history_entries()?;
     entries.retain(|entry| entry.id != id);
     write_history_entries(&entries)
+}
+
+/// Replaces history rows by id. Rows the caller did not list are kept as they
+/// are on disk — the lock stops concurrent lost updates, merge-by-id stops a
+/// stale snapshot from erasing rows the caller never saw. No redaction happens
+/// here: Rust stays a dumb pipe for history.
+#[tauri::command]
+fn update_history_entries(entries: Vec<HistoryEntry>) -> Result<(), String> {
+    let _guard = lock_history();
+    let mut merged = read_history_entries()?;
+
+    for update in entries.iter() {
+        if let Some(existing) = merged.iter_mut().find(|entry| entry.id == update.id) {
+            *existing = update.clone();
+        }
+    }
+
+    write_history_entries(&merged)
 }
 
 async fn ws_connect_inner(
@@ -2752,6 +2832,11 @@ struct DeleteHistoryEntryArgs {
 }
 
 #[derive(Deserialize)]
+struct UpdateHistoryEntriesArgs {
+    entries: Vec<HistoryEntry>,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CancelRequestArgs {
     request_id: String,
@@ -2943,6 +3028,10 @@ async fn api_delete_history_entry(Json(args): Json<DeleteHistoryEntryArgs>) -> i
     api_unit(delete_history_entry(args.id))
 }
 
+async fn api_update_history_entries(Json(args): Json<UpdateHistoryEntriesArgs>) -> impl IntoResponse {
+    api_unit(update_history_entries(args.entries))
+}
+
 #[cfg(feature = "dev-bridge")]
 async fn start_dev_server() {
     let app = Router::new()
@@ -2986,6 +3075,10 @@ async fn start_dev_server() {
         .route("/api/load_history", post(api_load_history))
         .route("/api/clear_history", post(api_clear_history))
         .route("/api/delete_history_entry", post(api_delete_history_entry))
+        .route(
+            "/api/update_history_entries",
+            post(api_update_history_entries),
+        )
         .layer(middleware::from_fn(require_dev_bridge_token))
         .layer(dev_bridge_cors_layer());
 
@@ -3039,6 +3132,7 @@ pub fn run() {
             load_history,
             clear_history,
             delete_history_entry,
+            update_history_entries,
             get_data_dir,
             get_secret_storage_state,
             configure_secret_storage,
@@ -5727,5 +5821,574 @@ mod tests {
         .unwrap();
         assert_eq!(request.method, "POST");
         assert_eq!(request.url, "https://api.example.com/b");
+    }
+    // ---------------------------------------------------------------------
+    // D01 — history redaction slice
+    // ---------------------------------------------------------------------
+
+    const SHARED_SENSITIVE_KEYS: &str = include_str!("../../src/utils/__fixtures__/sensitive-keys.json");
+
+    #[derive(Deserialize)]
+    struct SharedSensitiveKeys {
+        sensitive: Vec<String>,
+        insensitive: Vec<String>,
+    }
+
+    #[test]
+    fn test_is_sensitive_key_matches_shared_fixture() {
+        let fixture: SharedSensitiveKeys = serde_json::from_str(SHARED_SENSITIVE_KEYS).unwrap();
+
+        for key in &fixture.sensitive {
+            assert!(is_sensitive_key(key), "expected {key} to be sensitive");
+        }
+
+        for key in &fixture.insensitive {
+            assert!(!is_sensitive_key(key), "expected {key} to be insensitive");
+        }
+    }
+
+    #[test]
+    fn test_update_history_entries_preserves_unlisted_rows() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        append_history(sample_history_entry("keep-1", "2026-03-27T10:00:00Z")).unwrap();
+        append_history(sample_history_entry("rewrite", "2026-03-27T10:01:00Z")).unwrap();
+        append_history(sample_history_entry("keep-2", "2026-03-27T10:02:00Z")).unwrap();
+
+        let mut updated = sample_history_entry("rewrite", "2026-03-27T10:01:00Z");
+        updated.url = "https://api.example.com/sanitized".to_string();
+        update_history_entries(vec![
+            updated,
+            sample_history_entry("not-on-disk", "2026-03-27T10:03:00Z"),
+        ])
+        .unwrap();
+
+        let entries = read_history_entries().unwrap();
+        let ids: Vec<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+        assert_eq!(ids, vec!["keep-1", "rewrite", "keep-2"]);
+        assert_eq!(entries[1].url, "https://api.example.com/sanitized");
+        assert_eq!(entries[0].url, "http://example.com/api");
+        assert_eq!(entries[2].url, "http://example.com/api");
+    }
+
+    #[test]
+    fn test_read_saved_request_blanks_new_keys_without_touching_disk() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        create_project("Legacy Keys".to_string(), String::new()).unwrap();
+        let resolved = resolve_project("Legacy Keys").unwrap();
+        let file_path = project_collections_dir(&resolved.dir).join("signed.request.json");
+
+        // Written straight to disk so it keeps the plaintext a pre-upgrade
+        // ApiSolo would have saved under the now-sensitive key names.
+        let mut request = sample_saved_request("Signed", "GET", "https://api.example.com/signed");
+        request.headers = vec![
+            KeyValuePair {
+                enabled: true,
+                key: "X-Amz-Signature".to_string(),
+                value: "abc123signature".to_string(),
+                description: String::new(),
+            },
+            KeyValuePair {
+                enabled: true,
+                key: "aws-credential".to_string(),
+                value: "AKIAEXAMPLE".to_string(),
+                description: String::new(),
+            },
+            KeyValuePair {
+                enabled: true,
+                key: "Ocp-Apim-Subscription-Key".to_string(),
+                value: "sub-key-1".to_string(),
+                description: String::new(),
+            },
+            KeyValuePair {
+                enabled: true,
+                key: "X-Request-Id".to_string(),
+                value: "req-1".to_string(),
+                description: String::new(),
+            },
+        ];
+        fs::write(&file_path, pretty_json(&request).unwrap()).unwrap();
+        let before = fs::read(&file_path).unwrap();
+
+        let loaded = load_request("Legacy Keys".to_string(), "signed.request.json".to_string()).unwrap();
+
+        assert_eq!(loaded.headers[0].value, "");
+        assert_eq!(loaded.headers[1].value, "");
+        assert_eq!(loaded.headers[2].value, "");
+        assert_eq!(loaded.headers[3].value, "req-1");
+        assert_eq!(fs::read(&file_path).unwrap(), before);
+        assert!(String::from_utf8(before).unwrap().contains("abc123signature"));
+    }
+
+    #[test]
+    fn test_save_request_persists_blanked_new_keys() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        create_project("Signed Save".to_string(), String::new()).unwrap();
+        let mut request = sample_saved_request("Signed", "GET", "https://api.example.com/signed");
+        request.headers = vec![
+            KeyValuePair {
+                enabled: true,
+                key: "X-Amz-Signature".to_string(),
+                value: "abc123signature".to_string(),
+                description: String::new(),
+            },
+            KeyValuePair {
+                enabled: true,
+                key: "aws-credential".to_string(),
+                value: "AKIAEXAMPLE".to_string(),
+                description: String::new(),
+            },
+            KeyValuePair {
+                enabled: true,
+                key: "subscription-key".to_string(),
+                value: "sub-key-1".to_string(),
+                description: String::new(),
+            },
+            KeyValuePair {
+                enabled: true,
+                key: "X-Request-Id".to_string(),
+                value: "req-1".to_string(),
+                description: String::new(),
+            },
+        ];
+
+        save_request("Signed Save".to_string(), String::new(), request, None).unwrap();
+
+        let resolved = resolve_project("Signed Save").unwrap();
+        let file_path = project_collections_dir(&resolved.dir).join("signed.request.json");
+        let on_disk = fs::read_to_string(&file_path).unwrap();
+
+        assert!(!on_disk.contains("abc123signature"));
+        assert!(!on_disk.contains("AKIAEXAMPLE"));
+        assert!(!on_disk.contains("sub-key-1"));
+        assert!(on_disk.contains("req-1"));
+    }
+
+    // ---------------------------------------------------------------------
+    // §30 — the history lock must be held before any file I/O
+    //
+    // The only lock killer is the `try_lock` verdict taken while the command is
+    // parked inside its *first* I/O. Timeouts are used solely to detect a
+    // command that never reaches I/O and never feed the lock verdict; the final
+    // state assertions only prove the command semantics, not the lock position
+    // (all four guard placements produce the same final state without a race).
+    // ---------------------------------------------------------------------
+
+    const LOCK_PROBE_LIVENESS: std::time::Duration = std::time::Duration::from_secs(5);
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum LockVerdict {
+        LockHeld,
+        LockFree,
+        NeverReachedIo,
+        HarnessError,
+    }
+
+    #[derive(Clone, Copy)]
+    enum HistoryCommand {
+        Append,
+        AppendThenPanic,
+        Load,
+        Clear,
+        Delete,
+        Update,
+        /// Harness-only: reaches the I/O checkpoint without taking the lock, so
+        /// the probe can observe a free-but-poisoned lock.
+        UnlockedRead,
+    }
+
+    struct LockProbe {
+        verdict: LockVerdict,
+        note: Option<&'static str>,
+        child_ok: bool,
+        outcome: Option<String>,
+        final_ids: Vec<String>,
+    }
+
+    /// Installed right after the checkpoint slot so that any early return or
+    /// panic still releases the parked child and empties the global slot.
+    struct CheckpointCleanup {
+        resume: Option<std::sync::mpsc::Sender<()>>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for CheckpointCleanup {
+        fn drop(&mut self) {
+            if let Some(resume) = self.resume.take() {
+                let _ = resume.send(());
+            }
+
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+
+            *checkpoint_slot()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            history_lock().clear_poison();
+        }
+    }
+
+    fn seed_history(ids: &[&str]) {
+        let entries: Vec<HistoryEntry> = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| sample_history_entry(id, &format!("2026-03-27T10:0{index}:00Z")))
+            .collect();
+        write_history_entries(&entries).unwrap();
+    }
+
+    fn history_ids() -> Vec<String> {
+        read_history_entries()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect()
+    }
+
+    fn run_history_command(command: HistoryCommand, outcome: &Arc<StdMutex<Option<String>>>) {
+        let record = |value: &str| {
+            *outcome
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(value.to_string());
+        };
+
+        match command {
+            HistoryCommand::Append | HistoryCommand::AppendThenPanic => {
+                append_history(sample_history_entry("N", "2026-03-27T11:00:00Z")).unwrap();
+                record("append completed");
+
+                if matches!(command, HistoryCommand::AppendThenPanic) {
+                    // The command has fully returned: the guard is dropped, the
+                    // final state is [A, N] and the outcome is recorded. Only
+                    // `child_ok` can catch this.
+                    panic!("child panics AFTER the command completed");
+                }
+            }
+            HistoryCommand::Load => {
+                let entries = load_history().unwrap();
+                let ids: Vec<String> = entries.into_iter().map(|entry| entry.id).collect();
+                record(&format!("load returned {}", ids.join(",")));
+            }
+            HistoryCommand::Clear => {
+                clear_history().unwrap();
+                record("clear completed");
+            }
+            HistoryCommand::Delete => {
+                delete_history_entry("A".to_string()).unwrap();
+                record("delete completed");
+            }
+            HistoryCommand::UnlockedRead => {
+                let entries = read_history_entries().unwrap();
+                record(&format!("unlocked read returned {} entries", entries.len()));
+            }
+            HistoryCommand::Update => {
+                let mut updated = sample_history_entry("A", "2026-03-27T10:00:00Z");
+                updated.url = "https://api.example.com/updated".to_string();
+                update_history_entries(vec![updated]).unwrap();
+                record("update completed");
+            }
+        }
+    }
+
+    fn run_lock_probe(command: HistoryCommand, child_delay: std::time::Duration) -> LockProbe {
+        let (notify_tx, notify_rx) = std::sync::mpsc::channel::<&'static str>();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+
+        *checkpoint_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(IoCheckpoint {
+            notify: notify_tx,
+            resume: resume_rx,
+        });
+
+        let mut cleanup = CheckpointCleanup {
+            resume: Some(resume_tx),
+            handle: None,
+        };
+
+        let outcome_slot: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let child_outcome = Arc::clone(&outcome_slot);
+        cleanup.handle = Some(std::thread::spawn(move || {
+            std::thread::sleep(child_delay);
+            run_history_command(command, &child_outcome);
+        }));
+
+        // No assertion and no panic inside this window — the cleanup below has
+        // to run before anything can fail.
+        let (verdict, note) = match notify_rx.recv_timeout(LOCK_PROBE_LIVENESS) {
+            Err(_) => (
+                LockVerdict::NeverReachedIo,
+                Some("command never reached file I/O"),
+            ),
+            Ok(_) => match history_lock().try_lock() {
+                Err(std::sync::TryLockError::WouldBlock) => (LockVerdict::LockHeld, None),
+                Ok(guard) => {
+                    drop(guard);
+                    (LockVerdict::LockFree, None)
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => (
+                    LockVerdict::HarnessError,
+                    Some("history lock poisoned"),
+                ),
+            },
+        };
+
+        if let Some(resume) = cleanup.resume.take() {
+            let _ = resume.send(());
+        }
+
+        let child_ok = match cleanup.handle.take() {
+            Some(handle) => handle.join().is_ok(),
+            None => true,
+        };
+
+        drop(cleanup);
+
+        let outcome = outcome_slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+
+        LockProbe {
+            verdict,
+            note,
+            child_ok,
+            outcome,
+            final_ids: history_ids(),
+        }
+    }
+
+    fn assert_lock_probe(probe: &LockProbe, expected_outcome: &str, expected_final: &[&str]) {
+        let mut failures: Vec<String> = Vec::new();
+
+        if probe.verdict != LockVerdict::LockHeld {
+            failures.push(match probe.note {
+                Some(note) => format!("verdict={:?} ({note})", probe.verdict),
+                None => format!("verdict={:?}", probe.verdict),
+            });
+        }
+
+        if !probe.child_ok {
+            failures.push("child panicked".to_string());
+        }
+
+        if probe.outcome.as_deref() != Some(expected_outcome) {
+            failures.push(format!(
+                "outcome={:?}, expected {expected_outcome:?}",
+                probe.outcome
+            ));
+        }
+
+        let final_ids: Vec<&str> = probe.final_ids.iter().map(String::as_str).collect();
+        if final_ids != expected_final {
+            failures.push(format!("final={final_ids:?}, expected {expected_final:?}"));
+        }
+
+        assert!(failures.is_empty(), "lock probe failed: {}", failures.join(" + "));
+    }
+
+    #[test]
+    fn test_history_lock_held_at_first_io_in_append() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        seed_history(&["A"]);
+
+        let probe = run_lock_probe(HistoryCommand::Append, std::time::Duration::ZERO);
+        assert_lock_probe(&probe, "append completed", &["A", "N"]);
+    }
+
+    #[test]
+    fn test_history_lock_held_at_first_io_in_append_with_a_delayed_child() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        seed_history(&["A"]);
+
+        // 250ms is the offset that made an earlier, timeout-based design let
+        // every wrong guard placement pass; the verdict must not depend on it.
+        let probe = run_lock_probe(
+            HistoryCommand::Append,
+            std::time::Duration::from_millis(250),
+        );
+        assert_lock_probe(&probe, "append completed", &["A", "N"]);
+    }
+
+    #[test]
+    fn test_history_lock_held_at_first_io_in_load() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        seed_history(&["A"]);
+        let before = fs::read(history_file_path().unwrap()).unwrap();
+
+        let probe = run_lock_probe(HistoryCommand::Load, std::time::Duration::ZERO);
+        assert_lock_probe(&probe, "load returned A", &["A"]);
+        assert_eq!(fs::read(history_file_path().unwrap()).unwrap(), before);
+    }
+
+    #[test]
+    fn test_history_lock_held_at_first_io_in_clear() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        seed_history(&["A", "B"]);
+
+        // `clear_history` never reads, so its first I/O is the write.
+        let probe = run_lock_probe(HistoryCommand::Clear, std::time::Duration::ZERO);
+        assert_lock_probe(&probe, "clear completed", &[]);
+    }
+
+    #[test]
+    fn test_history_lock_held_at_first_io_in_delete() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        seed_history(&["A", "B"]);
+
+        let probe = run_lock_probe(HistoryCommand::Delete, std::time::Duration::ZERO);
+        assert_lock_probe(&probe, "delete completed", &["B"]);
+    }
+
+    #[test]
+    fn test_history_lock_held_at_first_io_in_update() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        seed_history(&["A", "B"]);
+
+        let probe = run_lock_probe(HistoryCommand::Update, std::time::Duration::ZERO);
+        assert_lock_probe(&probe, "update completed", &["A", "B"]);
+        let entries = read_history_entries().unwrap();
+        assert_eq!(entries[0].url, "https://api.example.com/updated");
+        assert_eq!(entries[1].url, "http://example.com/api");
+    }
+
+    #[test]
+    fn test_child_panic_after_completion_fails_the_test() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        seed_history(&["A"]);
+
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let probe = run_lock_probe(HistoryCommand::AppendThenPanic, std::time::Duration::ZERO);
+        let assert_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_lock_probe(&probe, "append completed", &["A", "N"]);
+        }));
+        std::panic::set_hook(previous_hook);
+
+        // The other three signals are all correct, so `child_ok` is the only
+        // assertion that can fail here. Deleting the `child_ok` branch from
+        // `assert_lock_probe` turns this test RED — that is the evidence that
+        // the assertion is load-bearing rather than decorative.
+        assert_eq!(probe.verdict, LockVerdict::LockHeld);
+        assert_eq!(probe.outcome.as_deref(), Some("append completed"));
+        assert_eq!(probe.final_ids, vec!["A".to_string(), "N".to_string()]);
+        assert!(!probe.child_ok);
+        assert!(
+            assert_result.is_err(),
+            "assert_lock_probe must fail when the child panicked after completing"
+        );
+
+        // The lock must not stay poisoned for the next case.
+        assert!(history_lock().try_lock().is_ok());
+    }
+
+    /// Poisons the history lock by letting a thread panic while holding it.
+    fn poison_history_lock() {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let _ = std::thread::spawn(|| {
+            let _guard = history_lock().lock().unwrap();
+            panic!("poisoning the history lock on purpose");
+        })
+        .join();
+        std::panic::set_hook(previous_hook);
+    }
+
+    #[test]
+    fn test_poisoned_lock_is_reported_and_cleared_not_read_as_held() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        seed_history(&["A"]);
+
+        poison_history_lock();
+        assert!(
+            history_lock().try_lock().is_err(),
+            "precondition: the lock must be poisoned before the probe"
+        );
+
+        // The command does not take the lock, so at the checkpoint the lock is
+        // free *and* poisoned — the one situation that reaches the poisoned
+        // branch. Reporting it as LockHeld would silently turn a broken
+        // environment into a passing lock assertion.
+        let probe = run_lock_probe(HistoryCommand::UnlockedRead, std::time::Duration::ZERO);
+
+        assert_eq!(probe.verdict, LockVerdict::HarnessError);
+        assert_eq!(probe.note, Some("history lock poisoned"));
+        assert!(probe.child_ok, "the probe must not panic on the poisoned path");
+        assert_eq!(probe.outcome.as_deref(), Some("unlocked read returned 1 entries"));
+
+        // Cleanup::drop calls clear_poison, so one panicking child cannot
+        // contaminate every later case.
+        assert!(
+            history_lock().try_lock().is_ok(),
+            "cleanup must clear the poison for the next case"
+        );
+
+        let next = run_lock_probe(HistoryCommand::Append, std::time::Duration::ZERO);
+        assert_lock_probe(&next, "append completed", &["A", "N"]);
+    }
+
+    #[test]
+    fn test_concurrent_append_and_update_keep_both_writes() {
+        // Supplementary and non-deterministic: it passes with the lock and
+        // very likely fails without it, but the deterministic kill comes from
+        // the checkpoint probes above.
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        for round in 0..30 {
+            seed_history(&["A"]);
+
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let appender_barrier = Arc::clone(&barrier);
+            let updater_barrier = Arc::clone(&barrier);
+
+            let appender = std::thread::spawn(move || {
+                appender_barrier.wait();
+                append_history(sample_history_entry("N", "2026-03-27T11:00:00Z")).unwrap();
+            });
+            let updater = std::thread::spawn(move || {
+                let mut updated = sample_history_entry("A", "2026-03-27T10:00:00Z");
+                updated.url = "https://api.example.com/sanitized".to_string();
+                updater_barrier.wait();
+                update_history_entries(vec![updated]).unwrap();
+            });
+
+            appender.join().unwrap();
+            updater.join().unwrap();
+
+            let entries = read_history_entries().unwrap();
+            let ids: Vec<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+            assert_eq!(ids, vec!["A", "N"], "round {round}");
+            assert_eq!(
+                entries[0].url, "https://api.example.com/sanitized",
+                "round {round}"
+            );
+        }
     }
 }

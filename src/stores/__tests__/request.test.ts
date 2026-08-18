@@ -4,12 +4,20 @@ import { createPinia, setActivePinia } from "pinia"
 import i18n from "../../i18n"
 
 const { executeScriptMock, invokeMock } = vi.hoisted(() => ({
-  executeScriptMock: vi.fn(async () => ({
-    success: true,
-    logs: [] as string[],
-    errors: [] as string[],
-    assertions: [] as Array<{ name: string; passed: boolean; message?: string }>,
-  })),
+  executeScriptMock: vi.fn(
+    async (): Promise<{
+      success: boolean
+      logs: string[]
+      errors: string[]
+      assertions: Array<{ name: string; passed: boolean; message?: string }>
+      updatedVariables?: Record<string, string>
+    }> => ({
+      success: true,
+      logs: [],
+      errors: [],
+      assertions: [],
+    }),
+  ),
   invokeMock: vi.fn(),
 }))
 
@@ -21,9 +29,44 @@ vi.mock("../../utils/invoke", () => ({
   invoke: invokeMock,
 }))
 
+import pinia from ".."
+import { useConsoleStore } from "../console"
+import { useEnvironmentsStore } from "../environments"
 import { useRequestStore } from "../request"
 import { useTabsStore } from "../tabs"
-import type { HttpResponse } from "../../types"
+import {
+  REDACTION_SENTINEL,
+  findSentinelFields,
+  hasPendingRedactedFields,
+  sanitizeHistoryEntry,
+} from "../../utils/redaction"
+import type { HistoryEntry, HttpResponse, KeyValuePair, SavedRequest, Tab } from "../../types"
+
+function pair(key: string, value: string, overrides: Partial<KeyValuePair> = {}): KeyValuePair {
+  return { id: `${key}-1`, enabled: true, key, value, description: "", ...overrides }
+}
+
+function okInvoke(commands: Record<string, unknown> = {}) {
+  return async (command: string) => {
+    if (command in commands) {
+      return commands[command]
+    }
+
+    if (command === "send_request") {
+      return buildResponse()
+    }
+
+    if (command === "list_environments") {
+      return []
+    }
+
+    if (command === "append_history") {
+      return null
+    }
+
+    throw new Error(`Unexpected invoke: ${command}`)
+  }
+}
 
 function createDeferred<T>() {
   let resolve!: (value: T) => void
@@ -611,9 +654,12 @@ describe("useRequestStore", () => {
       }
     }
 
-    expect(historyPayload.entry.responseBody).not.toContain("response-secret-token")
-    expect(historyPayload.entry.responseBody).not.toContain("another-secret")
-    expect(historyPayload.entry.responseBody).toContain("[redacted]")
+    // Tightened from a `toContain` check: the old regex chain produced invalid
+    // JSON here and the loose assertion never noticed.
+    expect(historyPayload.entry.responseBody).toBe(
+      '{"authorization":"[redacted]","token":"[redacted]"}',
+    )
+    expect(() => JSON.parse(historyPayload.entry.responseBody)).not.toThrow()
   })
 
   it("aborts the request when a pre-request script fails", async () => {
@@ -647,5 +693,590 @@ describe("useRequestStore", () => {
     expect(tabsStore.activeTab.responseError).toContain("Pre-request script failed")
     expect(invokeMock.mock.calls.some(([command]) => command === "send_request")).toBe(false)
     expect(invokeMock.mock.calls.some(([command]) => command === "append_history")).toBe(false)
+  })
+})
+
+const JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcDEF-_123"
+const DIGEST =
+  'username="Mufasa", realm="testrealm@host.com", nonce="dcd98b7102dd2f0e", uri="/dir/index.html", response=6629fae49393a05397450978507c4ef1'
+
+function baseHistoryEntry(overrides: Partial<HistoryEntry> = {}): HistoryEntry {
+  return {
+    id: "history-1",
+    method: "POST",
+    url: "https://api.example.com/users",
+    status: 200,
+    time: 12,
+    size: 2,
+    timestamp: "2026-04-28T10:00:00.000Z",
+    contentType: "application/json",
+    requestParams: [],
+    requestHeaders: [],
+    ...overrides,
+  }
+}
+
+describe("the outbound redaction gate", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    invokeMock.mockReset()
+    executeScriptMock.mockClear()
+  })
+
+  it.each([
+    ["headers", "X-Test"],
+    ["params", "access_token"],
+    ["formData", "password"],
+  ] as const)("refuses to send a sentinel value in %s", async (collection, key) => {
+    invokeMock.mockImplementation(okInvoke())
+
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+
+    tabsStore.updateTab(tabsStore.activeTab.id, {
+      method: "POST",
+      url: "https://api.example.com/users",
+      headers: collection === "headers" ? [pair(key, REDACTION_SENTINEL)] : [],
+      params: collection === "params" ? [pair(key, REDACTION_SENTINEL)] : [],
+      body:
+        collection === "formData"
+          ? {
+              type: "form-data",
+              content: "",
+              formData: [pair(key, REDACTION_SENTINEL)],
+              binaryPath: "",
+              binaryContent: "",
+            }
+          : { type: "none", content: "", formData: [], binaryPath: "", binaryContent: "" },
+    })
+
+    await requestStore.sendRequest(tabsStore.activeTab)
+
+    expect(tabsStore.activeTab.responseError).toBe(
+      i18n.global.t("errors.redactionSentinelOnWire", { field: key }),
+    )
+    expect(tabsStore.activeTab.responseError).toContain(key)
+    expect(invokeMock.mock.calls.some(([command]) => command === "send_request")).toBe(false)
+    expect(invokeMock.mock.calls.some(([command]) => command === "append_history")).toBe(false)
+  })
+
+  it("refuses a sentinel body value under a sensitive key", async () => {
+    invokeMock.mockImplementation(okInvoke())
+
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+
+    tabsStore.updateTab(tabsStore.activeTab.id, {
+      method: "POST",
+      url: "https://api.example.com/token",
+      body: {
+        type: "json",
+        content: `{"user":"bob","password":"${REDACTION_SENTINEL}"}`,
+        formData: [],
+        binaryPath: "",
+        binaryContent: "",
+      },
+    })
+
+    await requestStore.sendRequest(tabsStore.activeTab)
+
+    expect(tabsStore.activeTab.responseError).toBe(
+      i18n.global.t("errors.redactionSentinelOnWire", { field: "password" }),
+    )
+    expect(invokeMock.mock.calls.some(([command]) => command === "send_request")).toBe(false)
+  })
+
+  it("sends a body whose prose contains the sentinel", async () => {
+    invokeMock.mockImplementation(okInvoke())
+
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+
+    tabsStore.updateTab(tabsStore.activeTab.id, {
+      method: "POST",
+      url: "https://api.example.com/notes",
+      body: {
+        type: "json",
+        content: `{"note":"the string ${REDACTION_SENTINEL} appears here"}`,
+        formData: [],
+        binaryPath: "",
+        binaryContent: "",
+      },
+    })
+
+    await requestStore.sendRequest(tabsStore.activeTab)
+
+    expect(tabsStore.activeTab.responseError).toBeNull()
+    expect(invokeMock.mock.calls.some(([command]) => command === "send_request")).toBe(true)
+  })
+
+  it("refuses a sentinel restored from a saved collection request", async () => {
+    invokeMock.mockImplementation(okInvoke())
+
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+
+    // Rust writes `key=[redacted]` into urlencoded bodies of saved requests.
+    const saved: SavedRequest = {
+      name: "Token",
+      method: "POST",
+      url: "https://api.example.com/token",
+      params: [],
+      headers: [],
+      body: {
+        type: "form-urlencoded",
+        content: `username=bob&password=${REDACTION_SENTINEL}`,
+        formData: [],
+        binaryPath: "",
+        binaryContent: "",
+      },
+      auth: { type: "none" },
+      preRequestScript: "",
+      testScript: "",
+    }
+
+    tabsStore.openSavedRequest("demo", "auth/token.json", saved)
+    await requestStore.sendRequest(tabsStore.activeTab)
+
+    expect(tabsStore.activeTab.responseError).toBe(
+      i18n.global.t("errors.redactionSentinelOnWire", { field: "password" }),
+    )
+    expect(invokeMock.mock.calls.some(([command]) => command === "send_request")).toBe(false)
+  })
+
+  it("sends a variable that resolves to the literal sentinel", async () => {
+    invokeMock.mockImplementation(okInvoke())
+
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+    useEnvironmentsStore().setVariables([
+      { key: "lit", value: REDACTION_SENTINEL, secret: false },
+    ])
+
+    tabsStore.updateTab(tabsStore.activeTab.id, {
+      method: "GET",
+      url: "https://api.example.com/echo",
+      headers: [pair("X-Test", "{{lit}}")],
+    })
+
+    await requestStore.sendRequest(tabsStore.activeTab)
+
+    const sendPayload = invokeMock.mock.calls.find(([command]) => command === "send_request")?.[1] as {
+      args: { headers: KeyValuePair[] }
+    }
+
+    expect(tabsStore.activeTab.responseError).toBeNull()
+    expect(sendPayload.args.headers[0].value).toBe(REDACTION_SENTINEL)
+  })
+
+  it("sends a redacted-marked field as empty instead of blocking", async () => {
+    invokeMock.mockImplementation(okInvoke())
+
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+
+    tabsStore.updateTab(tabsStore.activeTab.id, {
+      method: "GET",
+      url: "https://api.example.com/echo",
+      headers: [pair("Cookie", "", { redacted: true })],
+    })
+
+    await requestStore.sendRequest(tabsStore.activeTab)
+
+    const sendPayload = invokeMock.mock.calls.find(([command]) => command === "send_request")?.[1] as {
+      args: { headers: KeyValuePair[] }
+    }
+
+    expect(tabsStore.activeTab.responseError).toBeNull()
+    expect(sendPayload.args.headers[0]).toEqual(expect.objectContaining({ key: "Cookie", value: "" }))
+  })
+})
+
+describe("credentials under non-sensitive field names", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    invokeMock.mockReset()
+    executeScriptMock.mockClear()
+  })
+
+  it.each([
+    ["a bare Bearer token", "raw", `Bearer ${JWT}`],
+    ["a bare Digest challenge", "raw", `Digest ${DIGEST}`],
+    ["a json note holding a token", "json", '{"note":"Bearer abc123"}'],
+    ["json prose mentioning Digest", "json", '{"note":"Digest authentication is required"}'],
+  ])(
+    "leaves credentials under non-sensitive keys untouched end to end for %s",
+    async (_name, bodyType, content) => {
+      invokeMock.mockImplementation(okInvoke())
+
+      const tabsStore = useTabsStore()
+      const requestStore = useRequestStore()
+
+      const stored = sanitizeHistoryEntry(
+        baseHistoryEntry({
+          requestHeaders: [pair("X-Note", "password: hunter2")],
+          requestBodyType: bodyType,
+          requestBodyContent: content,
+        }),
+      )
+
+      expect(stored.requestBodyContent).toBe(content)
+      expect(stored.requestHeaders?.[0].value).toBe("password: hunter2")
+
+      tabsStore.openHistoryEntry(stored)
+      const opened = tabsStore.activeTab
+
+      expect(opened.body.content).toBe(content)
+      expect(opened.headers[0].value).toBe("password: hunter2")
+      expect(hasPendingRedactedFields(opened)).toBe(false)
+      expect(findSentinelFields(opened)).toEqual([])
+
+      await requestStore.sendRequest(opened)
+
+      expect(tabsStore.activeTab.responseError).toBeNull()
+      expect(invokeMock.mock.calls.some(([command]) => command === "send_request")).toBe(true)
+    },
+  )
+})
+
+describe("history is built from a copy, never written back to the tab", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    invokeMock.mockReset()
+    executeScriptMock.mockClear()
+  })
+
+  it("never rewrites live tab values while building history", async () => {
+    invokeMock.mockImplementation(okInvoke())
+
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+
+    tabsStore.updateTab(tabsStore.activeTab.id, {
+      method: "GET",
+      url: "https://api.example.com/me",
+      headers: [pair("Cookie", "sid=abcdef123456; theme=dark")],
+      body: {
+        type: "json",
+        content: '{"password":"hunter2"}',
+        formData: [],
+        binaryPath: "",
+        binaryContent: "",
+      },
+    })
+
+    await requestStore.sendRequest(tabsStore.activeTab)
+
+    expect(tabsStore.activeTab.headers[0].value).toBe("sid=abcdef123456; theme=dark")
+    expect(tabsStore.activeTab.body.content).toBe('{"password":"hunter2"}')
+
+    const historyPayload = invokeMock.mock.calls.find(([command]) => command === "append_history")?.[1] as {
+      entry: HistoryEntry
+    }
+
+    expect(historyPayload.entry.requestHeaders?.[0].value).toBe(REDACTION_SENTINEL)
+  })
+
+  it("never persists the redacted marker to history", async () => {
+    invokeMock.mockImplementation(okInvoke())
+
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+
+    tabsStore.updateTab(tabsStore.activeTab.id, {
+      method: "POST",
+      url: "https://api.example.com/users",
+      headers: [pair("X-Note", "keep", { redacted: true })],
+      params: [pair("page", "1", { redacted: true })],
+      body: {
+        type: "form-data",
+        content: "",
+        formData: [pair("field", "value", { redacted: true })],
+        binaryPath: "",
+        binaryContent: "",
+      },
+    })
+
+    await requestStore.sendRequest(tabsStore.activeTab)
+
+    const historyPayload = invokeMock.mock.calls.find(([command]) => command === "append_history")?.[1] as {
+      entry: HistoryEntry
+    }
+
+    expect(JSON.stringify(historyPayload.entry)).not.toContain("redacted")
+  })
+})
+
+describe("script-written environment variables", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    invokeMock.mockReset()
+    executeScriptMock.mockClear()
+  })
+
+  it("marks a script-copied secret value as secret", async () => {
+    invokeMock.mockImplementation(okInvoke())
+    executeScriptMock.mockResolvedValueOnce({
+      success: true,
+      logs: [],
+      errors: [],
+      assertions: [],
+      updatedVariables: { copied: "s3cr3t-value" },
+    })
+
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+    const environmentsStore = useEnvironmentsStore()
+    environmentsStore.setVariables([{ key: "token", value: "s3cr3t-value", secret: true }])
+
+    tabsStore.updateTab(tabsStore.activeTab.id, {
+      method: "GET",
+      url: "https://api.example.com/echo",
+      preRequestScript: "pm.environment.set('copied', pm.environment.get('token'))",
+    })
+
+    await requestStore.sendRequest(tabsStore.activeTab)
+
+    expect(environmentsStore.variables).toContainEqual({
+      key: "copied",
+      value: "s3cr3t-value",
+      secret: true,
+    })
+  })
+
+  it("does not mark an unrelated new variable as secret", async () => {
+    invokeMock.mockImplementation(okInvoke())
+    executeScriptMock.mockResolvedValueOnce({
+      success: true,
+      logs: [],
+      errors: [],
+      assertions: [],
+      updatedVariables: { plain: "not-a-secret" },
+    })
+
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+    const environmentsStore = useEnvironmentsStore()
+    environmentsStore.setVariables([{ key: "token", value: "s3cr3t-value", secret: true }])
+
+    tabsStore.updateTab(tabsStore.activeTab.id, {
+      method: "GET",
+      url: "https://api.example.com/echo",
+      preRequestScript: "pm.environment.set('plain', 'not-a-secret')",
+    })
+
+    await requestStore.sendRequest(tabsStore.activeTab)
+
+    expect(environmentsStore.variables).toContainEqual({
+      key: "plain",
+      value: "not-a-secret",
+      secret: false,
+    })
+  })
+
+  it("keeps an existing secret variable secret when a script overwrites it", async () => {
+    invokeMock.mockImplementation(okInvoke())
+    executeScriptMock.mockResolvedValueOnce({
+      success: true,
+      logs: [],
+      errors: [],
+      assertions: [],
+      updatedVariables: { token: "rotated-value" },
+    })
+
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+    const environmentsStore = useEnvironmentsStore()
+    environmentsStore.setVariables([{ key: "token", value: "s3cr3t-value", secret: true }])
+
+    tabsStore.updateTab(tabsStore.activeTab.id, {
+      method: "GET",
+      url: "https://api.example.com/echo",
+      preRequestScript: "pm.environment.set('token', 'rotated-value')",
+    })
+
+    await requestStore.sendRequest(tabsStore.activeTab)
+
+    expect(environmentsStore.variables).toContainEqual({
+      key: "token",
+      value: "rotated-value",
+      secret: true,
+    })
+  })
+})
+
+describe("the console network line", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    invokeMock.mockReset()
+    executeScriptMock.mockClear()
+    useConsoleStore(pinia).clear()
+  })
+
+  it("logs the unresolved url to the console", async () => {
+    invokeMock.mockImplementation(okInvoke())
+
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+    useEnvironmentsStore().setVariables([
+      { key: "base", value: "https://api.example.com", secret: false },
+    ])
+
+    tabsStore.updateTab(tabsStore.activeTab.id, {
+      method: "GET",
+      url: "{{base}}/users",
+    })
+
+    await requestStore.sendRequest(tabsStore.activeTab)
+
+    const networkMessages = useConsoleStore(pinia)
+      .entries.filter((entry) => entry.source === "network")
+      .map((entry) => entry.message)
+
+    expect(networkMessages).toContain("[network] GET {{base}}/users started")
+    expect(networkMessages.join("\n")).not.toContain("https://api.example.com/users")
+  })
+})
+
+// Every field of a history entry is redacted by one line inside
+// `sanitizeHistoryEntry`. Testing that helper directly proves the *logic* but
+// not the *wiring*: an independent review reverted five of those lines and the
+// whole suite stayed green. Each test below drives the real send path and puts
+// the credential in exactly one place, so reverting that one line — and only
+// that line — turns it red. See specs/PROCESS.md P8.
+describe("each sanitizeHistoryEntry call site is reachable from the send path", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    invokeMock.mockReset()
+    executeScriptMock.mockClear()
+  })
+
+  async function sendAndCaptureHistory(
+    patch: Partial<Tab>,
+    response: Partial<HttpResponse> = {},
+  ): Promise<HistoryEntry> {
+    invokeMock.mockImplementation(okInvoke({ send_request: buildResponse(response) }))
+
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+    tabsStore.updateTab(tabsStore.activeTab.id, patch)
+    await requestStore.sendRequest(tabsStore.activeTab)
+
+    expect(tabsStore.activeTab.responseError).toBeNull()
+    const call = invokeMock.mock.calls.find(([command]) => command === "append_history")
+    expect(call, "append_history was never called").toBeDefined()
+    return (call![1] as { entry: HistoryEntry }).entry
+  }
+
+  it("redacts the url query on the way to append_history", async () => {
+    const entry = await sendAndCaptureHistory({
+      method: "GET",
+      url: "https://api.example.com/s?access_token=abcdef123456&page=2",
+    })
+
+    expect(entry.url).toBe(`https://api.example.com/s?access_token=${REDACTION_SENTINEL}&page=2`)
+  })
+
+  it("redacts request params on the way to append_history", async () => {
+    const entry = await sendAndCaptureHistory({
+      method: "GET",
+      url: "https://api.example.com/s",
+      params: [pair("access_token", "abcdef123456"), pair("page", "2")],
+    })
+
+    expect(entry.requestParams?.map((item) => item.value)).toEqual([REDACTION_SENTINEL, "2"])
+  })
+
+  it("redacts request headers on the way to append_history", async () => {
+    const entry = await sendAndCaptureHistory({
+      method: "GET",
+      url: "https://api.example.com/s",
+      headers: [pair("Cookie", "sid=abcdef123456; theme=dark"), pair("Accept", "*/*")],
+    })
+
+    expect(entry.requestHeaders?.map((item) => item.value)).toEqual([REDACTION_SENTINEL, "*/*"])
+  })
+
+  it("redacts the request body on the way to append_history", async () => {
+    const entry = await sendAndCaptureHistory({
+      method: "POST",
+      url: "https://api.example.com/token",
+      body: {
+        type: "json",
+        content: '{"user":"bob","password":"hunter2","id":9007199254740993123456789}',
+        formData: [],
+        binaryPath: "",
+        binaryContent: "",
+      },
+    })
+
+    expect(entry.requestBodyContent).toBe(
+      `{"user":"bob","password":"${REDACTION_SENTINEL}","id":9007199254740993123456789}`,
+    )
+  })
+
+  it("redacts form-data values on the way to append_history", async () => {
+    const entry = await sendAndCaptureHistory({
+      method: "POST",
+      url: "https://api.example.com/token",
+      body: {
+        type: "form-data",
+        content: "",
+        formData: [pair("password", "hunter2"), pair("grant_type", "password")],
+        binaryPath: "",
+        binaryContent: "",
+      },
+    })
+
+    expect(entry.requestBodyFormData?.map((item) => item.value)).toEqual([
+      REDACTION_SENTINEL,
+      "password",
+    ])
+  })
+
+  it("redacts the response body on the way to append_history", async () => {
+    const entry = await sendAndCaptureHistory(
+      { method: "GET", url: "https://api.example.com/me" },
+      { body: '{"id":7,"refreshToken":"rt-abcdef123456"}' },
+    )
+
+    expect(entry.responseBody).toBe(`{"id":7,"refreshToken":"${REDACTION_SENTINEL}"}`)
+  })
+
+  it("redacts response headers on the way to append_history", async () => {
+    const entry = await sendAndCaptureHistory(
+      { method: "GET", url: "https://api.example.com/me" },
+      {
+        headers: [
+          ["set-cookie", "sid=abcdef123456; theme=dark"],
+          ["content-type", "application/json"],
+        ],
+      },
+    )
+
+    expect(entry.responseHeaders).toEqual([
+      ["set-cookie", REDACTION_SENTINEL],
+      ["content-type", "application/json"],
+    ])
+  })
+
+  it("keeps a non-sensitive value byte-identical through the whole send path", async () => {
+    const entry = await sendAndCaptureHistory({
+      method: "POST",
+      url: "https://api.example.com/notes",
+      headers: [pair("X-Note", "password: hunter2")],
+      params: [pair("hint", `Bearer ${JWT}`)],
+      body: {
+        type: "raw",
+        content: `Digest ${DIGEST}`,
+        formData: [],
+        binaryPath: "",
+        binaryContent: "",
+      },
+    })
+
+    expect(entry.requestHeaders?.[0].value).toBe("password: hunter2")
+    expect(entry.requestParams?.[0].value).toBe(`Bearer ${JWT}`)
+    expect(entry.requestBodyContent).toBe(`Digest ${DIGEST}`)
   })
 })
