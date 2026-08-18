@@ -158,7 +158,7 @@
 
 **6 个照抄其交接清单落地**：`curlImport.error.unsupportedMethod`、`curlImport.warningTitle`、`curlImport.warning.fileReference`、`curlImport.warning.dataDiscarded`、`curlImport.warning.cookieFile`、`export.warning.fileContentNotExportable`。
 
-**1 个被取代（对交接清单的偏离，理由见 §34）**：`curlImport.warning.authorizationNotPreserved` 的 `{detail}` 取值是英文散文（`"line breaks"` / `"separator whitespace"`），插进中文句子会产出半英文的话。改为两个各自完整、无 detail 占位符的 key：
+**1 个被取代（对交接清单的偏离，理由见 §37）**：`curlImport.warning.authorizationNotPreserved` 的 `{detail}` 取值是英文散文（`"line breaks"` / `"separator whitespace"`），插进中文句子会产出半英文的话。改为两个各自完整、无 detail 占位符的 key：
 
 | key | zh-CN | en |
 |---|---|---|

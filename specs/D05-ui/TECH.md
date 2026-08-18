@@ -107,7 +107,7 @@ rev3 reconciler  : "https://x/a?q=a+b"    <= 已采纳
 **修法**：改用显式的来源信号（revision）。同一轮实跑还得到两个结论：
 
 1. **`sameParse` 可以整个删掉**，不是「再加一个判据」。键入模拟 10 个目标串在新协调器下 `TYPING FAILURES = 0`——因为 revision 未变即可判定为 self-echo，无需再比较字符串。**设计变简单了。**
-2. **新不变式（§9）的 killer 具有区分度**：把 revision 判据换回 `sameParse`，「Params 表改值」这一类外部更新**仍然被采纳**（解析结果不同），只有 I2 那一类转红。实跑确认该对照成立。
+2. **新不变式（§11）的 killer 具有区分度**：把 revision 判据换回 `sameParse`，「Params 表改值」这一类外部更新**仍然被采纳**（解析结果不同），只有 I2 那一类转红。实跑确认该对照成立。
 
 ### 0.10 I3 的实读
 
@@ -159,6 +159,44 @@ rev3 声称「把守卫移到 `activeRequestIds.set` 之后」是 §15 的 kille
 ```
 
 它是一个**真实的实现者会犯的错**（「早退时顺手记一下最新的尝试」），并且实测 `send_request` 仍然恰好一次（§14 绿）、第一次的响应与历史双双消失（§15 红）。**单塌成立，且是实跑出来的，不是推断出来的。**
+
+### 0.13 R3 要求的独立性复核（本轮实跑，**推翻 rev4 自己的 VERIFIED 桶**）
+
+rev4 把 6 条标成 VERIFIED，判据写的是「该用例转红、且相邻用例不红」。**我没有拿这条判据去查自己。** R3 逐条核完，只剩 2 条站得住。逐项复核结果：
+
+**(1) §11 —— 成立，本轮补测了第二个邻居。** mutant「revision 判据换回 `sameParse`」：
+
+```
+§10 case under mutant: GREEN     （Params 表改值，解析结果不同 ⇒ 仍被采纳）
+§13 case under mutant: GREEN     （切 tab，tabId 分支未被触碰）
+§11 case under mutant: RED
+```
+
+与它共用 `reconcileUrlBarValue` 的两条邻居**都保持绿**，只有 §11 塌。✅
+
+**(2) §12(a) —— 本轮由「测量」升级为「对照」。** 0.11 记的是两种 watcher 各跑几次（一次测量），不是「应用 patch ⇒ 用例转红」。本轮改写成真正的用例并跑了 mutant（`MUT=1` 切换 watch 源）：
+
+```
+正确（三个源）：Tests 2 passed
+mutant（去掉 revision 源）：× runs the reconciler on a revision-only external write
+                            Tests 1 failed | 1 passed      ← §13 邻居用例保持绿
+```
+
+✅ 单塌成立。**但只覆盖 (a)**；(b)「RequestPanel 真的传了 `url-revision`」**从未运行过**，随组件 harness 结论生效。
+
+**(3) §14 / §15 —— 双双降级为 DESIGNED。** 0.12 的四实现矩阵里就有反证，而我把它当成了正面证据：
+
+| mutant | send_request | 落地响应 | history | §14 用例 | §15 用例 |
+|---|---|---|---|---|---|
+| 无守卫 | 2 | SECOND | 1 | **RED** | **RED** |
+| 守卫早退时改写追踪表 | 1 | null | 0 | GREEN | **RED** |
+
+- **§15 有一个只让它塌的 mutant**（第二行），但该 mutant 下 §15 用例里的**两条断言同时失败**（响应 + 历史），因此**没有任何一条断言被证明单独承重**。
+- **§14 没有任何一个只让它塌的 mutant**：唯一能让它红的「无守卫」同时让 §15 红。两条属性经由同一张 `activeRequestIds` 表耦合，**在守卫这一行的变异空间里无法分离**。
+
+**这正是 P9 的原话所禁止的形态，而我上一轮把它用在了别人身上。** 要转 VERIFIED，需要实现存在之后在更大的变异空间里找（例如变异 `isRequestActive` 的回写判据，使响应与历史可以分别塌），规格阶段做不到。
+
+**(4) §54 / §55 —— 双双降级为 DESIGNED。** 生产改动只有一行，实测 `2 failed`：两个用例在同一个 mutant 下一起红。§55 用例内部确有一条断言在该 mutant 下通过（0.5 已记），这证明了**断言层**的单塌，但证明不了**用例层**与 §54 的可分离性——没有任何 patch 能让其中一个红而另一个绿。按判据的第二半，两条都不合格。
 
 ## 1. Context
 
@@ -216,14 +254,14 @@ export type CurlImportWarningCode =
   | "file-reference-not-inlined"
   | "data-segments-discarded"
   | "cookie-file-not-supported"
-  | "authorization-line-breaks-not-preserved"      // ← 由散文 detail 拆出（§34）
+  | "authorization-line-breaks-not-preserved"      // ← 由散文 detail 拆出（§37）
   | "authorization-separator-not-preserved"        // ← 同上
 export interface CurlImportWarning { code: CurlImportWarningCode; detail: string }
 
 export type CurlParseErrorCode = "invalid-command" | "unsupported-method" | "no-url"
 
 export interface CurlImportNotice {
-  pasteFailure?: { code: CurlParseErrorCode; detail: string }   // §30：原因也要本地化
+  pasteFailure?: { code: CurlParseErrorCode; detail: string }   // §33：原因也要本地化
   warnings: CurlImportWarning[]
 }
 // Tab 追加： importNotice?: CurlImportNotice
@@ -313,9 +351,9 @@ else { emit("pasteFallback", decision) }       // 不 preventDefault，浏览器
 
 `interpretPastedText` / `shouldPreventDefaultPaste` / `tabUpdatesFromParsedCurl` / `CURL_WARNING_KEYS: Record<CurlImportWarningCode, string>` / `warningMessageKeys`。`tabUpdatesFromParsedCurl` 里 `const { url, params } = syncParamsFromUrl(parsed.url, [])`，**`url` 取 synced 的**，并**无条件**写 `importNotice: noticeFor(parsed.warnings)`（空 warning 时为 `undefined`，从而实现「被下一次导入整体取代」）。
 
-`tryParseCurl` 包住 `parseCurl` 的三个 throw 点，返回 `{ ok: false, code, detail }` 而**不是字符串**——§30 要求三种原因都能本地化，携带英文消息就做不到。`curl-parser.ts` 的三处 `throw new Error(...)` 改抛带 `CurlParseErrorCode` 与 `detail` 的错误类，**消息文本保留原有关键信息**（已核实既有断言是 `toThrow(new RegExp(verb))`，因此仍绿）。
+`tryParseCurl` 包住 `parseCurl` 的三个 throw 点，返回 `{ ok: false, code, detail }` 而**不是字符串**——§33 要求三种原因都能本地化，携带英文消息就做不到。`curl-parser.ts` 的三处 `throw new Error(...)` 改抛带 `CurlParseErrorCode` 与 `detail` 的错误类，**消息文本保留原有关键信息**（已核实既有断言是 `toThrow(new RegExp(verb))`，因此仍绿）。
 
-同时按 §34 把 `storeAuthorizationValue` 的两个 push 点改用两个**独立 code**，`detail` 不再承载散文（0.10）。这两处是本切片对导入导出切片文件的全部改动。
+同时按 §37 把 `storeAuthorizationValue` 的两个 push 点改用两个**独立 code**，`detail` 不再承载散文（0.10）。这两处是本切片对导入导出切片文件的全部改动。
 
 ### 2.7 `src/utils/env-rows.ts`（新增，纯函数）
 
@@ -340,8 +378,8 @@ export interface HistoryGroup {
 
 **如实限定**：`v-for` 的 `:key` 接受任意 `string`，**branded type 挡不住 `:key="group.displayLabel"`**。所以：
 
-- §21（折叠状态）由 branded 类型 + **组件断言**共同保证；
-- §22（渲染身份）只由**源码 gate** 保证（裁定 A21），它断的是「模板里 `:key` 绑定到 `group.id`」这一事实，**不是**「重复 key 会导致错误的 patch 行为」。该限制写进测试文件注释，并有对应的人工检查点（4.5-c）。
+- §24（折叠状态）由 branded 类型 + **组件断言**共同保证；
+- §25（渲染身份）只由**源码 gate** 保证（裁定 A21），它断的是「模板里 `:key` 绑定到 `group.id`」这一事实，**不是**「重复 key 会导致错误的 patch 行为」。该限制写进测试文件注释，并有对应的人工检查点（4.5-c）。
 
 ### 2.9 `urlRevision` 的默认安全设计（R1-I2）
 
@@ -369,7 +407,7 @@ function updateTabFromUrlBar(id, updates)  // 唯一不递增的路径，仅供 
 | `src/stores/tabs.ts` | `openHistoryEntry` 复用谓词加 `!candidate.projectName && !candidate.savedRequestPath &&`；新增 2.9 的两条写入路径 |
 | `src/types/index.ts`（裁定 A19） | `CurlImportWarningCode` / `CurlImportWarning` / `CurlParseErrorCode` / `CurlImportNotice` 迁入；`HistoryGroup` 改 branded id；`Tab` 追加 `importNotice` 与 `urlRevision` |
 | `src/stores/console.ts` | `useConsoleStore(getActivePinia() ?? pinia)`；新增 `export const CONSOLE_LEVELS = [...] as const`，`ConsoleLevel` 由它派生 |
-| `src/components/panels/RequestPanel.vue` | 两条导入路径改用 `tabUpdatesFromParsedCurl`；渲染通知条（warning 行 + `pasteFailure` 行 + ✕）；给 `UrlBar` 传 `tab-id`；接 `pasteFallback` |
+| `src/components/panels/RequestPanel.vue` | 两条导入路径改用 `tabUpdatesFromParsedCurl`；渲染通知条（warning 行 + `pasteFailure` 行 + ✕）；给 `UrlBar` 传 **`tab-id` 与 `url-revision`**（§12(b)：漏传 `url-revision` 就会重造 R2-C1）；接 `pasteFallback` |
 | `src/components/sidebar/EnvironmentPanel.vue` | `rows` 改 `ref` + 2.7 |
 | `src/components/sidebar/HistoryPanel.vue` | 折叠状态改 `Set<HistoryGroupId>`；展示处用 `displayLabel` |
 | `src/components/sidebar/CollectionPanel.vue` | `exportCurrentProject` 调 `collectPostmanExportWarnings(requests)` → `exportFeedbackFor(warnings)` → `setFeedback` |
@@ -400,7 +438,7 @@ function updateTabFromUrlBar(id, updates)  // 唯一不递增的路径，仅供 
 | 「URL 栏 query 与线上 query 一致」表驱动测试 | **不受影响**：四行 fixture 全是字面量参数、无空白 key，0.3 已证逐字节等价 |
 | 同文件的 `splitUrlParts` 形状断言 | **必须改**（2.1 末尾），受控改动 |
 | 控制台网络行测试（从模块单例读条目） | **实测不受影响**（0.5）。仍须在改完 `console.ts` 后复跑全套并把结果写进 ACCEPTANCE |
-| 「不得退化成 method+url 去重」测试 | 本切片只**收紧**复用条件，继续成立，并被 §23 重新锁定 |
+| 「不得退化成 method+url 去重」测试 | 本切片只**收紧**复用条件，继续成立，并被 §27 重新锁定 |
 | `curl-parser` 的 `toThrow(new RegExp(verb))` | 改抛带 code 的错误类后仍绿（消息保留 verb） |
 | `postman-export.test.ts` 的 `IPC_NULL` 与内联 fixture | **不受影响**——rev2 不再改判据（0.6） |
 | `encodeQueryComponentPreservingTemplates` 的既有测试 | 2.3 只换内部实现、不改行为，必须继续绿 |
@@ -440,7 +478,7 @@ function updateTabFromUrlBar(id, updates)  // 唯一不递增的路径，仅供 
 
 现在的缺口正是接线：`pasteFallback` 的接收、失败原因的渲染、`warningMessageKeys` 的实际调用、告警行的条数、`exportFeedbackFor` 到集合 feedback 的接线、过滤按钮的渲染。**实现者可以把每个 helper 都写对、一个都不接，而纯函数测试与人工清单全部通过**——这正是本切片按 HIGH 处理的那类缺陷落在自己身上。grep 清单不是 gate，它不会红。
 
-**已裁定（A20）：引入 `@vue/test-utils` + `happy-dom`。** 理由：`?raw` 源码 gate 断的是文本而非行为——它无法区分「✕ 真的调用了 `updateTab`」与「源码里出现过这串字符」，一条注释就能满足它；而本切片要挡的恰恰是「看起来接上了、其实没有」。**裁定 A21** 相应把源码 gate 限定在**挂载无法回答**的两处（§22 的 `:key` 绑定、§47 的字面量清除），各自写明限制。
+**已裁定（A20）：引入 `@vue/test-utils` + `happy-dom`。** 理由：`?raw` 源码 gate 断的是文本而非行为——它无法区分「✕ 真的调用了 `updateTab`」与「源码里出现过这串字符」，一条注释就能满足它；而本切片要挡的恰恰是「看起来接上了、其实没有」。**裁定 A21** 相应把源码 gate 限定在**挂载无法回答**的两处（§25 的 `:key` 绑定、§53 的字面量清除），各自写明限制。
 
 选 `happy-dom` 而非 `jsdom`：更轻、启动更快。**不改 `vitest.config.ts` 的全局 `environment`**——组件测试文件各自用 `// @vitest-environment happy-dom` 文件头 docblock，现存 20 个文件的 `node` 环境零变化。所有组件测试一律 `shallowMount`（子组件全部 stub），避免把 CodeMirror 拉进 DOM 模拟环境。
 
@@ -469,11 +507,11 @@ owner 采纳该边界时的措辞是「rev1 那半论证成立，现在它是这
 | 8 | url-params | 纯函数 | DESIGNED | 末态显示串 === 目标串（10 个目标） | `return previous.draft` → `return incoming.url` |
 | 9 | url-params | 纯函数 | 冗余 | — | **与 §8 共用 killer，不独立可杀**，登记为 §8 在单次输入下的实例 |
 | 10 | url-params | 纯函数 | DESIGNED | Params 表改值后显示新值 | 删掉 `previous.revision !== incoming.revision` 整行 |
-| 11 | url-params | 纯函数 | **VERIFIED**（0.9） | 草稿 `%20` 被导入后的 `+` 取代 | 判据换回 `sameParse(...) ? previous.draft : incoming.url`。**§10 在此 mutant 下仍绿**——实跑确认 |
-| 12 | url-params-reactivity（**无 DOM**） + RequestPanel.spec | reactivity / 组件 | **VERIFIED**（0.11，reactivity 半边） | (a) revision-only 变化时协调器执行次数 === 1；(b) RequestPanel 传给 UrlBar 的 `url-revision` prop 存在 | (a) watch 源 `[props.url, props.tabId, props.urlRevision]` → `[props.url, props.tabId]`，实测执行次数由 1 变 0；(b) 模板里 `:url-revision="activeTab.urlRevision"` 整行删除。**两个用例各自单塌** |
+| 11 | url-params | 纯函数 | **VERIFIED**（0.9 + 0.13） | 草稿 `%20` 被导入后的 `+` 取代 | 判据换回 `sameParse(...) ? previous.draft : incoming.url`。**§10 在此 mutant 下仍绿**——实跑确认 |
+| 12 | url-params-reactivity（**无 DOM**） + RequestPanel.spec | reactivity / 组件 | **VERIFIED 仅 (a)**（0.13）；**(b) DESIGNED，从未运行** | (a) revision-only 变化时协调器执行次数 === 1；(b) RequestPanel 传给 UrlBar 的 `url-revision` prop 存在 | (a) watch 源 `[props.url, props.tabId, props.urlRevision]` → `[props.url, props.tabId]` —— 实跑：mutant 下 (a) 用例 RED、§13 邻居用例 GREEN；(b) 模板里 `:url-revision="activeTab.urlRevision"` 整行删除（**未跑**） |
 | 13 | url-params | 纯函数 | DESIGNED | 切 tab 后显示新 tab 的 url | 删掉 `previous.tabId !== incoming.tabId` 整行 |
-| 14 | request | store | **VERIFIED**（0.12） | `send_request` 次数 === 1（**该用例只断言这一项**） | 守卫整行删除 → 实测 2 次 |
-| 15 | request | store | **VERIFIED**（0.12） | 在途请求的响应落到 tab 上 + `append_history` 恰好一次（**该用例不断言调用次数**） | `{ return }` → `{ activeRequestIds.set(tab.id, crypto.randomUUID()); return }` → 实测调用次数仍为 1（§14 绿）、响应与历史双双消失 |
+| 14 | request | store | DESIGNED（0.13：无单塌 mutant） | `send_request` 次数 === 1（**该用例只断言这一项**） | 守卫整行删除 → 实测 2 次 |
+| 15 | request | store | DESIGNED（0.13：两条断言同塌） | 在途请求的响应落到 tab 上 + `append_history` 恰好一次（**该用例不断言调用次数**） | `{ return }` → `{ activeRequestIds.set(tab.id, crypto.randomUUID()); return }` → 实测调用次数仍为 1（§14 绿）、响应与历史双双消失 |
 | 16 | request | store | DESIGNED | 第二次 `send_request` 发生 | `finally` 里 `activeRequestIds.delete(tabId)` 整行删除 |
 | 17 | UrlBar.spec | 组件 | DESIGNED | `emitted().send` 为 undefined | `if (props.isLoading) { return }` 整行删除 |
 | 18 | env-rows | 纯函数 | DESIGNED | 编辑后 id 不变（key/value/secret 三行） | `{ ...row, ...patch }` → `{ ...row, ...patch, id: crypto.randomUUID() }` |
@@ -512,8 +550,8 @@ owner 采纳该边界时的措辞是「rev1 那半论证成立，现在它是这
 | 51 | console-filters + locale-matrix | 纯函数 | DESIGNED | 每个 labelKey 解析出的文案与矩阵逐字相等 | ``labelKey: `console.level.${level}` `` → `labelKey: level` |
 | 52 | DebugConsole.spec | 组件 | DESIGNED | 过滤按钮 `v-for` 条数 === 选项数 | 该 `v-for` 整行删除 |
 | 53 | source-gates | 源码（A21） | DESIGNED | 目标字面量不出现在源码里 | `BodyEditor.vue` 的 `{{ t("body.type") }}` → `Type`。**限制**：证明字面量不在，非「翻译真的被渲染」（4.5-e 补人工） |
-| 54 | console | store | **VERIFIED**（0.5） | `getActivePinia()` 身份不变（**该用例只断言这一句**） | `useConsoleStore(getActivePinia() ?? pinia)` → `useConsoleStore(pinia)` |
-| 55 | console | store | **VERIFIED**（0.5） | 模块单例条目数 === 0（**该用例前一句在此 mutant 下仍通过**） | 同 §54 一行；共用 mutant，**各有单塌用例** |
+| 54 | console | store | DESIGNED（0.13：与 §55 不可分离） | `getActivePinia()` 身份不变（**该用例只断言这一句**） | `useConsoleStore(getActivePinia() ?? pinia)` → `useConsoleStore(pinia)` |
+| 55 | console | store | DESIGNED（0.13：与 §54 不可分离） | 模块单例条目数 === 0（该用例前一句在此 mutant 下仍通过——**断言层单塌成立，用例层不成立**） | 同 §54 一行。**没有任何 patch 能让 §54 与 §55 一红一绿**，故两条都不计 VERIFIED |
 | 56 | locale-matrix | 纯函数 | DESIGNED | 20 个 key（14 自有 + 6 继承）× 2 语言的文案与 PRODUCT 表**逐字相等** | 两条各自单塌：(a) 把 `zh-CN.ts` 的 `curlImport.error.noUrl` 换成其 en 文案 → 该行红（旧式 `t(key) !== key` 断言在此 mutant 下**仍绿**）；(b) 把继承的 `curlImport.warning.cookieFile` 改成占位符仍在但语义错的句子 → 该行红（旧式「占位符存在」断言**仍绿**） |
 | 57 | locale-matrix | 纯函数 | DESIGNED | 文案含 `--data-urlencode` | `importCurlDescription` 改回原文 |
 | 58 | locale-parity | 纯函数 | DESIGNED | 键集相等 | 从 `en.ts` 删掉任一新键 |
@@ -561,42 +599,58 @@ P12 的原话是：判据必须**正向匹配「确实执行了」的证据**。
 - **f（§1–§13 的真实输入）**：逐字符手打 `https://api.test/a?x=1` 必须原样出现；粘贴 `…?api_key={{apiKey}}` 后地址栏显示花括号且出现「包含变量：apiKey」。
 - **g**：通知条与告警条出现时，1024×768 下不换行不溢出。
 
-### 4.6 覆盖台账（三态；rev4 起**不再从表格解析统计**）
+### 4.6 覆盖台账（三态；rev5 重新核定）
 
-这一格连错三轮，每次错在不同层次，全部留痕：
+这一格连错四轮，每轮错在不同层次，全部留痕：
 
 | 轮次 | 错法 |
 |---|---|
-| rev1 | 手数数错（40 说成 41、34 说成 38），并声称「没有 killer 落在 `.vue` 里」，与自己表里的字面量 gate 直接矛盾 |
-| rev2 | 仍手数，把 30 写成 31、把一条漏在列表外 |
-| rev3 | 改用脚本解析表格，**数字对了，判据错了**——把「这一格填了 patch 文本」当成「P9 单塌已成立」。脚本治好了手数，没治好**用错判据** |
+| rev1 | 手数数错，并声称「没有 killer 落在 `.vue` 里」，与自己表里的字面量 gate 矛盾 |
+| rev2 | 仍手数，把 30 写成 31、漏一条 |
+| rev3 | 改用脚本解析表格——**数字对了，判据错了**：把「填了 patch 栏」当成「单塌已成立」 |
+| rev4 | 改成三态——**判据写对了，没拿它查自己**：VERIFIED 桶里 6 条只有 2 条经得起该判据。§14 的反证数据**就在我自己交的那张四实现矩阵里**，我记录了推翻自己分类的证据然后没有回头看 |
 
-**rev4 的判据**：一条不变式只有在**实跑过「变异 ⇒ 该用例转红、且相邻用例不红」的对照**之后，才计入「已证明」。没跑过的，无论 patch 写得多具体，一律记 `DESIGNED`——**这是 P12 在我自己的台账上的应用：缺少证据的默认结论不能是良性结论。**
+**rev4 的错法值得单独说**：我上一轮撤回「51 条独立 killer」，理由是「表里填了 patch」是关于文档的陈述而非关于覆盖的陈述。换成三态之后，VERIFIED 桶犯了**结构完全相同**的错——「我跑了一个变异」被当成了「单塌已成立」，而没有检查邻居。**P9 的原话是「多项同时失败的 fixture 不能作为任何单条断言的承重证据」，我把它用在了别人身上。**
+
+**判据（rev5 起写死，避免再含糊）**：
+
+> **VERIFIED** = 已实跑「应用该 patch ⇒ 该不变式的用例转红」，**并且**已实跑确认**与它共用同一处生产代码**的其他不变式用例**保持绿**。
+> 两个条件缺一不可。只跑了前半 ⇒ DESIGNED。
 
 | 状态 | 条数 | 编号 |
 |---|---|---|
-| **VERIFIED**（本轮实跑过对照） | **6** | 11、12(a)、14、15、54、55 |
-| **DESIGNED**（有最小可编译 patch，未实跑） | 51 | 其余全部 |
-| **冗余**（明确不独立可杀） | 1 | §9 |
+| **VERIFIED** | **2** | §11、§12(a) |
+| **DESIGNED**（有最小可编译 patch，单塌未成立或未运行） | **55** | 其余全部（含 §12(b)、§14、§15、§54、§55） |
+| **冗余**（明确不独立可杀） | **1** | §9 |
 
-VERIFIED 六条的证据出处：§11 见 0.9；§12 的 reactivity 半边见 0.11；§14 / §15 见 0.12 的四行矩阵；§54 / §55 见 0.5。
+证据出处：§11 见 0.9 与 0.13(1)（两个共用同一函数的邻居都实测保持绿）；§12(a) 见 0.13(2)（本轮由测量升级为对照，邻居用例实测保持绿）。
+
+**本轮降级的四条及其原因**（0.13 有实跑数据）：
+
+| 条目 | 降级原因 |
+|---|---|
+| §14 | 唯一能让它红的 mutant 同时让 §15 红；两条属性经同一张 `activeRequestIds` 表耦合，守卫这一行的变异空间里无法分离 |
+| §15 | 有专属 mutant，但该 mutant 下用例内**两条断言同时失败**，没有一条被证明单独承重 |
+| §54 / §55 | 生产改动只有一行，两个用例在同一 mutant 下一起红，无 patch 能让一红一绿 |
+| §12(b) | 从未运行 |
 
 **结论及其适用范围（与度量分开写）**：
 
-- **「58 条中 57 条有 killer」是一句关于文档的陈述，不是关于覆盖的陈述。** 真正被实验证明过单塌的只有 6 条。规格阶段能做到的上限就是这个数——其余 51 条的生产代码尚不存在，**跑不了对照，也就不该声称已证明**。
-- 实现阶段的交付要求：**每一条 DESIGNED 必须转成 VERIFIED**，按 4.3 的协议记录，`INCONCLUSIVE` 不得计入。实现者的自检报告须给出三态分布，而不是「N 个变异全红」这类只有分子的数字。
-- §12 的两个用例中，(a) 已 VERIFIED 且**不依赖组件 harness**；(b) 依赖组件 harness，随 4.3 的结论生效或作废。
-- 组件层与源码 gate 那几条的有效性**全部以 4.3 两阶段自检通过为前提**。
+- **「58 条中 57 条有 killer」是关于文档的陈述。** 经实验证明单塌的只有 **2** 条。规格阶段的诚实上限就是这个数——rev4 说「六是规格阶段诚实的上限」，那句话本身没有过这把尺子。
+- 实现阶段交付要求：每一条 DESIGNED 转 VERIFIED，按 4.3 协议记录，`INCONCLUSIVE` 不计入。**自检报告须给出三态分布**，不得给「N 个变异全红」这类只有分子的数字。
+- §14/§15、§54/§55 两组要转 VERIFIED，需要在**更大的变异空间**里找分离点（例如变异 `isRequestActive` 的回写判据，使响应与历史可以分别塌）——那要等实现存在。**在此之前不得声称这两组「已被覆盖」。**
+- §12(a) 已 VERIFIED 且**不依赖组件 harness**；§12(b) 随 4.3 结论生效或作废。
+- 组件层与源码 gate 各条的有效性**全部以 4.3 两阶段自检通过为前提**。
 - §2 的成立**以 4.4-a 的后端编码实测为前提**（0.7 仍是推断）。
-- **仍未被任何自动化覆盖**：WebKit 焦点/选区行为（§18 真机面）、重复 `:key` 的错误 patch 行为（§25 行为面）、翻译文案的实际渲染（§34 / §53 渲染面）、1024×768 排版。四项在 4.5 有检查点，不计入任何覆盖统计。
+- **仍未被任何自动化覆盖**：WebKit 焦点/选区行为（§18）、重复 `:key` 的错误 patch 行为（§25）、翻译文案的实际渲染（§34 / §53）、1024×768 排版，以及 5.1 列出的三条组件降级项。全部在 4.5 有检查点，不计入任何覆盖统计。
 - **非承重项**（不得计作独立证据）：§9；§26 除「tab 数 +1」外的四项；§55 用例里的第一句。
 
 ### 4.7 对交接清单的偏离登记
 
 | 偏离 | 内容 | 理由 |
 |---|---|---|
-| 继承 key 少落地 1 个 | `curlImport.warning.authorizationNotPreserved` **不落地**，由 `curlImport.warning.authorizationLineBreaks` 与 `…Separator` 两个自足 key 取代 | 其 `{detail}` 的取值是英文散文（`"line breaks"` / `"separator whitespace"`，0.10 实读），插进中文句子会产出半英文的话，违反 §34。两种情形**可以同时发生**，拆开后各出一行，语义也更准 |
-| 连带改动 `curl-parser.ts` | 三个 throw 点改抛 `CurlParseErrorCode`；`storeAuthorizationValue` 的两个 push 点改用两个独立 code | §30 要求三种失败原因都本地化，携带英文消息做不到；§34 同理 |
+| 继承 key 少落地 1 个 | `curlImport.warning.authorizationNotPreserved` **不落地**，由 `curlImport.warning.authorizationLineBreaks` 与 `…Separator` 两个自足 key 取代 | 其 `{detail}` 的取值是英文散文（`"line breaks"` / `"separator whitespace"`，0.10 实读），插进中文句子会产出半英文的话，违反 §37。两种情形**可以同时发生**，拆开后各出一行，语义也更准 |
+| 连带改动 `curl-parser.ts` | 三个 throw 点改抛 `CurlParseErrorCode`；`storeAuthorizationValue` 的两个 push 点改用两个独立 code | §33 要求三种失败原因都本地化，携带英文消息做不到；§37 同理 |
 | 类型迁移 | `CurlImportWarningCode` / `CurlImportWarning` 由 `curl-parser.ts` 移入 `src/types/index.ts` | 裁定 A19。已核实全仓零第三方 importer，移动无涟漪 |
 
 ## 5. Risks and rollback
@@ -664,9 +718,9 @@ rev2 交付时只收到 1 条 IMPORTANT 的正文，其余 3 条未随裁定送�
 
 | id | 摘要 | 处置 |
 |---|---|---|
-| I1 | 「删掉 `label` 就是结构性保证」不成立——实现者可以改用 `displayLabel` 照样过 `vue-tsc` | rev2 已处置：拆成 §21（branded `Set` + 组件断言）与 §22（源码 gate，限制写明） |
-| I2 | `sameParse` 分不清 self-echo 与语义相同的外部更新，界面停在旧串上 | rev3 处置：判据改 revision 信号，`sameParse` 整个删除；新增 §9；0.9 实跑复现并验证；2.9 用「默认递增、单一豁免路径」把失败方向做成安全的 |
-| I3 | 自有 key 实为 9 非 11，缺两种失败原因，两个 Authorization detail 是硬编码英文 | rev3 处置：自有 key 更正为 13 并逐条列出；三类 parser error 改稳定 code；Authorization 拆成两个自足 key；新增 §30、§34；偏离登记在 4.7 |
+| I1 | 「删掉 `label` 就是结构性保证」不成立——实现者可以改用 `displayLabel` 照样过 `vue-tsc` | rev2 已处置：折叠状态改由 branded 类型 + 组件断言共同保证，渲染身份另由源码 gate 保证并写明限制（**此处刻意不写编号**——它跨轮重编过两次，见 IMPORTANT 1 的教训） |
+| I2 | `sameParse` 分不清 self-echo 与语义相同的外部更新，界面停在旧串上 | rev3 处置：判据改 revision 信号，`sameParse` 整个删除；新增「解析后等价仍须采纳」这一条；0.9 实跑复现并验证；2.9 用「默认递增、单一豁免路径」把失败方向做成安全的 |
+| I3 | 自有 key 实为 9 非 11，缺两种失败原因，两个 Authorization detail 是硬编码英文 | rev3 处置：自有 key 更正为 13 并逐条列出；三类 parser error 改稳定 code；Authorization 拆成两个自足 key；新增「三种失败原因全部本地化」与「detail 永远是数据」两条；偏离登记在 4.7 |
 | I4 | `src/types/index.ts` 越界，且 `CurlImportWarning` 会形成 types → utils 逆向依赖 | rev3 处置：按裁定 A19 纳入范围并把两个类型迁入 types 层（0.10 已核实零第三方 importer） |
 
 **本节保留而不删除**，因为它记录的是一次**交付链路的失误**（裁定送达但正文未附）以及当时的正确应对方式：登记缺口、拒绝猜测、显式声明产物不完整。这比结论本身更值得留痕。
