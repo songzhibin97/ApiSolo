@@ -311,6 +311,83 @@ describe("exportPostmanCollection", () => {
     expect(binary.request.body.file.src).toBe("payload.bin")
   })
 
+  // The shape a saved request actually has when it comes back from Rust.
+  //
+  // read_saved_request runs sanitize_saved_request_for_persistence, which
+  // assigns file_content = None (lib.rs:1453) and binary_content = None
+  // (lib.rs:1439). Neither Option<String> declares skip_serializing_if -- the
+  // single field in lib.rs that does is EnvVariable.vault_key -- so serde
+  // writes the key with a JSON null rather than omitting it. Verified by
+  // serializing the same struct shape: {"fileContent":null}.
+  //
+  // The TypeScript declaration says `fileContent?: string`, which is why every
+  // fixture in this file had been written with `undefined`. The cast is the
+  // point of the test: it models the wire, not the declaration.
+  const IPC_NULL = null as unknown as undefined
+
+  it("treats a Rust-blanked file field as having no in-memory content", () => {
+    const multipart = exportSingle(
+      makeRequest({
+        name: "Loaded Multipart",
+        method: "POST",
+        body: {
+          type: "form-data",
+          content: "",
+          formData: [fileField({ fileName: "报告.pdf", fileContent: IPC_NULL })],
+          binaryPath: "",
+        },
+      })
+    )
+
+    // Fixture self-check (PROCESS P6): this must be a real null, not undefined.
+    expect(multipart.request.body.formdata[0]).toBeDefined()
+    expect(IPC_NULL).toBeNull()
+
+    expect(multipart.request.body.formdata[0].src).toBe("报告.pdf")
+    expect(multipart.request.body.formdata[0].description).toBeUndefined()
+
+    const binary = exportSingle(
+      makeRequest({
+        name: "Loaded Binary",
+        method: "POST",
+        body: {
+          type: "binary",
+          content: "",
+          formData: [],
+          binaryPath: "报告.pdf",
+          binaryContent: IPC_NULL,
+        },
+      })
+    )
+
+    expect(binary.request.body.file.src).toBe("报告.pdf")
+    expect(binary.request.description).toBeUndefined()
+
+    expect(
+      collectPostmanExportWarnings([
+        makeRequest({
+          name: "Loaded Multipart",
+          body: {
+            type: "form-data",
+            content: "",
+            formData: [fileField({ fileName: "报告.pdf", fileContent: IPC_NULL })],
+            binaryPath: "",
+          },
+        }),
+        makeRequest({
+          name: "Loaded Binary",
+          body: {
+            type: "binary",
+            content: "",
+            formData: [],
+            binaryPath: "报告.pdf",
+            binaryContent: IPC_NULL,
+          },
+        }),
+      ])
+    ).toEqual([])
+  })
+
   // Behavior 40
   it("does not duplicate a query string left in the saved url", () => {
     const item = exportSingle(
