@@ -23,6 +23,16 @@ const authTypes = computed<{ label: string; value: AuthType }[]>(() => [
 const selectedType = computed(() => props.modelValue.type);
 const authDescription = computed(() => t(`auth.description.${selectedType.value}`));
 
+/**
+ * The URL bar deliberately does not render the query API key (its value is
+ * usually the secret itself). Without saying so here, a user who picks Query
+ * and then sees no parameter in the address cannot tell a safety measure from
+ * a broken feature.
+ */
+const isQueryApiKey = computed(
+  () => selectedType.value === "api-key" && (props.modelValue.apiKey?.addTo ?? "header") === "query",
+);
+
 function updateAuth(value: AuthConfig) {
   emit("update:modelValue", value);
 }
@@ -206,6 +216,13 @@ function updateApiKeyLocation(event: Event) {
         <option value="header">{{ t("auth.header") }}</option>
         <option value="query">{{ t("auth.query") }}</option>
       </select>
+
+      <p
+        v-if="isQueryApiKey"
+        class="text-xs leading-relaxed text-[var(--text-secondary)] md:col-span-3"
+      >
+        {{ t("auth.queryKeyHidden") }}
+      </p>
     </div>
   </div>
 </template>

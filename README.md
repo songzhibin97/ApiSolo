@@ -66,6 +66,7 @@ ApiSolo stores data locally. It does not require a cloud account.
 - Secret storage config: `$HOME/ApiSolo/scratch/secret-storage.json` stores only the chosen backend, not secret values or the local vault password.
 - Secret metadata: `.env.secrets.json` stores names and vault references only; secret values are written as empty strings.
 - Migration: if an older `.env.secrets.json` contains plaintext secret values, ApiSolo imports them into the selected secret backend on first load and rewrites the metadata file without plaintext.
+- An API key configured under Auth with **Add to: Query** is appended to the query string only when the request is sent; it is deliberately not shown in the URL bar, so the key never appears in an address you might copy or screenshot. An empty-looking address bar here means the key is hidden, not missing.
 - Saved requests and history keep variable placeholders such as `{{token}}`, but redact direct auth/header secret values and strip `fileContent` / `binaryContent` bytes before persistence.
 - Redaction is driven by the field name only; credentials written under a non-sensitive field name — including the value of an ordinary header or param — are neither redacted nor marked, and are stored as-is.
 - A request opened from history has its redacted values restored as empty, marked fields. They must be re-entered before the request will succeed; the placeholder `[redacted]` is never sent on the wire.

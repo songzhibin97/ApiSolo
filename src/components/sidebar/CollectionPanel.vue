@@ -190,6 +190,7 @@ async function copyRequestAsCurl(path: string) {
     testScript: request.testScript,
     projectName: activeProject.value,
     savedRequestPath: path,
+    urlRevision: 0,
   })
 
   await navigator.clipboard.writeText(command)

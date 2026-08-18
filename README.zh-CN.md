@@ -66,6 +66,7 @@ ApiSolo 只在本机保存数据，不依赖云账号。
 - 密钥存储配置：`$HOME/ApiSolo/scratch/secret-storage.json` 只保存选择的 backend，不保存密钥值或本地 Vault 主密码。
 - 密钥元数据：`.env.secrets.json` 只保存变量名和 vault 引用；密钥值会写成空字符串。
 - 迁移：如果旧版 `.env.secrets.json` 里有明文密钥，ApiSolo 首次加载时会导入当前选择的密钥 backend，并重写元数据文件去掉明文。
+- 认证方式选择 API Key 且「添加到」为 Query 时，该键值只在**发送时**追加到查询串；出于密钥保护，URL 栏不显示它，以免密钥出现在你可能复制或截图的地址里。地址栏看不到它说明它被隐藏了，不是没生效。
 - 保存请求和历史记录会保留 `{{token}}` 这类变量占位符，但会脱敏直接写入的认证/请求头密钥值，并在持久化前移除 `fileContent` / `binaryContent` 字节。
 - UI 中选择的上传文件属于当前会话数据；保存和历史条目只保留脱敏后的文件标签/占位信息。
 - 代理认证密码不会持久化到浏览器 localStorage。

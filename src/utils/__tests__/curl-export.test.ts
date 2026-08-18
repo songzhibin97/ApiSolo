@@ -19,6 +19,7 @@ function makeTab(overrides: Partial<Tab> = {}): Tab {
     testScript: "",
     projectName: null,
     savedRequestPath: null,
+    urlRevision: 0,
     ...overrides,
   }
 }

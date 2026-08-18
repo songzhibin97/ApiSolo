@@ -32,6 +32,7 @@ function makeTab(overrides: Partial<Tab> = {}): Tab {
     testScript: "",
     projectName: "demo",
     savedRequestPath: "auth/token.json",
+    urlRevision: 0,
     ...overrides,
   }
 }

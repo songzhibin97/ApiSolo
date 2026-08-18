@@ -55,6 +55,7 @@ const createEmptyTab = (index: number): Tab => ({
   responseError: null,
   scriptResult: null,
   isLoading: false,
+  urlRevision: 0,
 });
 
 function createSnapshotTab(tab: Pick<Tab, "label" | "method" | "url">): Tab {
@@ -79,6 +80,7 @@ function createSnapshotTab(tab: Pick<Tab, "label" | "method" | "url">): Tab {
     responseError: null,
     scriptResult: null,
     isLoading: false,
+    urlRevision: 0,
   };
 }
 
@@ -235,13 +237,43 @@ export const useTabsStore = defineStore("tabs", () => {
     }
   }
 
+  /**
+   * The default write path. Any update that touches `url` or `params` bumps
+   * `urlRevision`, which is how the URL bar knows the change did not come from
+   * its own keystrokes.
+   *
+   * The default is deliberately the safe side. A new write point that forgets
+   * about the revision still gets one, and the cost of a *spurious* bump is
+   * cosmetic — the field is replaced by the canonical form of a state that is
+   * genuinely current. The cost of a *missing* bump is the failure this slice
+   * exists to remove: the field keeps showing a string that no longer
+   * corresponds to anything.
+   */
   function updateTab(id: string, updates: Partial<Tab>) {
+    applyTabUpdates(id, updates, true);
+  }
+
+  /**
+   * The one path that does not bump the revision: the URL bar writing back what
+   * the user just typed. Only `UrlBar`'s own echo may use this — anything else
+   * that reaches for it will make the field stop following the state.
+   */
+  function updateTabFromUrlBar(id: string, updates: Partial<Tab>) {
+    applyTabUpdates(id, updates, false);
+  }
+
+  function applyTabUpdates(id: string, updates: Partial<Tab>, bumpUrlRevision: boolean) {
     const tab = tabs.value.find((item) => item.id === id);
     if (!tab) {
       return;
     }
 
+    const touchesUrl = "url" in updates || "params" in updates;
     Object.assign(tab, updates);
+
+    if (bumpUrlRevision && touchesUrl) {
+      tab.urlRevision += 1;
+    }
   }
 
   async function closeSavedRequest(projectName: string, requestPath: string) {
@@ -425,6 +457,10 @@ export const useTabsStore = defineStore("tabs", () => {
       Object.assign(matchingEmptyTab, {
         ...tab,
         id: existingId,
+        // Reuse rewrites url and params without going through updateTab, so
+        // the bump has to happen here. Without it a draft left in the URL bar
+        // would survive an open-from-history that produced the same string.
+        urlRevision: matchingEmptyTab.urlRevision + 1,
       })
       activeTabId.value = existingId
       return
@@ -494,6 +530,7 @@ export const useTabsStore = defineStore("tabs", () => {
     removeTab,
     setActiveTab,
     updateTab,
+    updateTabFromUrlBar,
     reorderTab,
     closeOtherTabs,
     closeTabsToRight,
