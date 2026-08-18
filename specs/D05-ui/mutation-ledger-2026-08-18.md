@@ -100,8 +100,8 @@ append_pair("a b", "c d")                                            ⇒  a+b=c+
 | `tabs.ts`：`updateTabFromUrlBar` 改成递增 | H | RED 1/315 | 「URL 栏回写不递增」 | ✅ |
 | `tabs.ts`：`openHistoryEntry` 复用分支不再递增 | H | RED 1/315 | 「历史条目接管空白 tab 时递增」 | ✅ |
 | `RequestPanel.vue`：`updateTabFromUrlBar` → `updateTab` | **W** | RED 1/315 | 「回写走不递增的那条路径」 | ✅ |
-| `RequestPanel.vue`：Params 编辑器的 `@update:model-value="updateParams"` → `updateParams(activeTab.params)`（**独立评审 R1 发现**）| **W** | RED 1/317 | 「params 表编辑进入请求、渲染串与 revision」**单塌** | ✅ |
-| `RequestPanel.vue`：`applyPastedCurl` 的 `updateTab` → `updateTabFromUrlBar`（**独立评审 R1 发现**）| **W** | RED 1/317 | 「粘贴 curl 进入请求且被标记为外部写入」**单塌** | ✅ |
+| `RequestPanel.vue`：Params 编辑器的 `@update:model-value="updateParams"` → `updateParams(activeTab.params)`（**独立评审 R1 发现**）| **W** | RED 1/317 | 「params 表编辑进入请求、渲染串与 revision」**用例单塌** | **断言组承重**：params 断言与 URL 断言**各自单独移除后用例仍红**，两条都不满足 P9 的单塌判据（见 4.8）|
+| `RequestPanel.vue`：`applyPastedCurl` 的 `updateTab` → `updateTabFromUrlBar`（**独立评审 R1 发现**）| **W** | RED 1/317 | 「粘贴 curl 进入请求且被标记为外部写入」**用例单塌** | ✅ **单条承重**（只移除 revision 断言 ⇒ 用例转绿，实测）|
 | `UrlBar.vue`：`onUrlInput` 不写 `draft` | **W** | RED 2/315 | §12(a)「把草稿与新来源交给协调器」＋§7 接线用例 | — |
 | `url-query.ts`：`splitTemplateSpans` → `[value]`（共享原语） | H | RED 2/315 | §1 两条（混排、模板旁的字节） | — |
 
@@ -243,7 +243,7 @@ P14 说存活有**三种**成因，第三种是「补丁是空操作、生产代
 | **INCONCLUSIVE** | **0** | —— |
 | **SURVIVED** | **0** | 先后有 **4** 条 P8 接线变异存活：2 条由起草者在台账里自查出（裁定 A27 关闭），2 条由**独立评审 R1** 找到（本轮关闭）。四条形状相同：生产代码是对的，缺的是**调用点**的测试 |
 
-**度量**：HEAD `bcb7bc7` 上整批跑 **25 个 mutant ⇒ RED 24 / ILLEGAL-PATCH 1 / SURVIVED 0 / INCONCLUSIVE 0**（那 1 条 ILLEGAL-PATCH 是 §12(b) 的冻结 killer，被类型系统挡下，见第 3 节）。独立评审 R1 之后在 `836acda` 上补跑 **2 个 mutant ⇒ RED 2**，基线全套由 315 增至 **317 passed**。**23 条 P9 承重对照全部 `LOAD-BEARING`**。
+**度量**：HEAD `bcb7bc7` 上整批跑 **25 个 mutant ⇒ RED 24 / ILLEGAL-PATCH 1 / SURVIVED 0 / INCONCLUSIVE 0**（那 1 条 ILLEGAL-PATCH 是 §12(b) 的冻结 killer，被类型系统挡下，见第 3 节）。独立评审 R1 之后在 `836acda` 上补跑 **2 个 mutant ⇒ RED 2**，基线全套由 315 增至 **317 passed**。**23 条 P9 承重对照中 22 条 `LOAD-BEARING`，1 条（KWIRE5）为断言组承重**。
 
 > **这 23 条是起草者自己的度量。** 独立评审本轮只复跑了其中 1 条（`KWIRE2`：移除承重断言后该 mutant 下全套转绿，对照成立），并明确拒绝把抽样写成完整复核。**「23 条全部承重」是我的实跑结论，不是被独立复核过的结论**——两者不能互相顶替。
 
@@ -272,8 +272,8 @@ P14 说存活有**三种**成因，第三种是「补丁是空操作、生产代
 关闭方式与 A27 那两条一致——**断言结果状态，不是 spy 调用**：
 
 ```
-KWIRE5（params 载荷被忽略）      ⇒ RED 1/317，单塌，P9 对照 LOAD-BEARING
-KWIRE6（粘贴走豁免路径）         ⇒ RED 1/317，单塌，P9 对照 LOAD-BEARING
+KWIRE5（params 载荷被忽略）      ⇒ RED 1/317，用例单塌；P9 见下（断言组承重）
+KWIRE6（粘贴走豁免路径）         ⇒ RED 1/317，用例单塌；P9 单条承重
 ```
 
 **为什么不用 spy**：spy 证明「某个函数被调用过」，证明不了「请求真的变了」。变异 A 下 `updateParams` **照样被调用**，只是拿到的是旧数组——一个 spy 断言在它下面会保持绿。
@@ -281,3 +281,27 @@ KWIRE6（粘贴走豁免路径）         ⇒ RED 1/317，单塌，P9 对照 LOA
 **四条连起来的形状是同一个**：生产代码正确、helper 有测试、store 有测试，**唯独没有人测「这两端有没有接上」**。P8 的原话就是这个。四条里有两条是自查出来的，两条要靠独立评审——**说明自查抓得到这一类，但抓不全**。
 
 **owner 的判准值得记下来**：评审判 0C（IMPORTANT 不阻断合并），owner 仍然拦下了，理由是「**判准是缺陷能不能静默复活，不是评审给的严重度标签**」——否则 A27 那次拦截就变成了任意判断。
+
+
+---
+
+## 4.8 KWIRE5 的 P9 声称过强 —— 独立评审 R2 指出，我复测后确认，并发现它只适用于两条中的一条
+
+**我原来的写法**：KWIRE5 与 KWIRE6 并列记「单塌，P9 对照 LOAD-BEARING」。**其中一半是错的。**
+
+原因是我做 P9 对照时，两个用例都**一次移除了两条断言**，于是测到的是「这一组断言承重」，而 P9 要的是「**移除该单条**断言 ⇒ 用例转绿」。评审在 KWIRE5 上拆开测了，我按同一手法把两条都拆开重测：
+
+| 对照 | 结果 |
+|---|---|
+| KWIRE5，只移除 params 断言 | 用例**仍红**（URL 断言接着塌） |
+| KWIRE5，只移除 URL 断言 | 用例**仍红**（params 断言接着塌） |
+| KWIRE5，两条都移除 | 317 passed |
+| **KWIRE6，只移除 revision 断言** | **用例转绿** ⇒ **单条承重成立** |
+
+**所以这不是一条结论，是两条**：KWIRE5 是断言组承重，KWIRE6 是货真价实的单条承重。评审只查了 KWIRE5，我如果照它的结论把两条一起降级，就会**把一条正确的声称也改错**——一个来自评审的修正同样需要被核实。
+
+**处置（owner 裁定）：改措辞，不改测试。** KWIRE5 那两条断言**各自都在做实事**（单独留下任何一条都会让 mutant 转红），它们只是**都抓同一个 mutant**——**那是冗余，不是承重不足**。
+
+**明确不做的事**：不把该用例拆成两条来让 P9 形式上成立。拆开确实能让每条单独承重，但那是**为了满足一个判据而改造被测对象**——P7 记录的正是这种事。判据的目的是「别留下不承重的断言」，而这两条都承重。
+
+**这一条与第 2 节的 §10/§11 是同一族**：都是「断言层承重成立、用例层单塌不成立」。区别在于 §10/§11 是**不可分离**（找不到隔离的 mutant），而 KWIRE5 是**可分离但没必要分**（拆开只为了迁就判据）。**两种情况都不该记 ✅，但也都不该被读成"测试有问题"。**
