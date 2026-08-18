@@ -1,0 +1,7 @@
+{
+  "sensitive": ["Cookie","Set-Cookie","Authorization","access_token","accessToken","refreshToken",
+                "idToken","authToken","sessionToken","csrfToken","clientSecret","X-API-Key","apikey",
+                "X-Api-Token","password","passwd","Ocp-Apim-Subscription-Key","subscription-key",
+                "X-Amz-Signature","aws-credential"],
+  "insensitive": ["key","Content-Type","Accept","page","keyword","monkey","X-Request-Id","user-agent"]
+}

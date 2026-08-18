@@ -1,0 +1,457 @@
+import { describe, expect, it } from "vitest"
+
+import sharedKeys from "../__fixtures__/sensitive-keys.json"
+import {
+  REDACTION_SENTINEL,
+  applyPairEdit,
+  bodyKindFromBodyType,
+  bodyKindFromContentType,
+  clearSentinelBody,
+  clearSentinelPairs,
+  hasPendingRedactedFields,
+  isSensitiveKey,
+  lenientDecodeKey,
+  redactBodyText,
+  redactKeyValuePairs,
+  redactUrlQuery,
+  redactValue,
+  sentinelBodyFields,
+} from "../redaction"
+import type { KeyValuePair, Tab } from "../../types"
+
+// `~` stands for a single backslash everywhere in this file. Escapes written as
+// literals have been silently eaten by the writing chain before (repo rule P6),
+// so every escaped fixture is built at runtime and self-checked before use.
+const B = String.fromCharCode(92)
+const esc = (value: string) => value.split("~").join(B)
+
+const COOKIE = "sid=abcdef123456; theme=dark"
+const JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcDEF-_123"
+const BASIC = "dXNlcjpwYXNzd29yZA=="
+const DIGEST =
+  'username="Mufasa", realm="testrealm@host.com", nonce="dcd98b7102dd2f0e", uri="/dir/index.html", response=6629fae49393a05397450978507c4ef1'
+const BIG_INT = "9007199254740993123456789"
+
+function pair(key: string, value: string, overrides: Partial<KeyValuePair> = {}): KeyValuePair {
+  return { id: `${key}-1`, enabled: true, key, value, description: "", ...overrides }
+}
+
+function makeTab(overrides: Partial<Tab> = {}): Tab {
+  return {
+    id: "tab-1",
+    label: "tab",
+    method: "POST",
+    url: "https://api.example.com/users",
+    protocol: "http",
+    isDirty: false,
+    params: [],
+    headers: [],
+    body: { type: "none", content: "", formData: [], binaryPath: "", binaryContent: "" },
+    auth: { type: "none" },
+    preRequestScript: "",
+    testScript: "",
+    projectName: null,
+    savedRequestPath: null,
+    ...overrides,
+  }
+}
+
+describe("§3 redacted marker lifecycle", () => {
+  const marked = [pair("Cookie", "", { redacted: true })]
+
+  it.each([
+    ["enabled", { enabled: false } as Partial<KeyValuePair>],
+    ["key", { key: "Cookie2" } as Partial<KeyValuePair>],
+    ["description", { description: "note" } as Partial<KeyValuePair>],
+  ])("keeps the marker when %s changes", (_field, patch) => {
+    expect(applyPairEdit(marked, "Cookie-1", patch)[0].redacted).toBe(true)
+  })
+
+  it("clears the marker when value changes", () => {
+    expect(applyPairEdit(marked, "Cookie-1", { value: "sid=1" })[0].redacted).toBe(false)
+  })
+})
+
+describe("§4 pending redacted fields", () => {
+  it("reports pending redacted fields until every marker is cleared", () => {
+    const headerOnly = makeTab({ headers: [pair("Cookie", "", { redacted: true })] })
+    expect(hasPendingRedactedFields(headerOnly)).toBe(true)
+
+    const paramOnly = makeTab({ params: [pair("access_token", "", { redacted: true })] })
+    expect(hasPendingRedactedFields(paramOnly)).toBe(true)
+
+    const formDataOnly = makeTab({
+      body: { type: "form-data", content: "", formData: [pair("password", "", { redacted: true })], binaryPath: "", binaryContent: "" },
+    })
+    expect(hasPendingRedactedFields(formDataOnly)).toBe(true)
+
+    const bodyOnly = makeTab({ bodyRedacted: true })
+    expect(hasPendingRedactedFields(bodyOnly)).toBe(true)
+
+    const cleared = makeTab({
+      headers: [pair("Cookie", "sid=1", { redacted: false })],
+      bodyRedacted: false,
+    })
+    expect(hasPendingRedactedFields(cleared)).toBe(false)
+  })
+})
+
+describe("§11 json bytes outside the redacted span", () => {
+  it.each([
+    [
+      "a big integer",
+      `{"id":${BIG_INT},"password":"hunter2"}`,
+      `{"id":${BIG_INT},"password":"${REDACTION_SENTINEL}"}`,
+    ],
+    [
+      "duplicate non-sensitive keys",
+      '{"id":1,"id":2,"password":"hunter2"}',
+      `{"id":1,"id":2,"password":"${REDACTION_SENTINEL}"}`,
+    ],
+    [
+      "indentation and newlines",
+      '{\n  "id": 1,\n  "password": "hunter2"\n}',
+      `{\n  "id": 1,\n  "password": "${REDACTION_SENTINEL}"\n}`,
+    ],
+    [
+      "a float literal",
+      '{"ratio":1.5e-3,"password":"hunter2"}',
+      `{"ratio":1.5e-3,"password":"${REDACTION_SENTINEL}"}`,
+    ],
+    [
+      "escape sequences in a string",
+      esc('{"note":"line~nbreak ~"q~"","password":"hunter2"}'),
+      esc(`{"note":"line~nbreak ~"q~"","password":"${REDACTION_SENTINEL}"}`),
+    ],
+    ["no sensitive key at all", '{\n  "id": 1\n}', '{\n  "id": 1\n}'],
+  ])("preserves non-matching json bytes for %s", (_name, input, expected) => {
+    expect(redactBodyText("json", input)).toBe(expected)
+  })
+})
+
+describe("§12 sensitive json values and recursion", () => {
+  it.each([
+    ["string", '{"password":"hunter2"}'],
+    ["number", '{"password":42}'],
+    ["bool", '{"password":true}'],
+    ["null", '{"password":null}'],
+    ["object", '{"password":{"a":1}}'],
+    ["array", '{"password":[1,2]}'],
+  ])("redacts a sensitive json value of type %s", (_name, input) => {
+    expect(redactBodyText("json", input)).toBe(`{"password":"${REDACTION_SENTINEL}"}`)
+  })
+
+  it.each([
+    [
+      "nested objects",
+      '{"a":{"b":{"c":{"password":"p"}}}}',
+      `{"a":{"b":{"c":{"password":"${REDACTION_SENTINEL}"}}}}`,
+    ],
+    [
+      "an array inside an object",
+      '{"a":[{"b":{"clientSecret":"x"}}]}',
+      `{"a":[{"b":{"clientSecret":"${REDACTION_SENTINEL}"}}]}`,
+    ],
+    [
+      "an array inside an array",
+      '{"a":[[{"token":"t"}]]}',
+      `{"a":[[{"token":"${REDACTION_SENTINEL}"}]]}`,
+    ],
+  ])("descends into non-matching %s", (_name, input, expected) => {
+    expect(redactBodyText("json", input)).toBe(expected)
+  })
+})
+
+describe("§13 escaped json keys", () => {
+  const ESCAPED_PASSWORD = esc('{"~u0070assword":"hunter2"}')
+  const ESCAPED_AUTHORIZATION = esc('{"~u0041uthorization":"Basic eHh4"}')
+  const ESCAPED_SOLIDUS = esc('{"api~/password":"p","n":1}')
+  const ILLEGAL_ESCAPE = esc('{"pa~xss":"1","password":"y"}')
+  const SURROGATE_PAIR = esc('{"pass~ud83d~ude00word":"x","password":"y"}')
+  const ESCAPED_QUOTE = esc('{"pa~"ss":"1","token":"t"}')
+  const ESCAPED_BACKSPACE = esc('{"pa~bssword":"x","cookie":"c"}')
+
+  it("uses fixtures that still contain real backslashes", () => {
+    expect(ESCAPED_PASSWORD).toContain(`${B}u0070`)
+    expect(ESCAPED_AUTHORIZATION).toContain(`${B}u0041`)
+    expect(ESCAPED_SOLIDUS).toContain(`${B}/`)
+    expect(ILLEGAL_ESCAPE).toContain(`${B}x`)
+    expect(SURROGATE_PAIR).toContain(`${B}ud83d${B}ude00`)
+    expect(ESCAPED_QUOTE).toContain(`${B}"`)
+    expect(ESCAPED_BACKSPACE).toContain(`${B}b`)
+  })
+
+  it("treats an escaped json key as its decoded name", () => {
+    // redaction — the decoded name decides, the original key bytes survive
+    expect(redactBodyText("json", ESCAPED_PASSWORD)).toBe(
+      esc(`{"~u0070assword":"${REDACTION_SENTINEL}"}`),
+    )
+    expect(redactBodyText("json", ESCAPED_AUTHORIZATION)).toBe(
+      esc(`{"~u0041uthorization":"${REDACTION_SENTINEL}"}`),
+    )
+    expect(redactBodyText("json", ESCAPED_SOLIDUS)).toBe(
+      esc(`{"api~/password":"${REDACTION_SENTINEL}","n":1}`),
+    )
+    // an illegal escape fails the scan and falls back to the text path
+    expect(redactBodyText("json", ILLEGAL_ESCAPE)).toBe(
+      esc(`{"pa~xss":"1","password":${REDACTION_SENTINEL}`),
+    )
+    expect(redactBodyText("json", SURROGATE_PAIR)).toBe(
+      esc(`{"pass~ud83d~ude00word":"x","password":"${REDACTION_SENTINEL}"}`),
+    )
+    expect(redactBodyText("json", ESCAPED_QUOTE)).toBe(
+      esc(`{"pa~"ss":"1","token":"${REDACTION_SENTINEL}"}`),
+    )
+    expect(redactBodyText("json", ESCAPED_BACKSPACE)).toBe(
+      esc(`{"pa~bssword":"x","cookie":"${REDACTION_SENTINEL}"}`),
+    )
+
+    // clearing — key bytes survive there too
+    expect(clearSentinelBody("json", esc(`{"~u0070assword":"${REDACTION_SENTINEL}"}`))).toEqual({
+      content: esc('{"~u0070assword":""}'),
+      cleared: true,
+    })
+
+    // the gate names the decoded key
+    expect(sentinelBodyFields("json", esc(`{"~u0070assword":"${REDACTION_SENTINEL}"}`))).toEqual([
+      "password",
+    ])
+    expect(sentinelBodyFields("json", esc(`{"api~/password":"${REDACTION_SENTINEL}","n":1}`))).toEqual([
+      "api/password",
+    ])
+  })
+})
+
+describe("§14 urlencoded bodies", () => {
+  it("keeps every urlencoded field and non-matching bytes", () => {
+    const redacted = redactBodyText("urlencoded", "grant_type=password&password=p&client_secret=xyz")
+
+    expect(redacted).toBe(
+      `grant_type=password&password=${REDACTION_SENTINEL}&client_secret=${REDACTION_SENTINEL}`,
+    )
+    expect(redacted.split("&")).toHaveLength(3)
+    // the separator is the first `=`, so a value containing `=` keeps its key
+    expect(redactBodyText("urlencoded", "token=abc=def&page=2")).toBe(
+      `token=${REDACTION_SENTINEL}&page=2`,
+    )
+  })
+})
+
+describe("§15 text bodies", () => {
+  it.each([
+    ["basic", `Authorization: Basic ${BASIC}`, `Authorization: ${REDACTION_SENTINEL}`],
+    ["digest", `Authorization: Digest ${DIGEST}`, `Authorization: ${REDACTION_SENTINEL}`],
+    ["spacey", "password  =  hunter2", `password  =  ${REDACTION_SENTINEL}`],
+  ])("redacts %s to end of line", (_name, input, expected) => {
+    const redacted = redactBodyText("text", input)
+
+    expect(redacted).toBe(expected)
+    expect(redacted.split(REDACTION_SENTINEL)).toHaveLength(2)
+    expect(redacted).not.toContain("Mufasa")
+    expect(redacted).not.toContain(BASIC)
+  })
+})
+
+describe("§17 non-sensitive key-value pairs", () => {
+  const rows = [
+    pair("X-Note", "password: hunter2"),
+    pair("X-Sample", `Bearer ${JWT}`),
+    pair("X-Challenge", `Digest ${DIGEST}`),
+  ]
+
+  it.each([["headers"], ["params"], ["formData"]])(
+    "keeps a non-sensitive %s value byte-identical",
+    () => {
+      expect(redactKeyValuePairs(rows).map((row) => row.value)).toEqual([
+        "password: hunter2",
+        `Bearer ${JWT}`,
+        `Digest ${DIGEST}`,
+      ])
+    },
+  )
+
+  it("still redacts by field name", () => {
+    expect(redactValue("Cookie", COOKIE)).toBe(REDACTION_SENTINEL)
+    expect(redactValue("Cookie", "")).toBe("")
+  })
+})
+
+describe("§18 line terminators", () => {
+  it.each([
+    ["LF", "\n"],
+    ["CRLF", "\r\n"],
+    ["lone CR", "\r"],
+  ])("preserves %s line terminators", (_name, terminator) => {
+    const input = `password: hunter2${terminator}X-Note: keep`
+    expect(redactBodyText("text", input)).toBe(
+      `password: ${REDACTION_SENTINEL}${terminator}X-Note: keep`,
+    )
+  })
+})
+
+describe("§19 idempotence and scan state", () => {
+  it("is idempotent across all paths", () => {
+    const cases: [Parameters<typeof redactBodyText>[0], string][] = [
+      ["json", '{"id":1,"password":"hunter2","nested":{"token":"t"}}'],
+      ["urlencoded", "grant_type=password&password=p&client_secret=xyz"],
+      ["text", `Cookie: ${COOKIE}\r\nAuthorization: Basic ${BASIC}\rX-Note: keep`],
+    ]
+
+    for (const [kind, input] of cases) {
+      const once = redactBodyText(kind, input)
+      expect(redactBodyText(kind, once)).toBe(once)
+    }
+  })
+
+  it("produces the same result for a line alone and inside a multi-line body", () => {
+    const lines = [`Cookie: ${COOKIE}`, "Authorization: Bearer tok", "password: hunter2"]
+
+    expect(redactBodyText("text", lines.join("\n"))).toBe(
+      `Cookie: ${REDACTION_SENTINEL}\nAuthorization: ${REDACTION_SENTINEL}\npassword: ${REDACTION_SENTINEL}`,
+    )
+  })
+
+  it("is unaffected by a preceding call", () => {
+    expect(redactBodyText("text", "Cookie: a=1")).toBe(`Cookie: ${REDACTION_SENTINEL}`)
+    expect(redactBodyText("text", `Authorization: Basic ${BASIC}`)).toBe(
+      `Authorization: ${REDACTION_SENTINEL}`,
+    )
+    expect(redactBodyText("text", "password: hunter2")).toBe(`password: ${REDACTION_SENTINEL}`)
+  })
+})
+
+describe("§20 malformed percent escapes", () => {
+  it("never throws on malformed percent escapes", () => {
+    expect(redactBodyText("urlencoded", "%E0%A4%A=1&pass%word=2&%70assword%ZZ=3")).toBe(
+      `%E0%A4%A=1&pass%word=2&%70assword%ZZ=${REDACTION_SENTINEL}`,
+    )
+    expect(redactUrlQuery("https://api.example.com/s?%E0%A4%A=1&%70assword%ZZ=3")).toBe(
+      `https://api.example.com/s?%E0%A4%A=1&%70assword%ZZ=${REDACTION_SENTINEL}`,
+    )
+  })
+
+  it("decodes leniently", () => {
+    expect(lenientDecodeKey("%70assword%ZZ")).toBe("password%ZZ")
+    expect(lenientDecodeKey("%E0%A4%A")).toBe("%E0%A4%A")
+    expect(lenientDecodeKey("pass%word")).toBe("pass%word")
+  })
+})
+
+describe("§21 documented over-redaction", () => {
+  it.each([
+    [
+      "urlencoded text under a raw body",
+      "text" as const,
+      "grant_type=password&password=p&client_secret=xyz",
+      `grant_type=password&password=${REDACTION_SENTINEL}`,
+    ],
+    [
+      "a single-line curl command",
+      "text" as const,
+      `curl -H 'Authorization: Basic ${BASIC}' https://x`,
+      `curl -H 'Authorization: ${REDACTION_SENTINEL}`,
+    ],
+    [
+      "unparsable json",
+      "json" as const,
+      '{"password":"hunter2"',
+      `{"password":${REDACTION_SENTINEL}`,
+    ],
+  ])("over-redacts %s (documented)", (_name, kind, input, expected) => {
+    expect(redactBodyText(kind, input)).toBe(expected)
+  })
+})
+
+describe("§22–§24 the field-name hard list", () => {
+  it("matches camelCase sensitive keys", () => {
+    for (const key of [
+      "accessToken",
+      "refreshToken",
+      "idToken",
+      "authToken",
+      "sessionToken",
+      "csrfToken",
+      "clientSecret",
+    ]) {
+      expect(isSensitiveKey(key)).toBe(true)
+    }
+  })
+
+  it("matches the shared fixture", () => {
+    for (const key of sharedKeys.sensitive) {
+      expect([key, isSensitiveKey(key)]).toEqual([key, true])
+    }
+
+    for (const key of sharedKeys.insensitive) {
+      expect([key, isSensitiveKey(key)]).toEqual([key, false])
+    }
+  })
+})
+
+describe("§25 url query redaction", () => {
+  it.each([
+    ["a percent escape", "https://api.example.com/s?q=a%20b", "https://api.example.com/s?q=a%20b"],
+    ["a plus sign", "https://api.example.com/s?q=a+b", "https://api.example.com/s?q=a+b"],
+    ["host casing", "https://API.Example.COM/s?q=1", "https://API.Example.COM/s?q=1"],
+    ["a default port", "https://api.example.com:443/s?q=1", "https://api.example.com:443/s?q=1"],
+    ["a fragment", "https://api.example.com/s?q=1#frag", "https://api.example.com/s?q=1#frag"],
+    ["a relative url", "/api/items?q=1", "/api/items?q=1"],
+    [
+      "a template on a non-matching key",
+      "https://api.example.com/s?path={{base}}%2Fusers",
+      "https://api.example.com/s?path={{base}}%2Fusers",
+    ],
+    [
+      "a repeated sensitive key",
+      "https://api.example.com/s?token=a&token=b",
+      `https://api.example.com/s?token=${REDACTION_SENTINEL}&token=${REDACTION_SENTINEL}`,
+    ],
+  ])("preserves every non-matching byte of the url for %s", (_name, input, expected) => {
+    expect(redactUrlQuery(input)).toBe(expected)
+  })
+
+  it("leaves a url without a query untouched", () => {
+    expect(redactUrlQuery("https://api.example.com/s#frag")).toBe("https://api.example.com/s#frag")
+  })
+})
+
+describe("body kind dispatch", () => {
+  it("maps declared types, never sniffs content", () => {
+    expect(bodyKindFromBodyType("json")).toBe("json")
+    expect(bodyKindFromBodyType("form-urlencoded")).toBe("urlencoded")
+    expect(bodyKindFromBodyType("raw")).toBe("text")
+    expect(bodyKindFromBodyType("none")).toBe("text")
+
+    expect(bodyKindFromContentType("application/json; charset=utf-8")).toBe("json")
+    expect(bodyKindFromContentType("application/x-www-form-urlencoded")).toBe("urlencoded")
+    expect(bodyKindFromContentType("text/plain")).toBe("text")
+  })
+})
+
+describe("clearing the sentinel out of a body", () => {
+  it("clears a sensitive field and leaves prose alone", () => {
+    expect(clearSentinelBody("urlencoded", `user=bob&password=${REDACTION_SENTINEL}`)).toEqual({
+      content: "user=bob&password=",
+      cleared: true,
+    })
+    expect(clearSentinelBody("text", `Cookie: ${REDACTION_SENTINEL}`)).toEqual({
+      content: "Cookie: ",
+      cleared: true,
+    })
+    expect(clearSentinelBody("text", `note: the string ${REDACTION_SENTINEL} appears here`)).toEqual({
+      content: `note: the string ${REDACTION_SENTINEL} appears here`,
+      cleared: false,
+    })
+    expect(clearSentinelBody("json", `{"note":"${REDACTION_SENTINEL}"}`)).toEqual({
+      content: `{"note":"${REDACTION_SENTINEL}"}`,
+      cleared: false,
+    })
+  })
+
+  it("clears sentinel pairs and marks them", () => {
+    expect(clearSentinelPairs([pair("Cookie", REDACTION_SENTINEL), pair("page", "1")])).toEqual([
+      { id: "Cookie-1", enabled: true, key: "Cookie", value: "", description: "", redacted: true },
+      { id: "page-1", enabled: true, key: "page", value: "1", description: "" },
+    ])
+  })
+})
