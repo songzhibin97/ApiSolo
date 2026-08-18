@@ -67,6 +67,11 @@ ApiSolo stores data locally. It does not require a cloud account.
 - Secret metadata: `.env.secrets.json` stores names and vault references only; secret values are written as empty strings.
 - Migration: if an older `.env.secrets.json` contains plaintext secret values, ApiSolo imports them into the selected secret backend on first load and rewrites the metadata file without plaintext.
 - Saved requests and history keep variable placeholders such as `{{token}}`, but redact direct auth/header secret values and strip `fileContent` / `binaryContent` bytes before persistence.
+- Redaction is driven by the field name only; credentials written under a non-sensitive field name — including the value of an ordinary header or param — are neither redacted nor marked, and are stored as-is.
+- A request opened from history has its redacted values restored as empty, marked fields. They must be re-entered before the request will succeed; the placeholder `[redacted]` is never sent on the wire.
+- Request scripts still read plaintext secret values through `pm.environment.get`. Only a whole-value copy into a new variable inherits the secret marker; derived copies such as `token.slice(0, 10)` do not.
+- After upgrading, `signature` / `credential` / `subscription-key` style fields in existing collection requests are shown empty and need re-entering. The file on disk is untouched until you save that request.
+- A redacted non-string JSON value (number, boolean, null, object, array) comes back as an empty string `""` when replayed from history; its type changes.
 - File uploads selected in the UI are session data; saved and historical entries keep only sanitized labels/placeholders.
 - Proxy authentication passwords are not persisted to browser local storage.
 - Pre-request scripts abort the request on failure and report the error in the active tab and console.

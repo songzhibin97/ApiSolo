@@ -9,6 +9,9 @@ import { useRequestStore } from "../../stores/request";
 import { isUntitledTabLabel, useTabsStore } from "../../stores/tabs";
 import { exportCurl } from "../../utils/curl-export";
 import { parseCurl } from "../../utils/curl-parser";
+import { hasPendingRedactedFields, pendingRedactedFieldNames } from "../../utils/redaction";
+import { buildSavedRequest } from "../../utils/saved-request";
+import { buildUrlWithParams, syncParamsFromUrl } from "../../utils/url-params";
 import AuthEditor from "../request/AuthEditor.vue";
 import BodyEditor from "../request/BodyEditor.vue";
 import KeyValueEditor from "../request/KeyValueEditor.vue";
@@ -20,7 +23,6 @@ import type {
   HttpMethod,
   KeyValuePair,
   RequestBody,
-  SavedRequest,
   Tab,
 } from "../../types";
 
@@ -57,6 +59,13 @@ const sections = computed(() => {
     { key: "scripts" as const, label: t("request.scripts"), count: countScripts(tab) },
   ];
 });
+
+const redactedFieldLabels = computed(() =>
+  [
+    ...pendingRedactedFieldNames(activeTab.value),
+    ...(activeTab.value.bodyRedacted ? [t("request.historyRedactedBody")] : []),
+  ].join(", "),
+);
 
 const collectionOptions = computed(() => [
   { label: t("common.rootCollection"), value: "" },
@@ -136,7 +145,8 @@ function updateHeaders(headers: KeyValuePair[]) {
 }
 
 function updateBody(body: RequestBody) {
-  updateActiveTab({ body });
+  const contentChanged = body.content !== activeTab.value.body.content;
+  updateActiveTab({ body, ...(contentChanged ? { bodyRedacted: false } : {}) });
 }
 
 function updateAuth(auth: AuthConfig) {
@@ -190,7 +200,11 @@ async function submitSave() {
   saveError.value = "";
 
   try {
-    await projectsStore.saveRequest(saveCollection.value, buildSavedRequest(activeTab.value), activeTab.value);
+    await projectsStore.saveRequest(
+      saveCollection.value,
+      buildSavedRequest(activeTab.value, saveName.value),
+      activeTab.value,
+    );
     showSaveDialog.value = false;
   } catch (error) {
     saveError.value = error instanceof Error ? error.message : String(error);
@@ -263,95 +277,12 @@ async function copyAsCurl() {
   }, 1500);
 }
 
-function buildSavedRequest(tab: Tab): SavedRequest {
-  return {
-    name: saveName.value.trim(),
-    method: tab.method,
-    url: tab.url,
-    params: stripTransientFields(tab.params),
-    headers: stripTransientFields(tab.headers),
-    body: sanitizeBodyForSave(tab.body),
-    auth: {
-      type: tab.auth.type,
-      basic: tab.auth.basic,
-      bearer: tab.auth.bearer,
-      apiKey: tab.auth.apiKey,
-    },
-    preRequestScript: tab.preRequestScript,
-    testScript: tab.testScript,
-  };
-}
-
-function sanitizeBodyForSave(body: RequestBody): RequestBody {
-  if (body.type === "form-data") {
-    return {
-      type: "form-data",
-      content: "",
-      formData: stripTransientFields(body.formData).map((item) =>
-        item.valueType === "file"
-          ? {
-              ...item,
-              fileName: sanitizeFileLabel(item.fileName || item.filePath || item.key),
-              filePath: "",
-              fileContent: undefined,
-            }
-          : item,
-      ),
-      binaryPath: "",
-      binaryContent: "",
-    }
-  }
-
-  if (body.type === "binary") {
-    return {
-      type: "binary",
-      content: "",
-      formData: [],
-      binaryPath: sanitizeFileLabel(body.binaryPath),
-      binaryContent: undefined,
-    }
-  }
-
-  if (body.type === "none") {
-    return {
-      type: "none",
-      content: "",
-      formData: [],
-      binaryPath: "",
-      binaryContent: undefined,
-    }
-  }
-
-  return {
-      type: body.type,
-      content: body.content,
-      formData: [],
-      binaryPath: "",
-      binaryContent: undefined,
-    }
-  }
-
-function stripTransientFields<T extends KeyValuePair>(items: T[]): T[] {
-  return items.map(({ id: _id, ...item }) => ({
-    id: "",
-    ...item,
-  })) as T[]
-}
-
 function deriveCollectionPath(path: string | null) {
   if (!path || !path.includes("/")) {
     return "";
   }
 
   return path.split("/").slice(0, -1).join("/");
-}
-
-function sanitizeFileLabel(value: string) {
-  if (!value) {
-    return ""
-  }
-
-  return value.split(/[\\/]/).pop() ?? value
 }
 
 function flattenFolders(nodes: CollectionNode[]): { label: string; value: string }[] {
@@ -392,62 +323,6 @@ function handleOutsideClick(event: MouseEvent) {
   requestActionsOpen.value = false;
 }
 
-function syncParamsFromUrl(rawUrl: string, currentParams: KeyValuePair[]) {
-  try {
-    const parsed = new URL(toParsableUrl(rawUrl));
-    const params = [...parsed.searchParams.entries()].map(([key, value]) => ({
-      id: crypto.randomUUID(),
-      enabled: true,
-      key,
-      value,
-      description: "",
-    }));
-    // Store URL without query string — params are the source of truth
-    const { baseUrl, hash } = splitUrlParts(rawUrl);
-    return {
-      url: `${baseUrl}${hash}`,
-      params: [...params, ...currentParams.filter((item) => !item.enabled)],
-    };
-  } catch {
-    return {
-      url: rawUrl,
-      params: currentParams,
-    };
-  }
-}
-
-function buildUrlWithParams(rawUrl: string, params: KeyValuePair[]) {
-  const { baseUrl, hash } = splitUrlParts(rawUrl)
-  const searchParams = new URLSearchParams()
-
-  for (const item of params) {
-    if (item.enabled && item.key) {
-      searchParams.append(item.key, item.value)
-    }
-  }
-
-  const query = searchParams.toString()
-  const urlWithoutHash = query ? `${baseUrl}?${query}` : baseUrl
-  return `${urlWithoutHash}${hash}`
-}
-
-function splitUrlParts(rawUrl: string) {
-  const hashIndex = rawUrl.indexOf("#")
-  const hash = hashIndex === -1 ? "" : rawUrl.slice(hashIndex)
-  const beforeHash = hashIndex === -1 ? rawUrl : rawUrl.slice(0, hashIndex)
-  const queryIndex = beforeHash.indexOf("?")
-  const baseUrl = queryIndex === -1 ? beforeHash : beforeHash.slice(0, queryIndex)
-
-  return {
-    baseUrl,
-    hash,
-  }
-}
-
-function toParsableUrl(rawUrl: string) {
-  return rawUrl.includes("://") ? rawUrl : `http://placeholder${rawUrl.startsWith("/") || rawUrl.startsWith("?") ? "" : "/"}${rawUrl}`
-}
-
 onMounted(() => {
   window.addEventListener("apisolo:save-request", onSaveShortcut as EventListener);
   document.addEventListener("click", handleOutsideClick);
@@ -473,6 +348,13 @@ onUnmounted(() => {
       @copy-curl="copyAsCurl"
       @paste-curl="applyPastedCurl"
     />
+
+    <div
+      v-if="hasPendingRedactedFields(activeTab)"
+      class="border-b border-amber-500/40 bg-amber-500/10 px-4 py-2 text-sm text-amber-300"
+    >
+      {{ t("request.historyRedactedBanner", { fields: redactedFieldLabels }) }}
+    </div>
 
     <div
       class="flex flex-nowrap items-center gap-3 border-b border-[var(--border)] bg-[color-mix(in_srgb,var(--bg-primary)_92%,black)] px-4 py-2.5"

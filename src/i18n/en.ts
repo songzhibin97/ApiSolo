@@ -20,6 +20,8 @@ export default {
     environmentNameRequired: "Environment name is required.",
     binaryBodyUnsupported: "Binary request body is not supported yet.",
     fileSelectionRequired: "Select the file again before sending this upload.",
+    redactionSentinelOnWire:
+      "Request not sent: {field} still holds the placeholder [redacted]. Enter a real value; to send this literal text, put it in an environment variable and reference it as {'{{'}name{'}}'}.",
   },
   layout: {
     collections: "Collections",
@@ -47,6 +49,9 @@ export default {
     cancel: "Cancel",
     sending: "Sending...",
     urlRequired: "Please enter a request URL",
+    historyRedactedBanner:
+      "This request came from history. These were redacted when it was saved and need re-entering: {fields}. Left empty, they are sent empty.",
+    historyRedactedBody: "request body",
     containsVariables: "Contains variables:",
     params: "Params",
     headers: "Headers",
@@ -77,6 +82,7 @@ export default {
     on: "On",
     del: "Del",
     deleteRow: "Delete row",
+    redactedPlaceholder: "Redacted — re-enter",
   },
   body: {
     none: "None",
@@ -210,7 +216,8 @@ export default {
     method: "method",
     depth: "Depth",
     securityNotice:
-      "History stores requests as entered. Use environment variables for sensitive values you do not want persisted to disk.",
+      "History redacts by field name: values of cookie / authorization / token / password fields are never written to disk; anything under other field names is saved as-is. A request opened from history needs those values re-entered before it will succeed.",
+    legacySanitized: "Removed plaintext credentials from {count} history entries.",
     empty: "History is empty",
     emptyDescription: "Sent requests will appear here with grouping, search, and quick reopen actions.",
     clearHistory: "Clear History",

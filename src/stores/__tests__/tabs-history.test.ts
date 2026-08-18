@@ -2,7 +2,12 @@ import { beforeEach, describe, expect, it } from "vitest"
 import { createPinia, setActivePinia } from "pinia"
 
 import { useTabsStore } from "../tabs"
-import type { HistoryEntry } from "../../types"
+import { REDACTION_SENTINEL, hasPendingRedactedFields } from "../../utils/redaction"
+import type { HistoryEntry, KeyValuePair } from "../../types"
+
+function pair(key: string, value: string): KeyValuePair {
+  return { id: "", enabled: true, key, value, description: "" }
+}
 
 function makeHistoryEntry(overrides: Partial<HistoryEntry> = {}): HistoryEntry {
   return {
@@ -259,5 +264,113 @@ describe("useTabsStore.openHistoryEntry", () => {
 
     expect(store.tabs).toHaveLength(3)
     expect(store.activeTab.body.content).toBe("{\"name\":\"bob\"}")
+  })
+
+  describe("§1 sentinel values never come back into a tab", () => {
+    it.each([
+      ["headers", "requestHeaders"],
+      ["params", "requestParams"],
+      ["formData", "requestBodyFormData"],
+    ] as const)("blanks sentinel values in %s", (collection, entryField) => {
+      const store = useTabsStore()
+
+      store.openHistoryEntry(
+        makeHistoryEntry({
+          url: "https://api.example.com/users",
+          requestParams: [pair("page", "1")],
+          requestHeaders: [pair("X-Test", "enabled")],
+          requestBodyType: "form-data",
+          requestBodyFormData: [pair("note", "keep")],
+          [entryField]: [pair("Cookie", REDACTION_SENTINEL), pair("page", "1")],
+        }),
+      )
+
+      const opened = store.activeTab
+      const rows = collection === "formData" ? opened.body.formData : opened[collection]
+
+      expect(rows[0]).toEqual(expect.objectContaining({ key: "Cookie", value: "", redacted: true }))
+      expect(rows[1]).toEqual(expect.objectContaining({ key: "page", value: "1" }))
+      expect(rows[1].redacted).toBeUndefined()
+      expect(hasPendingRedactedFields(opened)).toBe(true)
+    })
+  })
+
+  describe("§2 sentinel bodies are structurally cleared", () => {
+    it.each([
+      ["json", `{"user":"bob","password":"${REDACTION_SENTINEL}"}`, '{"user":"bob","password":""}'],
+      [
+        "form-urlencoded",
+        `user=bob&password=${REDACTION_SENTINEL}`,
+        "user=bob&password=",
+      ],
+      ["raw", `Cookie: ${REDACTION_SENTINEL}`, "Cookie: "],
+    ])("clears sentinel body for %s body", (bodyType, content, expected) => {
+      const store = useTabsStore()
+
+      store.openHistoryEntry(
+        makeHistoryEntry({ requestBodyType: bodyType, requestBodyContent: content }),
+      )
+
+      expect(store.activeTab.body.content).toBe(expected)
+      expect(store.activeTab.bodyRedacted).toBe(true)
+      expect(hasPendingRedactedFields(store.activeTab)).toBe(true)
+    })
+
+    it("leaves a body whose prose merely mentions the sentinel alone", () => {
+      const store = useTabsStore()
+      const content = `note: the string ${REDACTION_SENTINEL} appears here`
+
+      store.openHistoryEntry(
+        makeHistoryEntry({ requestBodyType: "raw", requestBodyContent: content }),
+      )
+
+      expect(store.activeTab.body.content).toBe(content)
+      expect(store.activeTab.bodyRedacted).toBe(false)
+      expect(hasPendingRedactedFields(store.activeTab)).toBe(false)
+    })
+  })
+
+  describe("§10 the restored response is display-only", () => {
+    it("keeps restored response headers out of the request headers", () => {
+      const store = useTabsStore()
+
+      store.openHistoryEntry(
+        makeHistoryEntry({
+          url: "https://api.example.com/users",
+          requestParams: [],
+          responseHeaders: [
+            ["set-cookie", "sid=abcdef123456"],
+            ["content-type", "application/json"],
+          ],
+          responseBody: '{"ok":true}',
+        }),
+      )
+
+      expect(store.activeTab.headers).toHaveLength(0)
+      expect(store.activeTab.response?.headers).toHaveLength(2)
+    })
+  })
+
+  describe("§41 early entries without headers or params", () => {
+    it("opens a legacy entry without headers or params cleanly", () => {
+      const store = useTabsStore()
+
+      store.openHistoryEntry(
+        makeHistoryEntry({
+          url: "https://api.example.com/users",
+          requestParams: undefined,
+          requestHeaders: undefined,
+          requestBodyType: undefined,
+          requestBodyContent: undefined,
+        }),
+      )
+
+      const opened = store.activeTab
+      expect(opened.headers).toEqual([])
+      expect(opened.params).toEqual([])
+      expect(opened.body.type).toBe("none")
+      expect(opened.bodyRedacted).toBe(false)
+      expect(hasPendingRedactedFields(opened)).toBe(false)
+    })
   })
 })

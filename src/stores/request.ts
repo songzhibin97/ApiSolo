@@ -7,6 +7,12 @@ import { useHistoryStore } from "./history"
 import { resolveTemplate } from "../utils/resolve-template"
 import { executeScript } from "../utils/script-executor"
 import { invoke } from "../utils/invoke"
+import {
+  findSentinelFields,
+  redactValue,
+  sanitizeHistoryEntry,
+} from "../utils/redaction"
+import { stripQueryFromUrl } from "../utils/url-params"
 import { useTabsStore } from "./tabs"
 import type {
   EnvVariable,
@@ -89,9 +95,19 @@ export const useRequestStore = defineStore("request", () => {
 
     try {
       const environmentsStore = useEnvironmentsStore()
+
+      // Gate on the unresolved snapshot: a variable that resolves to the
+      // literal sentinel is a deliberate escape hatch and must still go out.
+      const sentinelFields = findSentinelFields(requestSnapshot)
+      if (sentinelFields.length > 0) {
+        throw new Error(
+          i18n.global.t("errors.redactionSentinelOnWire", { field: sentinelFields.join(", ") }),
+        )
+      }
+
       let variables = environmentsStore.variables.map((item) => ({ ...item }))
       let resolvedTab = resolveTabVariables(requestSnapshot, variables)
-      const requestLabel = formatRequestLabel(resolvedTab.method, resolvedTab.url)
+      const requestLabel = formatRequestLabel(requestSnapshot.method, requestSnapshot.url)
 
       recordConsoleEntry("info", `[network] ${requestLabel} started`, "network")
 
@@ -260,11 +276,6 @@ function buildPayload(
   }
 }
 
-function stripQueryFromUrl(url: string) {
-  const [baseUrl] = url.split("?")
-  return baseUrl
-}
-
 function sanitizeProxyPayload(proxyConfig: ProxyConfig): ProxyConfig {
   return {
     ...proxyConfig,
@@ -373,6 +384,9 @@ function toVariableMap(variables: EnvVariable[]) {
 
 function mergeVariables(variables: EnvVariable[], updates: Record<string, string>) {
   const variableMap = new Map(variables.map((item) => [item.key, { ...item }]))
+  const knownSecretValues = new Set(
+    variables.filter((item) => item.secret && item.value).map((item) => item.value),
+  )
 
   for (const [key, value] of Object.entries(updates)) {
     const current = variableMap.get(key)
@@ -384,7 +398,7 @@ function mergeVariables(variables: EnvVariable[], updates: Record<string, string
     variableMap.set(key, {
       key,
       value,
-      secret: false,
+      secret: knownSecretValues.has(value),
     })
   }
 
@@ -454,7 +468,7 @@ function buildScriptRequest(tab: Tab) {
 }
 
 function buildHistoryEntry(tab: Tab, response: HttpResponse): HistoryEntry {
-  return {
+  const raw: HistoryEntry = {
     id: crypto.randomUUID(),
     method: tab.method,
     url: tab.url,
@@ -464,10 +478,10 @@ function buildHistoryEntry(tab: Tab, response: HttpResponse): HistoryEntry {
     timings: response.timings,
     timestamp: new Date().toISOString(),
     contentType: response.contentType,
-    requestParams: redactKeyValuePairs(tab.params.filter((param) => param.enabled && param.key)),
-    requestHeaders: redactKeyValuePairs(tab.headers.filter((header) => header.enabled && header.key)),
+    requestParams: tab.params.filter((param) => param.enabled && param.key),
+    requestHeaders: tab.headers.filter((header) => header.enabled && header.key),
     requestBodyType: tab.body.type,
-    requestBodyContent: redactSensitiveText(tab.body.content),
+    requestBodyContent: tab.body.content,
     requestAuthType: tab.auth.type,
     requestAuth: redactAuth(tab.auth),
     requestBodyFormData: sanitizeHistoryFormData(tab.body.formData),
@@ -477,10 +491,12 @@ function buildHistoryEntry(tab: Tab, response: HttpResponse): HistoryEntry {
     testScript: tab.testScript,
     responseBody:
       response.body.length > HISTORY_RESPONSE_BODY_LIMIT
-        ? `${redactSensitiveText(response.body.slice(0, HISTORY_RESPONSE_BODY_LIMIT))}\n[truncated]`
-        : redactSensitiveText(response.body),
-    responseHeaders: redactResponseHeaders(response.headers),
+        ? `${response.body.slice(0, HISTORY_RESPONSE_BODY_LIMIT)}\n[truncated]`
+        : response.body,
+    responseHeaders: response.headers,
   }
+
+  return sanitizeHistoryEntry(raw)
 }
 
 function sanitizeHistoryFormData(formData: FormDataItem[]) {
@@ -530,40 +546,3 @@ function redactAuth(auth: Tab["auth"]) {
   return { type: "none" as const }
 }
 
-function redactKeyValuePairs<T extends KeyValuePair>(items: T[]): T[] {
-  return items.map((item) => ({
-    ...item,
-    value: redactValue(item.key, item.value),
-  }))
-}
-
-function redactResponseHeaders(headers: [string, string][]): [string, string][] {
-  return headers.map(([key, value]) => [key, redactValue(key, value)])
-}
-
-function redactValue(key: string, value: string) {
-  return isSensitiveKey(key) && value ? "[redacted]" : redactSensitiveText(value)
-}
-
-function isSensitiveKey(key: string) {
-  return /(^|[-_\s])(authorization|cookie|set-cookie|token|secret|password|passwd|api[-_\s]?key|x[-_\s]?api[-_\s]?key)([-_\s]|$)/i.test(
-    key,
-  )
-}
-
-function redactSensitiveText(value: string) {
-  if (!value) {
-    return value
-  }
-
-  return value
-    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1[redacted]")
-    .replace(
-      /(["']?(?:password|passwd|token|secret|api[-_]?key|authorization)["']?\s*[:=]\s*)["'][^"'\r\n}]*["']/gi,
-      '$1"[redacted]"',
-    )
-    .replace(
-      /(["']?(?:password|passwd|token|secret|api[-_]?key|authorization)["']?\s*[:=]\s*)["']?([^"',\s}]+)["']?/gi,
-      "$1[redacted]",
-    )
-}
