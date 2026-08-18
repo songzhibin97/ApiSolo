@@ -12,19 +12,21 @@ use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use rand_core::{OsRng, RngCore};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
-use reqwest::{Client, Method, Url};
+use reqwest::header::{
+    HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH,
+    CONTENT_TYPE,
+};
+use reqwest::{Client, Method, Request as ReqwestRequest, RequestBuilder, Url};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::net::ToSocketAddrs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, PhysicalSize, WebviewWindow, WindowEvent};
-use tokio::net::TcpStream;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::AbortHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -167,7 +169,7 @@ struct ApiKeyAuth {
     add_to: String,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 struct RequestTimings {
     dns_lookup: u64,
@@ -191,43 +193,140 @@ impl Default for RequestTimings {
     }
 }
 
-async fn measure_connection_timings(url: &Url) -> Result<(u64, u64), String> {
-    let host = url
-        .host_str()
-        .ok_or_else(|| "Invalid URL: missing host".to_string())?
-        .to_string();
-    let port = url
-        .port_or_known_default()
-        .ok_or_else(|| "Invalid URL: missing port".to_string())?;
+/// Upper bound on how much of the overall request budget the pre-connect
+/// timing probe may consume. The probe spends *from* the total budget, never
+/// on top of it.
+const CONNECTION_PROBE_MAX: Duration = Duration::from_secs(5);
+
+/// Share the remaining probe budget fairly across the addresses still to be
+/// tried, so a single blackholed address cannot starve the ones behind it.
+fn per_attempt_budget(remaining: Duration, remaining_attempts: usize) -> Duration {
+    if remaining_attempts == 0 || remaining.is_zero() {
+        return Duration::ZERO;
+    }
+    remaining / remaining_attempts as u32
+}
+
+/// Connection loop with an injectable `connect`, so the budget arithmetic and
+/// the address walk can be tested without sockets or wall-clock timing.
+/// Returns the index of the address that connected and how long it took.
+fn connect_first_reachable_with<C>(
+    addrs: &[SocketAddr],
+    total_budget: Duration,
+    mut connect: C,
+) -> Option<(usize, u64)>
+where
+    C: FnMut(&SocketAddr, Duration) -> std::io::Result<()>,
+{
+    let mut remaining = total_budget;
+    for (index, addr) in addrs.iter().enumerate() {
+        let budget = per_attempt_budget(remaining, addrs.len() - index);
+        if budget.is_zero() {
+            return None;
+        }
+        let started_at = Instant::now();
+        let outcome = connect(addr, budget);
+        let elapsed = started_at.elapsed();
+        remaining = remaining.saturating_sub(elapsed);
+        if outcome.is_ok() {
+            return Some((index, elapsed.as_millis() as u64));
+        }
+    }
+    None
+}
+
+/// Bound the whole probe - DNS resolution included - by `budget`. Every failure
+/// mode collapses to "not measured"; the probe never decides whether the real
+/// request runs.
+async fn run_probe_within_budget<F>(budget: Duration, probe: F) -> (u64, u64)
+where
+    F: std::future::Future<Output = Result<(u64, u64), String>>,
+{
+    match tokio::time::timeout(budget, probe).await {
+        Ok(Ok(measured)) => measured,
+        Ok(Err(_)) => (0, 0),
+        Err(_) => (0, 0),
+    }
+}
+
+/// The fallible half of the probe. Runs entirely on the blocking pool because
+/// both `to_socket_addrs` and `connect_timeout` are synchronous.
+///
+/// `connect` is injectable so that the budget actually handed to each address
+/// can be observed. That matters more than it looks: an earlier version took no
+/// budget at all here and the address loop used the constant, which meant the
+/// caller's budget was silently dropped and the fair-share guarantee only held
+/// when the caller's budget happened to equal the constant.
+fn probe_connection_with<C>(
+    host: String,
+    port: u16,
+    budget: Duration,
+    connect: C,
+) -> Result<(u64, u64), String>
+where
+    C: FnMut(&SocketAddr, Duration) -> std::io::Result<()>,
+{
     let addr = format!("{host}:{port}");
+    let started_at = Instant::now();
+    let addrs = addr
+        .to_socket_addrs()
+        .map(|iter| iter.collect::<Vec<_>>())
+        .map_err(|error| format!("DNS resolve failed: {error}"))?;
+    let dns_elapsed = started_at.elapsed();
+    let dns_lookup = dns_elapsed.as_millis() as u64;
 
-    let dns_started_at = Instant::now();
-    let addrs =
-        tokio::task::spawn_blocking(move || -> Result<Vec<std::net::SocketAddr>, String> {
-            addr.to_socket_addrs()
-                .map(|iter| iter.collect())
-                .map_err(|error| format!("DNS resolve failed: {error}"))
-        })
-        .await
-        .map_err(|error| format!("DNS task failed: {error}"))??;
-    let dns_lookup = dns_started_at.elapsed().as_millis() as u64;
+    if addrs.is_empty() {
+        return Err("DNS resolve failed: no addresses found".to_string());
+    }
 
-    let target_addr = addrs
-        .first()
-        .copied()
-        .ok_or_else(|| "DNS resolve failed: no addresses found".to_string())?;
+    // Whatever DNS spent comes out of the same budget; the address loop only
+    // gets what is left, and splits that fairly across the addresses.
+    let remaining = budget.saturating_sub(dns_elapsed);
 
-    let tcp_started_at = Instant::now();
-    let stream = TcpStream::connect(target_addr)
-        .await
-        .map_err(|error| format!("TCP connect failed: {error}"))?;
-    let tcp_connect = tcp_started_at.elapsed().as_millis() as u64;
-    drop(stream);
-
+    // DNS really was measured, so report it even when no address answers;
+    // the connect leg stays 0 because it was never successfully measured.
+    let tcp_connect = connect_first_reachable_with(&addrs, remaining, connect)
+        .map(|(_, elapsed)| elapsed)
+        .unwrap_or(0);
     Ok((dns_lookup, tcp_connect))
 }
 
-#[derive(Serialize)]
+fn probe_connection(host: String, port: u16, budget: Duration) -> Result<(u64, u64), String> {
+    probe_connection_with(host, port, budget, |addr, budget| {
+        std::net::TcpStream::connect_timeout(addr, budget).map(drop)
+    })
+}
+
+/// Public entry point. Deliberately infallible: there is no error channel for a
+/// probe failure to escape through, so no call site can let the probe decide
+/// the fate of the request.
+async fn measure_connection_timings(url: &Url, budget: Duration) -> (u64, u64) {
+    let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+        return (0, 0);
+    };
+    let host = host.to_string();
+
+    let handle = tokio::task::spawn_blocking(move || probe_connection(host, port, budget));
+    let probe = async move {
+        match handle.await {
+            Ok(result) => result,
+            Err(error) => Err(format!("Connection probe task failed: {error}")),
+        }
+    };
+    run_probe_within_budget(budget, probe).await
+}
+
+/// Machine-readable companion to `HttpResponse::body`. Without it the frontend
+/// could only tell an ApiSolo placeholder from genuine server text by matching
+/// the placeholder string, which is a far worse contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ResponseBodyKind {
+    Text,
+    Binary,
+}
+
+#[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct HttpResponse {
     status: u16,
@@ -238,6 +337,7 @@ struct HttpResponse {
     time: u64,
     timings: RequestTimings,
     content_type: String,
+    body_kind: ResponseBodyKind,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -2327,6 +2427,20 @@ async fn send_request(args: SendRequestArgs) -> Result<HttpResponse, String> {
 }
 
 async fn execute_request(args: SendRequestArgs) -> Result<HttpResponse, String> {
+    execute_request_with_budget(args, REQUEST_TOTAL_BUDGET).await
+}
+
+/// The budget is a parameter rather than a constant so that tests can observe
+/// whether the checkpoints are actually wired in - a helper can be written and
+/// tested perfectly and still never be called.
+async fn execute_request_with_budget(
+    args: SendRequestArgs,
+    total_budget: Duration,
+) -> Result<HttpResponse, String> {
+    // The one and only timing origin for this request.
+    let overall_started_at = Instant::now();
+    let overall_deadline = overall_started_at + total_budget;
+
     let mut builder = Client::builder()
         .redirect(reqwest::redirect::Policy::limited(10))
         .timeout(std::time::Duration::from_secs(30))
@@ -2365,28 +2479,7 @@ async fn execute_request(args: SendRequestArgs) -> Result<HttpResponse, String> 
     let method = Method::from_bytes(args.method.as_bytes())
         .map_err(|error| format!("Invalid HTTP method '{}': {error}", args.method))?;
 
-    let mut url = Url::parse(&args.url).map_err(|error| format!("Invalid URL: {error}"))?;
-
-    {
-        let mut pairs = url.query_pairs_mut();
-        for param in args
-            .params
-            .iter()
-            .filter(|item| item.enabled && !item.key.trim().is_empty())
-        {
-            pairs.append_pair(&param.key, &param.value);
-        }
-    }
-
-    if let Some(api_key) = args.auth.api_key.as_ref() {
-        if args.auth.auth_type == "api-key"
-            && api_key.add_to == "query"
-            && !api_key.key.trim().is_empty()
-        {
-            url.query_pairs_mut()
-                .append_pair(&api_key.key, &api_key.value);
-        }
-    }
+    let url = build_request_url(&args.url, &args.params, &args.auth)?;
 
     let mut header_map = HeaderMap::new();
     for header in args
@@ -2414,8 +2507,10 @@ async fn execute_request(args: SendRequestArgs) -> Result<HttpResponse, String> 
         }
     }
 
+    // No `?` and no `unwrap_or` here: the probe cannot fail in a way that
+    // reaches this expression, which is what keeps it advisory by construction.
     let (dns_lookup, tcp_connect) = if should_measure_connection_timings(args.proxy.as_ref()) {
-        measure_connection_timings(&url).await?
+        measure_connection_timings(&url, probe_budget(overall_deadline, Instant::now())).await
     } else {
         (0, 0)
     };
@@ -2446,9 +2541,15 @@ async fn execute_request(args: SendRequestArgs) -> Result<HttpResponse, String> 
         "none" => {}
         "json" => {
             if !args.body.content.trim().is_empty() {
-                let json: serde_json::Value = serde_json::from_str(&args.body.content)
+                // Parse for validation only, then send the user's bytes
+                // verbatim. Round-tripping through Value would sort keys, drop
+                // duplicates and collapse whitespace - fatal for any API that
+                // signs the raw body.
+                serde_json::from_str::<serde_json::Value>(&args.body.content)
                     .map_err(|error| format!("Invalid JSON body: {error}"))?;
-                request = request.json(&json);
+                request = request
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(args.body.content);
             }
         }
         "form-urlencoded" => {
@@ -2483,63 +2584,506 @@ async fn execute_request(args: SendRequestArgs) -> Result<HttpResponse, String> 
         other => return Err(format!("Unsupported body type: {other}")),
     }
 
-    let started_at = Instant::now();
-    let response = request
-        .send()
+    let built = finish_request_with_deadline(
+        request,
+        &args.auth.auth_type,
+        &args.body.body_type,
+        overall_deadline,
+    )?;
+    let response = client
+        .execute(built)
         .await
-        .map_err(|error| format!("Request failed: {error}"))?;
+        .map_err(|error| format_error_chain("Request failed", &error))?;
 
     let status = response.status();
     let status_text = status.canonical_reason().unwrap_or("").to_string();
-    let content_type = response
-        .headers()
+    let raw_headers = response.headers().clone();
+    let content_type = raw_headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let headers = response
-        .headers()
+    let plan = plan_content_encoding(&raw_headers);
+
+    let download_started_at = Instant::now();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format_error_chain("Failed to read response body", &error))?;
+    let download = download_started_at.elapsed().as_millis() as u64;
+
+    // Checked before the task is created, not after: `spawn_blocking` cannot be
+    // cancelled, so an exhausted budget must stop us from starting the decode
+    // rather than merely stop us from waiting for it.
+    let decode_budget =
+        ensure_budget_remaining(overall_deadline, Instant::now(), "decoding the response")?;
+    let decoded = {
+        let content_type = content_type.clone();
+        // `bytes` moves into the closure so the full copy happens inside the
+        // timeout; a remote-controlled body could otherwise be copied for
+        // seconds outside any budget.
+        let handle =
+            tokio::task::spawn_blocking(move || {
+                finalize_response_body(bytes.to_vec(), plan, &content_type)
+            });
+        let decode = async move {
+            match handle.await {
+                Ok(result) => result,
+                Err(error) => Err(format!("Response decode task failed: {error}")),
+            }
+        };
+        run_decode_within_budget(decode_budget, decode).await?
+    };
+
+    let headers = response_header_pairs(&raw_headers, decoded.dropped_encoding_headers);
+    let timings = build_timings(
+        overall_started_at.elapsed(),
+        dns_lookup,
+        tcp_connect,
+        download,
+    );
+
+    Ok(HttpResponse {
+        status: status.as_u16(),
+        status_text,
+        headers,
+        body: decoded.body,
+        size: decoded.size,
+        time: timings.total,
+        timings,
+        content_type,
+        body_kind: decoded.body_kind,
+    })
+}
+
+fn should_measure_connection_timings(proxy: Option<&ProxyConfig>) -> bool {
+    !matches!(proxy, Some(config) if config.enabled && !config.host.trim().is_empty())
+}
+
+/// Total wall-clock budget for one send, from the first line of
+/// `execute_request_with_budget` until the decoded body is in hand.
+const REQUEST_TOTAL_BUDGET: Duration = Duration::from_secs(30);
+
+/// Cap on decompressed output. Decompression introduces an amplification the
+/// identity path does not have: a 10 MB all-zero gzip expands to ~10 GB. The
+/// slice that creates the amplification carries the cap.
+const MAX_DECOMPRESSED_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContentEncoding {
+    Gzip,
+    Deflate,
+    Brotli,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ContentEncodingPlan {
+    /// No encoding, only `identity`, or nothing but empty tokens.
+    None,
+    /// Exactly one supported encoding survived normalisation.
+    Decode(ContentEncoding),
+    /// Unknown single encoding, several stacked encodings, or a malformed
+    /// field. Carries the normalised token list for the user-facing marker.
+    Undecodable(String),
+}
+
+fn supported_content_encoding(token: &str) -> Option<ContentEncoding> {
+    match token {
+        "gzip" | "x-gzip" => Some(ContentEncoding::Gzip),
+        "deflate" => Some(ContentEncoding::Deflate),
+        "br" => Some(ContentEncoding::Brotli),
+        _ => None,
+    }
+}
+
+/// Collect `Content-Encoding` the way HTTP defines it: repeated fields and a
+/// comma list are the same ordered list. Only a single supported encoding is
+/// decoded; anything else is reported honestly rather than guessed at.
+fn plan_content_encoding(headers: &HeaderMap) -> ContentEncodingPlan {
+    // A field value that is not valid UTF-8 is malformed, not absent. Letting
+    // it fall through to `unwrap_or("")` would turn it into "no encoding" and
+    // hand undecoded bytes to the text path.
+    for value in headers.get_all(CONTENT_ENCODING) {
+        if value.to_str().is_err() {
+            return ContentEncodingPlan::Undecodable("(unparsable)".to_string());
+        }
+    }
+
+    let tokens = headers
+        .get_all(CONTENT_ENCODING)
         .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty() && token != "identity")
+        .collect::<Vec<_>>();
+
+    if tokens.is_empty() {
+        return ContentEncodingPlan::None;
+    }
+    if tokens.len() == 1 {
+        return match supported_content_encoding(&tokens[0]) {
+            Some(encoding) => ContentEncodingPlan::Decode(encoding),
+            None => ContentEncodingPlan::Undecodable(tokens.join(", ")),
+        };
+    }
+    // Two or more encodings stacked. Not deduplicated: `gzip, gzip` is real
+    // double compression and collapsing it would decode the wrong thing.
+    ContentEncodingPlan::Undecodable(tokens.join(", "))
+}
+
+fn decompress_response_body(
+    bytes: Vec<u8>,
+    plan: &ContentEncodingPlan,
+) -> Result<(Vec<u8>, bool), String> {
+    decompress_response_body_with_limit(bytes, plan, MAX_DECOMPRESSED_RESPONSE_BYTES)
+}
+
+/// Limit is a parameter so the boundary cases can be exercised with kilobyte
+/// fixtures instead of manufacturing 64 MiB of test data.
+fn decompress_response_body_with_limit(
+    bytes: Vec<u8>,
+    plan: &ContentEncodingPlan,
+    limit: usize,
+) -> Result<(Vec<u8>, bool), String> {
+    let encoding = match plan {
+        ContentEncodingPlan::Decode(encoding) => *encoding,
+        ContentEncodingPlan::None | ContentEncodingPlan::Undecodable(_) => {
+            return Ok((bytes, false))
+        }
+    };
+
+    let label = match encoding {
+        ContentEncoding::Gzip => "gzip",
+        ContentEncoding::Deflate => "deflate",
+        ContentEncoding::Brotli => "br",
+    };
+
+    let decoded = match encoding {
+        // MultiGzDecoder, not GzDecoder: concatenated gzip members are legal
+        // and GzDecoder would silently stop after the first one.
+        ContentEncoding::Gzip => read_capped(
+            flate2::read::MultiGzDecoder::new(bytes.as_slice()),
+            limit,
+            label,
+        ),
+        ContentEncoding::Brotli => read_capped(
+            brotli_decompressor::Decompressor::new(bytes.as_slice(), 4096),
+            limit,
+            label,
+        ),
+        // `Content-Encoding: deflate` is officially zlib, but enough servers
+        // emit raw deflate that browsers accept both. Try zlib, fall back.
+        ContentEncoding::Deflate => {
+            match read_capped(flate2::read::ZlibDecoder::new(bytes.as_slice()), limit, label) {
+                Ok(decoded) => Ok(decoded),
+                Err(zlib_error) => {
+                    if zlib_error.contains("too large") {
+                        Err(zlib_error)
+                    } else {
+                        read_capped(
+                            flate2::read::DeflateDecoder::new(bytes.as_slice()),
+                            limit,
+                            label,
+                        )
+                    }
+                }
+            }
+        }
+    }?;
+
+    Ok((decoded, true))
+}
+
+fn read_capped<R: Read>(reader: R, limit: usize, label: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    // `take` stops the allocation from running away; the decision below is
+    // what actually enforces the limit.
+    reader
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(&mut out)
+        .map_err(|error| format!("Failed to decode {label} response body: {error}"))?;
+    if out.len() > limit {
+        return Err(format!(
+            "Response body too large: decompressed content exceeds the {limit}-byte limit \
+             (Content-Encoding: {label})"
+        ));
+    }
+    Ok(out)
+}
+
+/// Pull the `charset` parameter out of a Content-Type. Only the parameter is
+/// consulted - no BOM inspection, no `<meta>` scraping, no content sniffing,
+/// because every one of those is a guess and a wrong guess is fresh mojibake.
+fn charset_from_content_type(content_type: &str) -> Option<String> {
+    for part in content_type.split(';').skip(1) {
+        let (name, value) = part.split_once('=')?;
+        if name.trim().eq_ignore_ascii_case("charset") {
+            let value = value.trim().trim_matches('"').trim();
+            if value.is_empty() {
+                return None;
+            }
+            return Some(value.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+fn binary_body_marker(size: usize, content_type: &str, undecoded_encoding: Option<&str>) -> String {
+    let shown = if content_type.trim().is_empty() {
+        "(none)"
+    } else {
+        content_type
+    };
+    match undecoded_encoding {
+        Some(encoding) => format!(
+            "[ApiSolo] Compressed response not decoded: content-encoding: {encoding}, \
+             {size} bytes, content-type: {shown}"
+        ),
+        None => format!(
+            "[ApiSolo] Binary response not shown as text: {size} bytes, content-type: {shown}"
+        ),
+    }
+}
+
+/// Text-vs-binary is decided by whether the bytes decode, not by the
+/// Content-Type's major type: APIs mislabel JSON as octet-stream and servers
+/// mislabel PNGs as text/html, and the bytes are right in both cases.
+fn decode_response_body(bytes: &[u8], content_type: &str) -> (String, ResponseBodyKind) {
+    let encoding = charset_from_content_type(content_type)
+        .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
+        .unwrap_or(encoding_rs::UTF_8);
+
+    // Single-byte encodings accept every byte, so decodability alone cannot
+    // catch binary declared as latin-1. No real text response carries NUL.
+    if bytes.contains(&0) {
+        return (
+            binary_body_marker(bytes.len(), content_type, None),
+            ResponseBodyKind::Binary,
+        );
+    }
+
+    match encoding.decode_without_bom_handling_and_without_replacement(bytes) {
+        Some(text) => (text.into_owned(), ResponseBodyKind::Text),
+        None => (
+            binary_body_marker(bytes.len(), content_type, None),
+            ResponseBodyKind::Binary,
+        ),
+    }
+}
+
+fn response_header_pairs(
+    headers: &HeaderMap,
+    drop_encoding_headers: bool,
+) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            // After a successful decode these two describe bytes the user is
+            // no longer looking at. Showing them next to decoded content is
+            // exactly the "UI must not lie" failure mode.
+            !drop_encoding_headers || (*name != CONTENT_ENCODING && *name != CONTENT_LENGTH)
+        })
         .map(|(name, value)| {
             (
                 name.to_string(),
                 value.to_str().unwrap_or_default().to_string(),
             )
         })
-        .collect::<Vec<_>>();
-    let download_started_at = Instant::now();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| format!("Failed to read response body: {error}"))?;
-    let total = dns_lookup
-        .saturating_add(tcp_connect)
-        .saturating_add(started_at.elapsed().as_millis() as u64);
-    let download = download_started_at.elapsed().as_millis() as u64;
-    let size = bytes.len() as u64;
-    let body = String::from_utf8_lossy(&bytes).to_string();
+        .collect()
+}
 
-    Ok(HttpResponse {
-        status: status.as_u16(),
-        status_text,
-        headers,
-        body,
+#[derive(Debug)]
+struct DecodedResponseBody {
+    size: u64,
+    body: String,
+    body_kind: ResponseBodyKind,
+    dropped_encoding_headers: bool,
+}
+
+/// Synchronous on purpose: decompression plus a full charset transcode is CPU
+/// work that would otherwise monopolise an async worker. Its only call site is
+/// inside `spawn_blocking`.
+fn finalize_response_body(
+    bytes: Vec<u8>,
+    plan: ContentEncodingPlan,
+    content_type: &str,
+) -> Result<DecodedResponseBody, String> {
+    let (body_bytes, decoded) = decompress_response_body(bytes, &plan)?;
+    let size = body_bytes.len() as u64;
+
+    // An undecoded compressed payload can easily be valid UTF-8 by accident.
+    // Forcing the binary path stops it from being rendered as if it were text.
+    if let ContentEncodingPlan::Undecodable(tokens) = &plan {
+        return Ok(DecodedResponseBody {
+            size,
+            body: binary_body_marker(body_bytes.len(), content_type, Some(tokens)),
+            body_kind: ResponseBodyKind::Binary,
+            dropped_encoding_headers: decoded,
+        });
+    }
+
+    let (body, body_kind) = decode_response_body(&body_bytes, content_type);
+    Ok(DecodedResponseBody {
         size,
-        time: total,
-        timings: RequestTimings {
-            dns_lookup,
-            tcp_connect,
-            tls_handshake: 0,
-            ttfb: 0,
-            download,
-            total,
-        },
-        content_type,
+        body,
+        body_kind,
+        dropped_encoding_headers: decoded,
     })
 }
 
-fn should_measure_connection_timings(proxy: Option<&ProxyConfig>) -> bool {
-    !matches!(proxy, Some(config) if config.enabled && !config.host.trim().is_empty())
+fn remaining_budget(deadline: Instant, now: Instant) -> Duration {
+    deadline.saturating_duration_since(now)
+}
+
+fn probe_budget(deadline: Instant, now: Instant) -> Duration {
+    CONNECTION_PROBE_MAX.min(remaining_budget(deadline, now))
+}
+
+fn ensure_budget_remaining(
+    deadline: Instant,
+    now: Instant,
+    phase: &str,
+) -> Result<Duration, String> {
+    let remaining = remaining_budget(deadline, now);
+    if remaining.is_zero() {
+        return Err(format!(
+            "Request budget exhausted before {phase} (30s limit)"
+        ));
+    }
+    Ok(remaining)
+}
+
+/// Keeps build, header normalisation, budget read and timeout assignment in one
+/// place and in this order. Reading the budget before the build would hand the
+/// build's own cost to the HTTP phase a second time; here the ordering is four
+/// consecutive lines rather than a detail buried in a long function.
+fn finish_request_with_deadline(
+    request: RequestBuilder,
+    auth_type: &str,
+    body_type: &str,
+    deadline: Instant,
+) -> Result<ReqwestRequest, String> {
+    let mut built = request
+        .build()
+        .map_err(|error| format_error_chain("Failed to build request", &error))?;
+    normalize_auto_headers(built.headers_mut(), auth_type, body_type);
+    let budget = ensure_budget_remaining(deadline, Instant::now(), "sending the request")?;
+    *built.timeout_mut() = Some(budget);
+    Ok(built)
+}
+
+async fn run_decode_within_budget<F>(
+    budget: Duration,
+    decode: F,
+) -> Result<DecodedResponseBody, String>
+where
+    F: std::future::Future<Output = Result<DecodedResponseBody, String>>,
+{
+    match tokio::time::timeout(budget, decode).await {
+        Ok(result) => result,
+        Err(_) => Err("Request budget exhausted while decoding the response (30s limit)".to_string()),
+    }
+}
+
+/// `total` is measured, never summed from the parts: a blackholed address or a
+/// slow decode has to show up in what the user is told they waited.
+fn build_timings(
+    overall_elapsed: Duration,
+    dns_lookup: u64,
+    tcp_connect: u64,
+    download: u64,
+) -> RequestTimings {
+    RequestTimings {
+        dns_lookup,
+        tcp_connect,
+        // Not measurable at this layer; deriving them would be fake precision.
+        tls_handshake: 0,
+        ttfb: 0,
+        download,
+        total: overall_elapsed.as_millis() as u64,
+    }
+}
+
+fn keep_first_header_value(headers: &mut HeaderMap, name: HeaderName) {
+    if let Some(first) = headers.get(&name).cloned() {
+        headers.insert(name, first);
+    }
+}
+
+fn keep_last_header_value(headers: &mut HeaderMap, name: HeaderName) {
+    if let Some(last) = headers.get_all(&name).iter().last().cloned() {
+        headers.insert(name, last);
+    }
+}
+
+/// Collapse the duplicates reqwest's appending helpers leave behind. The user's
+/// headers went in first via `.headers(...)`, the app's computed ones were
+/// appended after, so "keep first" and "keep last" express the whole precedence
+/// table.
+fn normalize_auto_headers(headers: &mut HeaderMap, auth_type: &str, body_type: &str) {
+    match body_type {
+        // For multipart only the boundary we actually used is correct, so the
+        // app's value wins even against an explicit user header.
+        "form-data" => keep_last_header_value(headers, CONTENT_TYPE),
+        // The user's value - including any charset suffix - is what they typed.
+        "form-urlencoded" | "json" => keep_first_header_value(headers, CONTENT_TYPE),
+        // raw / binary / none: the app adds nothing, so there is nothing to
+        // collapse and however many rows the user wrote go out.
+        _ => {}
+    }
+
+    // The Auth tab only participates when actively selected, which makes it an
+    // unambiguous instruction. Leaving it to lose silently is the "panel that
+    // does nothing" failure. Escape hatch: set the tab back to none.
+    if matches!(auth_type, "basic" | "bearer") {
+        keep_last_header_value(headers, AUTHORIZATION);
+    }
+}
+
+/// reqwest's Display prints only the kind and the URL; the actual cause lives
+/// on the source chain, which is what tells a cert rejection apart from a
+/// timeout apart from a refused connection.
+fn format_error_chain(prefix: &str, error: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![prefix.to_string()];
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = current {
+        parts.push(error.to_string());
+        current = error.source();
+    }
+    parts.join(": ")
+}
+
+/// Only opens the query serialiser when there is something to append: calling
+/// `query_pairs_mut` unconditionally appends a bare `?` to every URL.
+fn build_request_url(
+    raw_url: &str,
+    params: &[KeyValuePair],
+    auth: &AuthInput,
+) -> Result<Url, String> {
+    let mut url = Url::parse(raw_url).map_err(|error| format!("Invalid URL: {error}"))?;
+
+    let mut pairs: Vec<(&str, &str)> = params
+        .iter()
+        .filter(|item| item.enabled && !item.key.trim().is_empty())
+        .map(|item| (item.key.as_str(), item.value.as_str()))
+        .collect();
+
+    if let Some(api_key) = auth.api_key.as_ref() {
+        if auth.auth_type == "api-key" && api_key.add_to == "query" && !api_key.key.trim().is_empty()
+        {
+            pairs.push((api_key.key.as_str(), api_key.value.as_str()));
+        }
+    }
+
+    if !pairs.is_empty() {
+        let mut serializer = url.query_pairs_mut();
+        for (key, value) in pairs {
+            serializer.append_pair(key, value);
+        }
+    }
+
+    Ok(url)
 }
 
 fn resolve_binary_body_bytes(body: &RequestBodyInput, label: &str) -> Result<Vec<u8>, String> {
@@ -4143,10 +4687,12 @@ mod tests {
                 total: 210,
             },
             content_type: "application/json".to_string(),
+            body_kind: ResponseBodyKind::Text,
         };
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"statusText\""));
+        assert!(json.contains("\"bodyKind\":\"text\""));
         assert!(json.contains("\"contentType\""));
         assert!(json.contains("\"timings\""));
         assert!(!json.contains("\"status_text\""));
@@ -5470,6 +6016,7 @@ mod tests {
                 total: 52,
             },
             content_type: "application/json".to_string(),
+            body_kind: ResponseBodyKind::Text,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -6391,4 +6938,1344 @@ mod tests {
             );
         }
     }
+
+    // ================= D02 — HTTP 报文正确性 =================
+    //
+    // Fixtures below are byte literals produced by EXTERNAL tools, never by the
+    // crate under test - generating the expected value with the same code that
+    // decodes it would prove nothing. Commands are recorded next to each one.
+    //
+    // PAYLOAD (80 bytes):
+    //   {"repo":"tauri-apps/tauri","stars":12345,"描述":"跨平台桌面应用框架"}
+    const D02_PAYLOAD: &str =
+        "{\"repo\":\"tauri-apps/tauri\",\"stars\":12345,\"描述\":\"跨平台桌面应用框架\"}";
+
+    // printf '%s' "$PAYLOAD" | gzip -n -c | xxd -i
+    const D02_GZIP: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xab, 0x56, 0x2a, 0x4a, 0x2d,
+        0xc8, 0x57, 0xb2, 0x52, 0x2a, 0x49, 0x2c, 0x2d, 0xca, 0xd4, 0x4d, 0x2c, 0x28, 0x28, 0xd6,
+        0x07, 0x33, 0x95, 0x74, 0x94, 0x8a, 0x4b, 0x12, 0x8b, 0x8a, 0x95, 0xac, 0x0c, 0x8d, 0x8c,
+        0x4d, 0x4c, 0x75, 0x94, 0x9e, 0xf5, 0xf7, 0xbf, 0xd8, 0xbf, 0x01, 0xa8, 0xf2, 0xc5, 0xf6,
+        0x15, 0x4f, 0x77, 0x6e, 0x7e, 0xda, 0xbf, 0xe1, 0xd9, 0xc2, 0x9e, 0x97, 0x73, 0x17, 0x3d,
+        0xdd, 0x35, 0xe5, 0xf9, 0x94, 0x15, 0xcf, 0x16, 0xb6, 0x3d, 0x9b, 0xb7, 0x4d, 0xa9, 0x16,
+        0x00, 0xe0, 0xc8, 0xfb, 0x23, 0x50, 0x00, 0x00, 0x00,
+    ];
+
+    // printf '%s' "$PAYLOAD" | brotli -c | xxd -i
+    const D02_BROTLI: &[u8] = &[
+        0x21, 0x3c, 0x01, 0x04, 0x7b, 0x22, 0x72, 0x65, 0x70, 0x6f, 0x22, 0x3a, 0x22, 0x74, 0x61,
+        0x75, 0x72, 0x69, 0x2d, 0x61, 0x70, 0x70, 0x73, 0x2f, 0x74, 0x61, 0x75, 0x72, 0x69, 0x22,
+        0x2c, 0x22, 0x73, 0x74, 0x61, 0x72, 0x73, 0x22, 0x3a, 0x31, 0x32, 0x33, 0x34, 0x35, 0x2c,
+        0x22, 0xe6, 0x8f, 0x8f, 0xe8, 0xbf, 0xb0, 0x22, 0x3a, 0x22, 0xe8, 0xb7, 0xa8, 0xe5, 0xb9,
+        0xb3, 0xe5, 0x8f, 0xb0, 0xe6, 0xa1, 0x8c, 0xe9, 0x9d, 0xa2, 0xe5, 0xba, 0x94, 0xe7, 0x94,
+        0xa8, 0xe6, 0xa1, 0x86, 0xe6, 0x9e, 0xb6, 0x22, 0x7d, 0x03,
+    ];
+
+    // python3: zlib.compress(payload)  -> RFC 1950 zlib stream
+    const D02_ZLIB: &[u8] = &[
+        0x78, 0x9c, 0xab, 0x56, 0x2a, 0x4a, 0x2d, 0xc8, 0x57, 0xb2, 0x52, 0x2a, 0x49, 0x2c, 0x2d,
+        0xca, 0xd4, 0x4d, 0x2c, 0x28, 0x28, 0xd6, 0x07, 0x33, 0x95, 0x74, 0x94, 0x8a, 0x4b, 0x12,
+        0x8b, 0x8a, 0x95, 0xac, 0x0c, 0x8d, 0x8c, 0x4d, 0x4c, 0x75, 0x94, 0x9e, 0xf5, 0xf7, 0xbf,
+        0xd8, 0xbf, 0x01, 0xa8, 0xf2, 0xc5, 0xf6, 0x15, 0x4f, 0x77, 0x6e, 0x7e, 0xda, 0xbf, 0xe1,
+        0xd9, 0xc2, 0x9e, 0x97, 0x73, 0x17, 0x3d, 0xdd, 0x35, 0xe5, 0xf9, 0x94, 0x15, 0xcf, 0x16,
+        0xb6, 0x3d, 0x9b, 0xb7, 0x4d, 0xa9, 0x16, 0x00, 0x20, 0x87, 0x26, 0x7e,
+    ];
+
+    // python3: zlib.compressobj(9, zlib.DEFLATED, -15) -> raw deflate, no header
+    const D02_RAW_DEFLATE: &[u8] = &[
+        0xab, 0x56, 0x2a, 0x4a, 0x2d, 0xc8, 0x57, 0xb2, 0x52, 0x2a, 0x49, 0x2c, 0x2d, 0xca, 0xd4,
+        0x4d, 0x2c, 0x28, 0x28, 0xd6, 0x07, 0x33, 0x95, 0x74, 0x94, 0x8a, 0x4b, 0x12, 0x8b, 0x8a,
+        0x95, 0xac, 0x0c, 0x8d, 0x8c, 0x4d, 0x4c, 0x75, 0x94, 0x9e, 0xf5, 0xf7, 0xbf, 0xd8, 0xbf,
+        0x01, 0xa8, 0xf2, 0xc5, 0xf6, 0x15, 0x4f, 0x77, 0x6e, 0x7e, 0xda, 0xbf, 0xe1, 0xd9, 0xc2,
+        0x9e, 0x97, 0x73, 0x17, 0x3d, 0xdd, 0x35, 0xe5, 0xf9, 0x94, 0x15, 0xcf, 0x16, 0xb6, 0x3d,
+        0x9b, 0xb7, 0x4d, 0xa9, 0x16, 0x00,
+    ];
+
+    // python3: gzip.compress(b'a' * 1024) / gzip.compress(b'a' * 1025)
+    const D02_GZIP_1024: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x4b, 0x4c, 0x1c, 0x05, 0xa3,
+        0x60, 0x14, 0x8c, 0x54, 0x00, 0x00, 0xb9, 0x97, 0x55, 0x7c, 0x00, 0x04, 0x00, 0x00,
+    ];
+    const D02_GZIP_1025: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x4b, 0x4c, 0x1c, 0x05, 0xa3,
+        0x60, 0x14, 0x8c, 0x58, 0x00, 0x00, 0xfc, 0xe0, 0x76, 0x5a, 0x01, 0x04, 0x00, 0x00,
+    ];
+
+    fn d02_args(method: &str, url: String) -> SendRequestArgs {
+        SendRequestArgs {
+            request_id: String::new(),
+            method: method.to_string(),
+            url,
+            params: vec![],
+            headers: vec![],
+            body: RequestBodyInput {
+                body_type: "none".to_string(),
+                content: String::new(),
+                form_data: vec![],
+                binary_path: String::new(),
+                binary_content: None,
+            },
+            auth: AuthInput {
+                auth_type: "none".to_string(),
+                basic: None,
+                bearer: None,
+                api_key: None,
+            },
+            proxy: None,
+            tls: None,
+        }
+    }
+
+    fn d02_header(key: &str, value: &str) -> KeyValuePair {
+        KeyValuePair {
+            enabled: true,
+            key: key.to_string(),
+            value: value.to_string(),
+            description: String::new(),
+        }
+    }
+
+    fn d02_encoding_headers(values: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append(CONTENT_ENCODING, HeaderValue::from_str(value).unwrap());
+        }
+        headers
+    }
+
+    /// wiremock 0.5 splits stored header values on commas
+    /// (`wiremock-0.5.22/src/request.rs:154`), so "exactly one header line"
+    /// assertions are only sound for values containing no comma. Every value
+    /// used below satisfies that.
+    fn d02_header_values(request: &wiremock::Request, name: &str) -> Vec<String> {
+        request
+            .headers
+            .iter()
+            .find(|(key, _)| key.as_str().eq_ignore_ascii_case(name))
+            .map(|(_, values)| values.iter().map(|value| value.to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    async fn d02_serve(body: &'static [u8], headers: &[(&str, &str)]) -> wiremock::MockServer {
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let mut template = ResponseTemplate::new(200).set_body_bytes(body.to_vec());
+        for (key, value) in headers {
+            template = template.insert_header(*key, *value);
+        }
+        Mock::given(method("GET"))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    // ---------- §1-§7 解压 ----------
+
+    #[tokio::test]
+    async fn test_decompress_gzip_response_body() {
+        let server = d02_serve(
+            D02_GZIP,
+            &[
+                ("content-encoding", "gzip"),
+                ("content-type", "application/json"),
+            ],
+        )
+        .await;
+        let response = send_request(d02_args("GET", server.uri())).await.unwrap();
+        assert_eq!(response.body, D02_PAYLOAD);
+    }
+
+    #[tokio::test]
+    async fn test_decompress_brotli_response_body() {
+        let server = d02_serve(
+            D02_BROTLI,
+            &[
+                ("content-encoding", "br"),
+                ("content-type", "application/json"),
+            ],
+        )
+        .await;
+        let response = send_request(d02_args("GET", server.uri())).await.unwrap();
+        assert_eq!(response.body, D02_PAYLOAD);
+    }
+
+    #[tokio::test]
+    async fn test_decompress_deflate_zlib_response_body() {
+        let server = d02_serve(
+            D02_ZLIB,
+            &[
+                ("content-encoding", "deflate"),
+                ("content-type", "application/json"),
+            ],
+        )
+        .await;
+        let response = send_request(d02_args("GET", server.uri())).await.unwrap();
+        assert_eq!(response.body, D02_PAYLOAD);
+    }
+
+    #[test]
+    fn test_decompress_raw_deflate_stream() {
+        // Servers that emit bare RFC 1951 under `Content-Encoding: deflate` are
+        // common enough that browsers accept them; the zlib decoder must fall
+        // back rather than reject.
+        let (bytes, decoded) = decompress_response_body(
+            D02_RAW_DEFLATE.to_vec(),
+            &ContentEncodingPlan::Decode(ContentEncoding::Deflate),
+        )
+        .unwrap();
+        assert!(decoded);
+        assert_eq!(String::from_utf8(bytes).unwrap(), D02_PAYLOAD);
+    }
+
+    #[test]
+    fn test_content_encoding_token_case_and_whitespace() {
+        assert_eq!(
+            plan_content_encoding(&d02_encoding_headers(&[" GZIP "])),
+            ContentEncodingPlan::Decode(ContentEncoding::Gzip)
+        );
+        assert_eq!(
+            plan_content_encoding(&d02_encoding_headers(&["Br"])),
+            ContentEncodingPlan::Decode(ContentEncoding::Brotli)
+        );
+    }
+
+    #[test]
+    fn test_content_encoding_x_gzip_alias() {
+        assert_eq!(
+            plan_content_encoding(&d02_encoding_headers(&["x-gzip"])),
+            ContentEncodingPlan::Decode(ContentEncoding::Gzip)
+        );
+    }
+
+    #[test]
+    fn test_decompress_multi_member_gzip() {
+        // Two gzip members concatenated - legal, and GzDecoder would stop after
+        // the first one.
+        let mut doubled = D02_GZIP.to_vec();
+        doubled.extend_from_slice(D02_GZIP);
+        let (bytes, decoded) = decompress_response_body(
+            doubled,
+            &ContentEncodingPlan::Decode(ContentEncoding::Gzip),
+        )
+        .unwrap();
+        assert!(decoded);
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            format!("{D02_PAYLOAD}{D02_PAYLOAD}")
+        );
+    }
+
+    // ---------- §8-§16 编码判定、上限、Accept-Encoding ----------
+
+    #[tokio::test]
+    async fn test_decoded_response_drops_encoding_headers() {
+        let server = d02_serve(
+            D02_GZIP,
+            &[
+                ("content-encoding", "gzip"),
+                ("content-type", "application/json"),
+            ],
+        )
+        .await;
+        let response = send_request(d02_args("GET", server.uri())).await.unwrap();
+        let names = response
+            .headers
+            .iter()
+            .map(|(name, _)| name.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        // They describe the compressed bytes; keeping them next to decoded
+        // content is the "UI must not lie" failure.
+        assert!(!names.contains(&"content-encoding".to_string()), "{names:?}");
+        assert!(!names.contains(&"content-length".to_string()), "{names:?}");
+        assert!(names.contains(&"content-type".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn test_plan_content_encoding_table() {
+        let rows: Vec<(&str, HeaderMap, ContentEncodingPlan)> = vec![
+            ("(1) 无头", HeaderMap::new(), ContentEncodingPlan::None),
+            (
+                "(2) identity",
+                d02_encoding_headers(&["identity"]),
+                ContentEncodingPlan::None,
+            ),
+            (
+                "(3) 全空 token",
+                d02_encoding_headers(&[" , , "]),
+                ContentEncodingPlan::None,
+            ),
+            (
+                "(4) identity, gzip",
+                d02_encoding_headers(&["identity, gzip"]),
+                ContentEncodingPlan::Decode(ContentEncoding::Gzip),
+            ),
+            (
+                "(5) gzip, br",
+                d02_encoding_headers(&["gzip, br"]),
+                ContentEncodingPlan::Undecodable("gzip, br".to_string()),
+            ),
+            (
+                "(6) 两行 gzip + br",
+                d02_encoding_headers(&["gzip", "br"]),
+                ContentEncodingPlan::Undecodable("gzip, br".to_string()),
+            ),
+            (
+                "(7) gzip, gzip 不去重",
+                d02_encoding_headers(&["gzip, gzip"]),
+                ContentEncodingPlan::Undecodable("gzip, gzip".to_string()),
+            ),
+            (
+                "(8) gzip;q=1.0",
+                d02_encoding_headers(&["gzip;q=1.0"]),
+                ContentEncodingPlan::Undecodable("gzip;q=1.0".to_string()),
+            ),
+            (
+                "(9) zstd",
+                d02_encoding_headers(&["zstd"]),
+                ContentEncodingPlan::Undecodable("zstd".to_string()),
+            ),
+        ];
+        let mut failures = vec![];
+        for (label, headers, expected) in rows {
+            let got = plan_content_encoding(&headers);
+            if got != expected {
+                failures.push(format!("{label}: expected {expected:?}, got {got:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "ROWS FAILED:\n{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn test_non_utf8_content_encoding_is_undecodable() {
+        // A malformed field is malformed, not absent. Letting `to_str()` fail
+        // into an empty string would turn it into "no encoding" and hand
+        // undecoded bytes to the text path.
+        let mut headers = HeaderMap::new();
+        headers.append(
+            CONTENT_ENCODING,
+            HeaderValue::from_bytes(b"gzip,\x80").unwrap(),
+        );
+        assert_eq!(
+            plan_content_encoding(&headers),
+            ContentEncodingPlan::Undecodable("(unparsable)".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_undecodable_encoding_is_kept_raw_and_marked_binary() {
+        // Fixture is deliberately valid UTF-8 with no NUL, so both text guards
+        // would pass it: only the forced-binary branch can make it binary.
+        const PLAIN: &[u8] = b"this is valid utf-8 and contains no nul byte";
+        let server = d02_serve(
+            PLAIN,
+            &[
+                ("content-encoding", "zstd"),
+                ("content-type", "application/json"),
+            ],
+        )
+        .await;
+        let response = send_request(d02_args("GET", server.uri())).await.unwrap();
+        assert!(
+            response.body.contains("Compressed response not decoded"),
+            "{}",
+            response.body
+        );
+        assert!(response.body.contains("zstd"), "{}", response.body);
+        let names = response
+            .headers
+            .iter()
+            .map(|(name, _)| name.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"content-encoding".to_string()), "{names:?}");
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"bodyKind\":\"binary\""), "{json}");
+    }
+
+    #[tokio::test]
+    async fn test_identity_or_absent_encoding_is_not_decompressed() {
+        assert_eq!(
+            plan_content_encoding(&d02_encoding_headers(&["identity"])),
+            ContentEncodingPlan::None
+        );
+        const PLAIN: &[u8] = b"plain ascii body";
+        let server = d02_serve(
+            PLAIN,
+            &[
+                ("content-encoding", "identity"),
+                ("content-type", "text/plain"),
+            ],
+        )
+        .await;
+        let response = send_request(d02_args("GET", server.uri())).await.unwrap();
+        assert_eq!(response.body, "plain ascii body");
+        // Nothing was decoded, so nothing may be stripped.
+        let names = response
+            .headers
+            .iter()
+            .map(|(name, _)| name.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"content-encoding".to_string()), "{names:?}");
+        assert!(names.contains(&"content-length".to_string()), "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn test_corrupt_gzip_response_fails_with_named_encoding() {
+        const NOT_GZIP: &[u8] = b"this is definitely not a gzip stream";
+        let server = d02_serve(NOT_GZIP, &[("content-encoding", "gzip")]).await;
+        let error = send_request(d02_args("GET", server.uri()))
+            .await
+            .unwrap_err();
+        assert!(error.contains("gzip"), "{error}");
+        assert!(error.contains("Failed to decode"), "{error}");
+    }
+
+    #[test]
+    fn test_decompressed_body_at_the_limit_succeeds() {
+        // The limit means "up to and including", not "at this point it is over".
+        let (bytes, _) = decompress_response_body_with_limit(
+            D02_GZIP_1024.to_vec(),
+            &ContentEncodingPlan::Decode(ContentEncoding::Gzip),
+            1024,
+        )
+        .unwrap();
+        assert_eq!(bytes.len(), 1024);
+    }
+
+    #[test]
+    fn test_decompressed_body_over_the_limit_is_rejected() {
+        let error = decompress_response_body_with_limit(
+            D02_GZIP_1025.to_vec(),
+            &ContentEncodingPlan::Decode(ContentEncoding::Gzip),
+            1024,
+        )
+        .unwrap_err();
+        assert!(error.contains("too large"), "{error}");
+        assert!(error.contains("1024"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_no_accept_encoding_header_is_added() {
+        // The whole reason decompression is done by hand: enabling reqwest's
+        // features would inject this header into requests the user never asked
+        // to compress.
+        let server = d02_serve(b"ok", &[]).await;
+        send_request(d02_args("GET", server.uri())).await.unwrap();
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            d02_header_values(&received[0], "accept-encoding"),
+            Vec::<String>::new()
+        );
+    }
+
+    // ---------- §17-§24 正文解码 ----------
+
+    #[test]
+    fn test_response_charset_is_honored() {
+        // gb2312: 中=D6D0 文=CEC4 测=B2E2 试=CAD4; shift_jis: テ=8365 ス=8358
+        // ト=8367; iso-8859-1: é=E9. Verifiable with `iconv`.
+        let gb: &[u8] = &[
+            0xD6, 0xD0, 0xCE, 0xC4, 0xB2, 0xE2, 0xCA, 0xD4, 0x61, 0x62, 0x63,
+        ];
+        let sjis: &[u8] = &[0x83, 0x65, 0x83, 0x58, 0x83, 0x67];
+        let latin: &[u8] = &[0x63, 0x61, 0x66, 0xE9];
+        let rows: Vec<(&[u8], &str, &str)> = vec![
+            (gb, "text/html; charset=gb2312", "中文测试abc"),
+            (gb, "text/html; charset=gbk", "中文测试abc"),
+            (sjis, "text/plain; charset=shift_jis", "テスト"),
+            (latin, "text/plain; charset=iso-8859-1", "café"),
+        ];
+        let mut failures = vec![];
+        for (bytes, content_type, expected) in rows {
+            let (body, kind) = decode_response_body(bytes, content_type);
+            if body != expected || kind != ResponseBodyKind::Text {
+                failures.push(format!(
+                    "{content_type}: expected {expected:?}, got {body:?} {kind:?}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "ROWS FAILED:\n{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn test_charset_parameter_parsing() {
+        let rows = [
+            ("text/html; CHARSET=GB2312", Some("gb2312")),
+            ("text/html;charset=\"gb2312\"", Some("gb2312")),
+            ("multipart/x; boundary=b; charset=gb2312", Some("gb2312")),
+            ("text/html; charset=gb2312; foo=bar", Some("gb2312")),
+            // Must not match as a substring.
+            ("text/html; xcharset=gb2312", None),
+            ("text/html", None),
+        ];
+        let mut failures = vec![];
+        for (input, expected) in rows {
+            let got = charset_from_content_type(input);
+            if got.as_deref() != expected {
+                failures.push(format!("{input}: expected {expected:?}, got {got:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "ROWS FAILED:\n{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn test_response_without_charset_decodes_as_utf8() {
+        let (body, kind) = decode_response_body("héllo".as_bytes(), "text/plain");
+        assert_eq!(body, "héllo");
+        assert_eq!(kind, ResponseBodyKind::Text);
+    }
+
+    #[test]
+    fn test_unrecognized_charset_label_falls_back_to_utf8() {
+        let (body, kind) =
+            decode_response_body("héllo".as_bytes(), "text/plain; charset=x-not-a-charset");
+        assert_eq!(body, "héllo");
+        assert_eq!(kind, ResponseBodyKind::Text);
+    }
+
+    #[test]
+    fn test_undecodable_bytes_are_reported_as_binary() {
+        let png: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        let (body, kind) = decode_response_body(png, "image/png");
+        assert_eq!(kind, ResponseBodyKind::Binary);
+        assert!(body.starts_with("[ApiSolo] Binary response"), "{body}");
+        assert!(body.contains("image/png"), "{body}");
+        // The whole point: no lossy substitution anywhere.
+        assert!(!body.contains('\u{FFFD}'), "{body}");
+    }
+
+    #[test]
+    fn test_response_with_nul_byte_is_binary() {
+        // Valid UTF-8, so the decode guard lets it through: only the NUL guard
+        // can reject it.
+        let (_, kind) = decode_response_body(b"ok\0ok", "text/plain");
+        assert_eq!(kind, ResponseBodyKind::Binary);
+    }
+
+    #[tokio::test]
+    async fn test_empty_response_body_is_empty_text() {
+        let server = d02_serve(b"", &[("content-type", "text/plain")]).await;
+        let response = send_request(d02_args("GET", server.uri())).await.unwrap();
+        assert_eq!(response.body, "");
+        assert_eq!(response.size, 0);
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"bodyKind\":\"text\""), "{json}");
+    }
+
+    #[tokio::test]
+    async fn test_response_size_is_post_decompression_byte_count() {
+        let server = d02_serve(
+            D02_GZIP,
+            &[
+                ("content-encoding", "gzip"),
+                ("content-type", "application/json"),
+            ],
+        )
+        .await;
+        let response = send_request(d02_args("GET", server.uri())).await.unwrap();
+        assert_eq!(response.size as usize, D02_PAYLOAD.len());
+        assert_ne!(response.size as usize, D02_GZIP.len());
+    }
+
+    // ---------- §25-§33 自动请求头与请求体保真 ----------
+
+    #[tokio::test]
+    async fn test_form_data_sends_single_content_type_with_real_boundary() {
+        let server = d02_serve(b"ok", &[]).await;
+        let mut args = d02_args("POST", server.uri());
+        // A stale boundary left over from a pasted cURL: for multipart only the
+        // boundary we actually used can be right.
+        args.headers = vec![d02_header(
+            "Content-Type",
+            "multipart/form-data; boundary=----WebKitFormBoundaryStale",
+        )];
+        args.body = RequestBodyInput {
+            body_type: "form-data".to_string(),
+            content: String::new(),
+            form_data: vec![FormDataItem {
+                enabled: true,
+                key: "a".to_string(),
+                value: "1".to_string(),
+                description: String::new(),
+                value_type: "text".to_string(),
+                file_name: String::new(),
+                file_path: String::new(),
+                file_content: None,
+                content_type: String::new(),
+            }],
+            binary_path: String::new(),
+            binary_content: None,
+        };
+        send_request(args).await.unwrap();
+        let received = server.received_requests().await.unwrap();
+        let values = d02_header_values(&received[0], "content-type");
+        assert_eq!(values.len(), 1, "{values:?}");
+        assert!(values[0].starts_with("multipart/form-data; boundary="));
+        assert!(!values[0].contains("Stale"), "{values:?}");
+        // The boundary announced must be the one the body actually uses.
+        let boundary = values[0].split("boundary=").nth(1).unwrap();
+        let body = String::from_utf8_lossy(&received[0].body);
+        assert!(body.contains(boundary), "boundary {boundary} not in body");
+    }
+
+    #[tokio::test]
+    async fn test_form_urlencoded_keeps_user_content_type() {
+        let server = d02_serve(b"ok", &[]).await;
+        let mut args = d02_args("POST", server.uri());
+        args.headers = vec![d02_header(
+            "Content-Type",
+            "application/x-www-form-urlencoded;charset=UTF-8",
+        )];
+        args.body = RequestBodyInput {
+            body_type: "form-urlencoded".to_string(),
+            content: "user=a&pass=b".to_string(),
+            form_data: vec![],
+            binary_path: String::new(),
+            binary_content: None,
+        };
+        send_request(args).await.unwrap();
+        let received = server.received_requests().await.unwrap();
+        let values = d02_header_values(&received[0], "content-type");
+        assert_eq!(
+            values,
+            vec!["application/x-www-form-urlencoded;charset=UTF-8".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_json_body_keeps_user_content_type() {
+        let server = d02_serve(b"ok", &[]).await;
+        let mut args = d02_args("POST", server.uri());
+        args.headers = vec![d02_header("Content-Type", "application/vnd.api+json")];
+        args.body = RequestBodyInput {
+            body_type: "json".to_string(),
+            content: "{\"a\":1}".to_string(),
+            form_data: vec![],
+            binary_path: String::new(),
+            binary_content: None,
+        };
+        send_request(args).await.unwrap();
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            d02_header_values(&received[0], "content-type"),
+            vec!["application/vnd.api+json".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_raw_body_adds_no_content_type() {
+        let server = d02_serve(b"ok", &[]).await;
+        let mut args = d02_args("POST", server.uri());
+        args.body = RequestBodyInput {
+            body_type: "raw".to_string(),
+            content: "anything".to_string(),
+            form_data: vec![],
+            binary_path: String::new(),
+            binary_content: None,
+        };
+        send_request(args).await.unwrap();
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            d02_header_values(&received[0], "content-type"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bearer_auth_replaces_manual_authorization_header() {
+        let server = d02_serve(b"ok", &[]).await;
+        let mut args = d02_args("GET", server.uri());
+        args.headers = vec![d02_header("Authorization", "Bearer stale-token")];
+        args.auth = AuthInput {
+            auth_type: "bearer".to_string(),
+            basic: None,
+            bearer: Some(BearerAuth {
+                token: "fresh-token".to_string(),
+            }),
+            api_key: None,
+        };
+        send_request(args).await.unwrap();
+        let received = server.received_requests().await.unwrap();
+        // Exactly one, and it is the panel's - a panel that silently does
+        // nothing is the failure this fixes.
+        assert_eq!(
+            d02_header_values(&received[0], "authorization"),
+            vec!["Bearer fresh-token".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auth_none_keeps_every_manual_authorization_header() {
+        let server = d02_serve(b"ok", &[]).await;
+        let mut args = d02_args("GET", server.uri());
+        // Two rows on purpose: with one value an unconditional keep-last would
+        // be an inert mutation and prove nothing.
+        args.headers = vec![
+            d02_header("Authorization", "Bearer aaa"),
+            d02_header("Authorization", "Bearer bbb"),
+        ];
+        send_request(args).await.unwrap();
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            d02_header_values(&received[0], "authorization"),
+            vec!["Bearer aaa".to_string(), "Bearer bbb".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_key_header_replaces_a_manual_row_of_the_same_name() {
+        // The existing e2e for api-key auth supplies no header row of its own,
+        // so insert and append produce the identical single value and the
+        // mutation ledger found `insert -> append` surviving. Only a manual row
+        // with the same name can tell the two apart.
+        let server = d02_serve(b"ok", &[]).await;
+        let mut args = d02_args("GET", server.uri());
+        args.headers = vec![d02_header("X-Custom-Auth", "manual-stale-value")];
+        args.auth = AuthInput {
+            auth_type: "api-key".to_string(),
+            basic: None,
+            bearer: None,
+            api_key: Some(ApiKeyAuth {
+                key: "X-Custom-Auth".to_string(),
+                value: "my-secret-key".to_string(),
+                add_to: "header".to_string(),
+            }),
+        };
+        send_request(args).await.unwrap();
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            d02_header_values(&received[0], "x-custom-auth"),
+            vec!["my-secret-key".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_json_body_is_sent_verbatim() {
+        let server = d02_serve(b"ok", &[]).await;
+        // Indented, non-alphabetical, duplicate key, oversized integer: every
+        // one of these is destroyed by a Value round-trip, and raw-body
+        // signature schemes sign exactly these bytes.
+        let body = "{\n  \"timestamp\": 1700000000,\n  \"nonce\": \"ab\",\n  \
+                    \"amount\": \"1.00\",\n  \"a\": 1,\n  \"a\": 2,\n  \
+                    \"id\": 123456789012345678901\n}";
+        let mut args = d02_args("POST", server.uri());
+        args.body = RequestBodyInput {
+            body_type: "json".to_string(),
+            content: body.to_string(),
+            form_data: vec![],
+            binary_path: String::new(),
+            binary_content: None,
+        };
+        send_request(args).await.unwrap();
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received[0].body, body.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_invalid_json_body_is_rejected_before_sending() {
+        let server = d02_serve(b"ok", &[]).await;
+        let mut args = d02_args("POST", server.uri());
+        args.body = RequestBodyInput {
+            body_type: "json".to_string(),
+            content: "{\"a\":".to_string(),
+            form_data: vec![],
+            binary_path: String::new(),
+            binary_content: None,
+        };
+        let error = send_request(args).await.unwrap_err();
+        assert!(error.contains("Invalid JSON body"), "{error}");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    // ---------- §34-§35 失败诊断 ----------
+
+    #[test]
+    fn test_format_error_chain_joins_every_source() {
+        #[derive(Debug)]
+        struct Layer {
+            message: &'static str,
+            source: Option<Box<Layer>>,
+        }
+        impl std::fmt::Display for Layer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.message)
+            }
+        }
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.source
+                    .as_ref()
+                    .map(|inner| inner.as_ref() as &(dyn std::error::Error + 'static))
+            }
+        }
+
+        let chain = Layer {
+            message: "outer",
+            source: Some(Box::new(Layer {
+                message: "middle",
+                source: Some(Box::new(Layer {
+                    message: "root cause",
+                    source: None,
+                })),
+            })),
+        };
+        assert_eq!(
+            format_error_chain("Request failed", &chain),
+            "Request failed: outer: middle: root cause"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transport_error_includes_cause_chain() {
+        // A port that is definitely closed: bind, read the port, drop.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let error = send_request(d02_args("GET", format!("http://127.0.0.1:{port}/")))
+            .await
+            .unwrap_err();
+        assert!(
+            error.starts_with("Request failed: error sending request for url ("),
+            "{error}"
+        );
+        // Assert structurally, not on platform wording: something must follow
+        // the Display form, which is exactly what the source walk adds.
+        let tail = &error[error.find(')').unwrap()..];
+        assert!(tail.contains(": "), "chain not walked: {error}");
+    }
+
+    #[tokio::test]
+    async fn test_body_read_error_includes_cause_chain() {
+        // Announce more body than we send, then hang up.
+        //
+        // The accept loop must keep running: the pre-connect timing probe opens
+        // its own throwaway connection first, so a single-accept fixture would
+        // serve the probe and then leave the real request with a closed port.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort")
+                        .await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        let error = send_request(d02_args("GET", format!("http://{addr}/")))
+            .await
+            .unwrap_err();
+        assert!(error.starts_with("Failed to read response body"), "{error}");
+        let tail = &error["Failed to read response body".len()..];
+        assert!(tail.matches(": ").count() >= 2, "chain not walked: {error}");
+    }
+
+    // ---------- §36-§45 预算、探测与耗时 ----------
+
+    #[tokio::test]
+    async fn test_probe_errors_are_swallowed() {
+        // Structural note: `measure_connection_timings` returns a plain tuple,
+        // so a probe failure has no channel to reach the caller through. This
+        // pins the swallowing arm; the load-bearing guarantee is the type.
+        let outcome =
+            run_probe_within_budget(Duration::from_secs(5), async { Err("dns exploded".into()) })
+                .await;
+        assert_eq!(outcome, (0, 0));
+    }
+
+    #[test]
+    fn test_connect_first_reachable_tries_every_address() {
+        let addrs: Vec<SocketAddr> = vec![
+            "127.0.0.1:1".parse().unwrap(),
+            "127.0.0.1:2".parse().unwrap(),
+        ];
+        let hit = connect_first_reachable_with(&addrs, Duration::from_secs(5), |addr, _| {
+            if addr.port() == 2 {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("refused"))
+            }
+        });
+        assert_eq!(hit.map(|(index, _)| index), Some(1));
+    }
+
+    #[test]
+    fn test_per_attempt_budget_is_shared_fairly() {
+        assert_eq!(
+            per_attempt_budget(Duration::from_secs(5), 2),
+            Duration::from_millis(2500)
+        );
+        assert_eq!(
+            per_attempt_budget(Duration::from_secs(5), 1),
+            Duration::from_secs(5)
+        );
+        assert_eq!(per_attempt_budget(Duration::ZERO, 3), Duration::ZERO);
+        assert_eq!(per_attempt_budget(Duration::from_secs(5), 0), Duration::ZERO);
+    }
+
+    #[test]
+    fn test_connect_first_reachable_gives_each_address_a_share() {
+        let addrs: Vec<SocketAddr> = vec![
+            "127.0.0.1:1".parse().unwrap(),
+            "127.0.0.1:2".parse().unwrap(),
+        ];
+        let mut seen: Vec<(u16, Duration)> = vec![];
+        connect_first_reachable_with(&addrs, Duration::from_secs(5), |addr, budget| {
+            seen.push((addr.port(), budget));
+            Err(std::io::Error::other("refused"))
+        });
+        // A blackholed first address may only spend its own share.
+        assert_eq!(seen[0].1, Duration::from_millis(2500), "{seen:?}");
+        assert_eq!(seen.len(), 2, "second address never tried: {seen:?}");
+    }
+
+    #[test]
+    fn test_probe_connection_hands_the_callers_budget_to_the_addresses() {
+        // The bug this pins: `probe_connection` used to take no budget at all
+        // and the address loop used CONNECTION_PROBE_MAX, so the caller's
+        // budget died between the timeout wrapper and the loop. The fair-share
+        // guarantee then only held when the caller happened to pass 5s, and a
+        // request with 2s left would give its first address 2.5s - the outer
+        // timeout fires and the second address is never tried at all.
+        //
+        // localhost resolves to at least one address on every supported
+        // platform; assert against the count actually resolved so this cannot
+        // silently pass on a single-stack machine.
+        let mut seen: Vec<Duration> = vec![];
+        let budget = Duration::from_secs(2);
+        let outcome = probe_connection_with("localhost".to_string(), 9, budget, |_, given| {
+            seen.push(given);
+            Err(std::io::Error::other("refused"))
+        });
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(!seen.is_empty(), "no address was tried");
+        // Each address gets at most its fair share of the caller's budget, and
+        // in particular never the CONNECTION_PROBE_MAX constant.
+        let fair_share = budget / seen.len() as u32;
+        assert!(
+            seen[0] <= fair_share,
+            "first address got {:?}, more than its {:?} share of the caller's {:?}",
+            seen[0],
+            fair_share,
+            budget
+        );
+        assert!(
+            seen[0] < CONNECTION_PROBE_MAX,
+            "first address got the constant ({:?}) instead of the caller's budget",
+            seen[0]
+        );
+    }
+
+    #[test]
+    fn test_connect_first_reachable_stops_when_budget_is_exhausted() {
+        let addrs: Vec<SocketAddr> = vec![
+            "127.0.0.1:1".parse().unwrap(),
+            "127.0.0.1:2".parse().unwrap(),
+        ];
+        let hit = connect_first_reachable_with(&addrs, Duration::ZERO, |_, _| {
+            panic!("budget exhausted; no connection may be attempted");
+        });
+        assert_eq!(hit, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_probe_budget_covers_the_whole_probe() {
+        // Frozen clock: with real time a zero-duration timer races the inner
+        // future and the inner future usually wins - measured 1000/1000.
+        let probe = async {
+            tokio::time::sleep(Duration::from_nanos(1)).await;
+            Ok((7_u64, 9_u64))
+        };
+        assert_eq!(run_probe_within_budget(Duration::ZERO, probe).await, (0, 0));
+
+        let probe = async {
+            tokio::time::sleep(Duration::from_nanos(1)).await;
+            Ok((7_u64, 9_u64))
+        };
+        assert_eq!(
+            run_probe_within_budget(Duration::from_secs(5), probe).await,
+            (7, 9)
+        );
+    }
+
+    #[test]
+    fn test_probe_budget_never_exceeds_the_overall_remaining() {
+        let now = Instant::now();
+        assert_eq!(
+            probe_budget(now + Duration::from_secs(30), now),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            probe_budget(now + Duration::from_secs(2), now),
+            Duration::from_secs(2)
+        );
+        assert_eq!(probe_budget(now - Duration::from_secs(1), now), Duration::ZERO);
+    }
+
+    #[test]
+    fn test_exhausted_budget_is_rejected() {
+        let now = Instant::now();
+        let error = ensure_budget_remaining(now, now, "sending the request").unwrap_err();
+        assert!(error.contains("budget exhausted"), "{error}");
+        assert_eq!(
+            ensure_budget_remaining(now + Duration::from_secs(4), now, "sending the request")
+                .unwrap(),
+            Duration::from_secs(4)
+        );
+    }
+
+    #[test]
+    fn test_request_timeout_is_taken_from_the_remaining_budget() {
+        let client = Client::builder().no_proxy().build().unwrap();
+        let now = Instant::now();
+        let built = finish_request_with_deadline(
+            client.get("http://127.0.0.1:1/"),
+            "none",
+            "none",
+            now + Duration::from_secs(23),
+        )
+        .unwrap();
+        // Truncating to whole seconds keeps this off the wall clock: the
+        // assertion is "it came from the deadline", not a duration measurement.
+        assert_eq!(built.timeout().unwrap().as_secs(), 22);
+    }
+
+    #[tokio::test]
+    async fn test_execute_request_with_zero_budget_sends_nothing() {
+        // Wiring, not helper: deleting the pre-send checkpoint makes the
+        // request go out and this turns red.
+        let server = d02_serve(b"ok", &[]).await;
+        let error = execute_request_with_budget(d02_args("GET", server.uri()), Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(error.contains("budget exhausted"), "{error}");
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "budget was exhausted; the request must never have been sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_request_honours_a_small_budget() {
+        // Wiring: the per-request timeout must come from the budget. If it is
+        // dropped or replaced by the 30s constant the delayed response arrives
+        // and this returns Ok. Any budget-respecting path yields Err, so there
+        // is no middle state; 500ms vs 5s is a 10x margin.
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+        let outcome = execute_request_with_budget(
+            d02_args("GET", server.uri()),
+            Duration::from_millis(500),
+        )
+        .await;
+        assert!(outcome.is_err(), "budget was ignored: {outcome:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_decode_over_budget_fails_at_the_deadline() {
+        let decode = async {
+            tokio::time::sleep(Duration::from_nanos(1)).await;
+            Ok(DecodedResponseBody {
+                size: 0,
+                body: String::new(),
+                body_kind: ResponseBodyKind::Text,
+                dropped_encoding_headers: false,
+            })
+        };
+        let error = run_decode_within_budget(Duration::ZERO, decode)
+            .await
+            .unwrap_err();
+        assert!(error.contains("budget exhausted"), "{error}");
+
+        let decode = async {
+            tokio::time::sleep(Duration::from_nanos(1)).await;
+            Ok(DecodedResponseBody {
+                size: 7,
+                body: "ok".to_string(),
+                body_kind: ResponseBodyKind::Text,
+                dropped_encoding_headers: false,
+            })
+        };
+        assert_eq!(
+            run_decode_within_budget(Duration::from_secs(5), decode)
+                .await
+                .unwrap()
+                .size,
+            7
+        );
+    }
+
+    #[test]
+    fn test_build_timings_uses_measured_total_not_the_sum() {
+        let timings = build_timings(Duration::from_millis(500), 10, 20, 30);
+        assert_eq!(timings.total, 500);
+        assert!(timings.total >= timings.dns_lookup + timings.tcp_connect + timings.download);
+    }
+
+    #[test]
+    fn test_build_timings_keeps_tls_and_ttfb_zero() {
+        let timings = build_timings(Duration::from_millis(500), 10, 20, 30);
+        assert_eq!(timings.tls_handshake, 0);
+        assert_eq!(timings.ttfb, 0);
+    }
+
+    // ---------- §48-§49 请求目标与运行时 ----------
+
+    #[tokio::test]
+    async fn test_request_target_has_no_trailing_question_mark() {
+        let server = d02_serve(b"ok", &[]).await;
+        let base = server.uri();
+
+        send_request(d02_args("GET", format!("{base}/v1/users")))
+            .await
+            .unwrap();
+        let mut args = d02_args("GET", format!("{base}/v1/users"));
+        args.params = vec![d02_header("a", "1")];
+        send_request(args).await.unwrap();
+        // A `?` the user typed themselves is theirs to keep.
+        send_request(d02_args("GET", format!("{base}/v1/users?")))
+            .await
+            .unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received[0].url.query(), None, "stray ? on the wire");
+        assert_eq!(received[1].url.query(), Some("a=1"));
+        assert_eq!(received[2].url.query(), Some(""));
+    }
+
+    #[test]
+    fn test_finalize_response_body_is_runtime_independent() {
+        // Plain #[test]: no async runtime. Proves the function can be called
+        // off the executor, which is what makes the spawn_blocking call site
+        // possible. NOTE: this does not prove the call site is wrapped - see
+        // the verification gap register in TECH.md §4.3.
+        let decoded = finalize_response_body(
+            D02_PAYLOAD.as_bytes().to_vec(),
+            ContentEncodingPlan::None,
+            "application/json",
+        )
+        .unwrap();
+        assert_eq!(decoded.body, D02_PAYLOAD);
+        assert_eq!(decoded.body_kind, ResponseBodyKind::Text);
+    }
+
+
+    // ---------- 评审 R1 IMPORTANT 的补强 ----------
+
+    #[tokio::test]
+    async fn test_json_body_that_is_only_whitespace_sends_no_body() {
+        // Pins the branch the §33 test missed. Empty or whitespace-only JSON
+        // content is treated as "no body", not as malformed JSON: that guard
+        // predates this change and §33 ties the rejection wording to the
+        // previous behaviour, so leaving the editor blank must not start
+        // erroring. Malformed-but-present content is still rejected - see
+        // test_invalid_json_body_is_rejected_before_sending.
+        let server = d02_serve(b"ok", &[]).await;
+        let mut args = d02_args("POST", server.uri());
+        args.body = RequestBodyInput {
+            body_type: "json".to_string(),
+            content: "   \n\t ".to_string(),
+            form_data: vec![],
+            binary_path: String::new(),
+            binary_content: None,
+        };
+        send_request(args).await.unwrap();
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        assert!(received[0].body.is_empty(), "{:?}", received[0].body);
+        // No body means no content-type of ours either.
+        assert_eq!(
+            d02_header_values(&received[0], "content-type"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_undecodable_encoding_preserves_the_original_bytes_and_length() {
+        // §11 promised the bytes are untouched and Content-Length survives, but
+        // the original test only looked at the marker text, so returning an
+        // empty Vec from the undecodable branch left it green. These assertions
+        // are the ones that collapse if the bytes stop being preserved.
+        const PLAIN: &[u8] = b"this is valid utf-8 and contains no nul byte";
+        let server = d02_serve(
+            PLAIN,
+            &[
+                ("content-encoding", "zstd"),
+                ("content-type", "application/json"),
+            ],
+        )
+        .await;
+        let response = send_request(d02_args("GET", server.uri())).await.unwrap();
+        // size is the byte count of the untouched body ...
+        assert_eq!(response.size as usize, PLAIN.len());
+        // ... and the marker reports that same count back to the user.
+        assert!(
+            response.body.contains(&format!("{} bytes", PLAIN.len())),
+            "{}",
+            response.body
+        );
+        // ... and Content-Length still describes those same bytes.
+        let content_length = response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map(|(_, value)| value.clone());
+        assert_eq!(content_length, Some(PLAIN.len().to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_corrupt_stream_error_carries_the_underlying_cause() {
+        // §13 asks for the encoding name *and* the underlying reason. The
+        // original test only checked the name, so replacing the cause with a
+        // fixed string kept it green.
+        const NOT_GZIP: &[u8] = b"this is definitely not a gzip stream";
+        let server = d02_serve(NOT_GZIP, &[("content-encoding", "gzip")]).await;
+        let error = send_request(d02_args("GET", server.uri()))
+            .await
+            .unwrap_err();
+        let (_, cause) = error.rsplit_once(": ").expect("no cause segment");
+        assert!(
+            !cause.trim().is_empty() && cause != "gzip",
+            "no underlying cause carried: {error}"
+        );
+        // flate2 reports the header mismatch; assert something specific enough
+        // that a hard-coded string would have to impersonate it.
+        assert!(
+            error.to_lowercase().contains("header"),
+            "cause is not the decoder's own: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_user_supplied_accept_encoding_is_sent_unchanged() {
+        // §16 has two halves. The existing test covers "we add none"; this one
+        // covers "we keep the user's", which is the half that matters for the
+        // pasted-cURL workflow and which a blanket remove() would pass.
+        let server = d02_serve(b"ok", &[]).await;
+        let mut args = d02_args("GET", server.uri());
+        args.headers = vec![d02_header("Accept-Encoding", "gzip")];
+        send_request(args).await.unwrap();
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            d02_header_values(&received[0], "accept-encoding"),
+            vec!["gzip".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_declared_charset_is_honoured_through_the_request_path() {
+        // §17-§22 were only exercised against the decoder helper, so the
+        // production path could have ignored Content-Type entirely and every
+        // one of them would still pass. This drives the whole path.
+        // gb2312: 中=D6D0 文=CEC4 测=B2E2 试=CAD4, then "abc".
+        const GBK: &[u8] = &[
+            0xD6, 0xD0, 0xCE, 0xC4, 0xB2, 0xE2, 0xCA, 0xD4, 0x61, 0x62, 0x63,
+        ];
+        let server = d02_serve(GBK, &[("content-type", "text/html; charset=gb2312")]).await;
+        let response = send_request(d02_args("GET", server.uri())).await.unwrap();
+        assert_eq!(response.body, "中文测试abc");
+        assert!(!response.body.contains('\u{FFFD}'), "{}", response.body);
+    }
+
+    #[tokio::test]
+    async fn test_binary_and_none_bodies_add_no_content_type() {
+        // §28 covers raw / binary / none; only raw was exercised.
+        let server = d02_serve(b"ok", &[]).await;
+
+        let mut binary = d02_args("POST", server.uri());
+        binary.body = RequestBodyInput {
+            body_type: "binary".to_string(),
+            content: String::new(),
+            form_data: vec![],
+            binary_path: "payload.bin".to_string(),
+            binary_content: Some("AQIDBA==".to_string()),
+        };
+        send_request(binary).await.unwrap();
+
+        send_request(d02_args("GET", server.uri())).await.unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        for request in &received {
+            assert_eq!(
+                d02_header_values(request, "content-type"),
+                Vec::<String>::new(),
+                "{:?}",
+                request.method
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_basic_auth_replaces_a_manual_authorization_header() {
+        // §29 names basic and bearer; only bearer was exercised.
+        let server = d02_serve(b"ok", &[]).await;
+        let mut args = d02_args("GET", server.uri());
+        args.headers = vec![d02_header("Authorization", "Basic c3RhbGU6c3RhbGU=")];
+        args.auth = AuthInput {
+            auth_type: "basic".to_string(),
+            basic: Some(BasicAuth {
+                username: "alice".to_string(),
+                // A colon in the password is legal and must survive.
+                password: "p:w".to_string(),
+            }),
+            bearer: None,
+            api_key: None,
+        };
+        send_request(args).await.unwrap();
+        let received = server.received_requests().await.unwrap();
+        let values = d02_header_values(&received[0], "authorization");
+        assert_eq!(values.len(), 1, "{values:?}");
+        assert_ne!(values[0], "Basic c3RhbGU6c3RhbGU=");
+        // base64("alice:p:w")
+        assert_eq!(values[0], "Basic YWxpY2U6cDp3");
+    }
+
+    #[tokio::test]
+    async fn test_api_key_mode_leaves_a_manual_authorization_header_alone() {
+        // §30 says anything other than basic/bearer must not touch a manual
+        // Authorization row; api-key mode was never exercised for that.
+        let server = d02_serve(b"ok", &[]).await;
+        let mut args = d02_args("GET", server.uri());
+        // Two rows, not one: with a single value a keep-last collapse is
+        // indistinguishable from leaving the header alone, which is exactly how
+        // the api-key insert/append mutation escaped the first ledger run.
+        args.headers = vec![
+            d02_header("Authorization", "Bearer hand-written-a"),
+            d02_header("Authorization", "Bearer hand-written-b"),
+        ];
+        args.auth = AuthInput {
+            auth_type: "api-key".to_string(),
+            basic: None,
+            bearer: None,
+            api_key: Some(ApiKeyAuth {
+                key: "X-Api-Key".to_string(),
+                value: "secret".to_string(),
+                add_to: "header".to_string(),
+            }),
+        };
+        send_request(args).await.unwrap();
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            d02_header_values(&received[0], "authorization"),
+            vec![
+                "Bearer hand-written-a".to_string(),
+                "Bearer hand-written-b".to_string()
+            ]
+        );
+        assert_eq!(
+            d02_header_values(&received[0], "x-api-key"),
+            vec!["secret".to_string()]
+        );
+    }
+
 }
