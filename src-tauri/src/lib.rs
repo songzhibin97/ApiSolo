@@ -1890,7 +1890,19 @@ fn build_collection_tree(dir: &Path, relative: PathBuf) -> Result<Vec<Collection
         }
 
         let child_relative = relative.join(&name);
-        let saved_request = read_saved_request(&entry_path)?;
+        // One foreign or half-written .json used to fail the whole tree, so a
+        // project with dozens of intact requests showed an empty sidebar. The
+        // file is left alone on disk; it simply is not a request.
+        let saved_request = match read_saved_request(&entry_path) {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!(
+                    "Skipping unreadable saved request {}: {error}",
+                    entry_path.display()
+                );
+                continue;
+            }
+        };
         requests.push(CollectionNode {
             name: saved_request.name,
             path: child_relative.to_string_lossy().replace('\\', "/"),
@@ -9171,5 +9183,91 @@ mod tests {
         let health = get_history_health().unwrap();
         assert_eq!(health.skipped_lines, 0);
         assert_eq!(health.quarantined_lines, 2);
+    }
+
+    // ---------------------------------------------------------------- D03 §七
+    // The collection tree: one unparsable .json must cost only itself.
+
+    fn d03_collection_names(project: &str) -> Vec<String> {
+        get_collection_tree(project.to_string())
+            .unwrap()
+            .iter()
+            .map(|node| node.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn test_collection_tree_skips_unparsable_files() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        create_project("Tree Skip".to_string(), String::new()).unwrap();
+        save_request(
+            "Tree Skip".to_string(),
+            String::new(),
+            sample_saved_request("Get Users", "GET", "http://example.com/users"),
+            None,
+        )
+        .unwrap();
+
+        let collections_dir = temp_home
+            .path()
+            .join("ApiSolo/projects/tree-skip/collections");
+        // A foreign export and a half-written save, the two shapes users hit.
+        std::fs::write(
+            collections_dir.join("openapi.json"),
+            r#"{"openapi":"3.0.0","paths":{}}"#,
+        )
+        .unwrap();
+        std::fs::write(collections_dir.join("torn.request.json"), r#"{"name":"To"#).unwrap();
+
+        assert_eq!(d03_collection_names("Tree Skip"), vec!["Get Users"]);
+        assert!(
+            collections_dir.join("openapi.json").exists()
+                && collections_dir.join("torn.request.json").exists(),
+            "skipping a file must not delete or move it"
+        );
+    }
+
+    #[test]
+    fn test_collection_tree_skips_unparsable_files_in_subfolders() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        create_project("Tree Sub".to_string(), String::new()).unwrap();
+        create_collection("Tree Sub".to_string(), "users".to_string(), String::new()).unwrap();
+        save_request(
+            "Tree Sub".to_string(),
+            "users".to_string(),
+            sample_saved_request("List Users", "GET", "http://example.com/users"),
+            None,
+        )
+        .unwrap();
+        save_request(
+            "Tree Sub".to_string(),
+            String::new(),
+            sample_saved_request("Root Request", "GET", "http://example.com/"),
+            None,
+        )
+        .unwrap();
+
+        let collections_dir = temp_home
+            .path()
+            .join("ApiSolo/projects/tree-sub/collections");
+        std::fs::write(collections_dir.join("users/torn.request.json"), "{").unwrap();
+
+        let tree = get_collection_tree("Tree Sub".to_string()).unwrap();
+        let top: Vec<&str> = tree.iter().map(|node| node.name.as_str()).collect();
+        assert_eq!(top, vec!["users", "Root Request"]);
+
+        let folder = tree.iter().find(|node| node.name == "users").unwrap();
+        let children: Vec<&str> = folder
+            .children
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect();
+        assert_eq!(children, vec!["List Users"]);
     }
 }
