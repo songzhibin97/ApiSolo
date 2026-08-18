@@ -18,7 +18,7 @@ use reqwest::header::{
 };
 use reqwest::{Client, Method, Request as ReqwestRequest, RequestBuilder, Url};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -1707,36 +1707,541 @@ fn delete_secret_value(vault_key: &str) -> Result<(), String> {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Vault maintenance: collision evidence and the deferred cleanup queue.
+//
+// One sidecar file, one reader, one lock, one read-modify-write. It holds
+// identifiers and failure classifications only — never a secret value, and
+// never a backend's raw error string.
+
+const MAINTENANCE_VERSION: u8 = 1;
+
+fn maintenance_version() -> u8 {
+    MAINTENANCE_VERSION
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnvironmentRef {
+    /// Project directory name.
+    project: String,
+    /// Environment file stem.
+    environment: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SecretKeyCollision {
+    legacy_vault_key: String,
+    variable_key: String,
+    environments: Vec<EnvironmentRef>,
+    detected_at: String,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum PruneFailureKind {
+    IndexUnreadable,
+    IndexIncomplete,
+    BackendDelete,
+}
+
+/// Exactly two fields, and that is a load-bearing property: a raw backend
+/// error can carry paths or key material, so there is nowhere here to put one.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PruneFailure {
+    at: String,
+    kind: PruneFailureKind,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MaintenanceSnapshot {
+    #[serde(default = "maintenance_version")]
+    version: u8,
+    #[serde(default)]
+    collisions: Vec<SecretKeyCollision>,
+    #[serde(default)]
+    pending_prune: Vec<String>,
+    #[serde(default)]
+    last_failure: Option<PruneFailure>,
+}
+
+impl Default for MaintenanceSnapshot {
+    fn default() -> Self {
+        Self {
+            version: MAINTENANCE_VERSION,
+            collisions: Vec::new(),
+            pending_prune: Vec::new(),
+            last_failure: None,
+        }
+    }
+}
+
+/// Guards the maintenance file's read-merge-write cycle. Atomic replacement
+/// alone is not enough: two loads that each discover a different collision
+/// would read the same old snapshot and each write back only their own, and
+/// once migration completes the lost evidence cannot be reconstructed.
+///
+/// Never held at the same time as LOCAL_VAULT_TX. Cleanup runs as: hold this,
+/// read the queue, release, delete through the vault lock, re-acquire this to
+/// record what finished.
+fn vault_maintenance_tx() -> &'static StdMutex<()> {
+    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| StdMutex::new(()))
+}
+
+fn lock_vault_maintenance_tx() -> MutexGuard<'static, ()> {
+    vault_maintenance_tx()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn vault_maintenance_path() -> Result<PathBuf, String> {
+    Ok(data_dir()?.join("scratch").join("vault-maintenance.json"))
+}
+
+fn read_maintenance_snapshot() -> Result<MaintenanceSnapshot, String> {
+    let path = vault_maintenance_path()?;
+    if !path.exists() {
+        return Ok(MaintenanceSnapshot::default());
+    }
+
+    let contents = fs::read_to_string(&path)
+        .map_err(|error| format!("Failed to read vault maintenance file: {error}"))?;
+    serde_json::from_str(&contents)
+        .map_err(|error| format!("Failed to parse vault maintenance file: {error}"))
+}
+
+fn write_maintenance_snapshot(snapshot: &MaintenanceSnapshot) -> Result<(), String> {
+    write_atomic(
+        &vault_maintenance_path()?,
+        pretty_json(snapshot)?.as_bytes(),
+    )
+}
+
+/// Recovers the variable name from a vault key's third segment. Legacy keys
+/// sanitise their first two segments down to `[A-Za-z0-9_-]`, so the last ':'
+/// always separates the base64 name.
+fn variable_key_from_vault_key(vault_key: &str) -> String {
+    let Some((_, encoded)) = vault_key.rsplit_once(':') else {
+        return String::new();
+    };
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_default()
+}
+
+fn record_vault_key_collisions(
+    candidates: &[String],
+    index: &VaultKeyIndex,
+) -> Result<(), String> {
+    let _guard = lock_vault_maintenance_tx();
+    checkpoint("maintenance_enter");
+    let mut snapshot = read_maintenance_snapshot()?;
+
+    let mut changed = false;
+    for candidate in candidates {
+        let Some(references) = index.refs.get(candidate) else {
+            continue;
+        };
+
+        let mut distinct: Vec<EnvironmentRef> = Vec::new();
+        for reference in references {
+            if !distinct.contains(reference) {
+                distinct.push(reference.clone());
+            }
+        }
+        if distinct.len() < 2 {
+            continue;
+        }
+        if snapshot
+            .collisions
+            .iter()
+            .any(|collision| &collision.legacy_vault_key == candidate)
+        {
+            continue;
+        }
+
+        snapshot.collisions.push(SecretKeyCollision {
+            legacy_vault_key: candidate.clone(),
+            variable_key: variable_key_from_vault_key(candidate),
+            environments: distinct,
+            detected_at: now_iso(),
+        });
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(());
+    }
+
+    write_maintenance_snapshot(&snapshot)
+}
+
+fn enqueue_pending_prune(keys: &[String]) -> Result<(), String> {
+    let _guard = lock_vault_maintenance_tx();
+    checkpoint("maintenance_enter");
+    let mut snapshot = read_maintenance_snapshot()?;
+
+    let mut changed = false;
+    for key in keys {
+        if !snapshot.pending_prune.contains(key) {
+            snapshot.pending_prune.push(key.clone());
+            changed = true;
+        }
+    }
+
+    if !changed {
+        return Ok(());
+    }
+
+    write_maintenance_snapshot(&snapshot)
+}
+
+/// Read-only on purpose. An earlier design took the queue out of the file and
+/// wrote it back shortened; a crash between that and the actual deletion lost
+/// the cleanup intent permanently — the very defect this queue exists to fix.
+/// The queue only ever shrinks in `resolve_pending_prune`, for keys already
+/// confirmed done.
+fn read_pending_prune() -> Result<Vec<String>, String> {
+    let _guard = lock_vault_maintenance_tx();
+    checkpoint("maintenance_enter");
+    let snapshot = read_maintenance_snapshot()?;
+    Ok(snapshot.pending_prune)
+}
+
+fn resolve_pending_prune(done: &[String]) -> Result<(), String> {
+    let _guard = lock_vault_maintenance_tx();
+    checkpoint("maintenance_enter");
+    let mut snapshot = read_maintenance_snapshot()?;
+
+    let before = snapshot.pending_prune.len();
+    snapshot.pending_prune.retain(|key| !done.contains(key));
+    if snapshot.pending_prune.len() == before {
+        return Ok(());
+    }
+
+    write_maintenance_snapshot(&snapshot)
+}
+
+/// Records that a cleanup round did not finish. Not a checker target: it never
+/// branches on what it read, so there is no read-before-lock surface here.
+fn note_pending_prune_failure(kind: PruneFailureKind) -> Result<(), String> {
+    let _guard = lock_vault_maintenance_tx();
+    let mut snapshot = read_maintenance_snapshot()?;
+    snapshot.last_failure = Some(PruneFailure {
+        at: now_iso(),
+        kind,
+    });
+    write_maintenance_snapshot(&snapshot)
+}
+
+struct VaultKeyIndex {
+    refs: BTreeMap<String, Vec<EnvironmentRef>>,
+    /// False when any environment's metadata could not be read, or when some
+    /// row still has no key written down. An incomplete index may not be used
+    /// to conclude that anything is unreferenced.
+    complete: bool,
+}
+
+/// Scans every environment's secret metadata for the vault keys still in use.
+fn index_referenced_vault_keys() -> Result<VaultKeyIndex, String> {
+    let mut index = VaultKeyIndex {
+        refs: BTreeMap::new(),
+        complete: true,
+    };
+
+    let projects = projects_dir()?;
+    let Ok(project_entries) = fs::read_dir(&projects) else {
+        index.complete = false;
+        return Ok(index);
+    };
+
+    for project_entry in project_entries {
+        let Ok(project_entry) = project_entry else {
+            index.complete = false;
+            continue;
+        };
+        let project_dir = project_entry.path();
+        if !project_dir.is_dir() {
+            continue;
+        }
+        let Some(project_name) = project_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(ToOwned::to_owned)
+        else {
+            index.complete = false;
+            continue;
+        };
+
+        let env_dir = project_environments_dir(&project_dir);
+        if !env_dir.exists() {
+            continue;
+        }
+        let Ok(env_entries) = fs::read_dir(&env_dir) else {
+            index.complete = false;
+            continue;
+        };
+
+        for env_entry in env_entries {
+            let Ok(env_entry) = env_entry else {
+                index.complete = false;
+                continue;
+            };
+            let path = env_entry.path();
+            let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let Some(stem) = file_name.strip_suffix(".env.secrets.json") else {
+                continue;
+            };
+
+            let reference = EnvironmentRef {
+                project: project_name.clone(),
+                environment: stem.to_string(),
+            };
+
+            let Ok(variables) = read_env_variables(&path, true) else {
+                index.complete = false;
+                continue;
+            };
+
+            for variable in variables {
+                let recorded = variable.vault_key.trim();
+                if !recorded.is_empty() {
+                    index
+                        .refs
+                        .entry(recorded.to_string())
+                        .or_default()
+                        .push(reference.clone());
+                    continue;
+                }
+
+                // Old-format row with no key written down. The read path
+                // derives one, so the reference is implicit but real. The
+                // derivation is only a guess — the legacy key was built from
+                // whatever spelling of the name was passed in at the time, and
+                // disk only kept the slug — so the whole round is downgraded
+                // rather than risk deleting a key that is still in use.
+                index.complete = false;
+                for derived in [
+                    vault_key_for(&project_dir, stem, &variable.key),
+                    legacy_vault_key_for(&project_dir, stem, &variable.key),
+                ] {
+                    index
+                        .refs
+                        .entry(derived)
+                        .or_default()
+                        .push(reference.clone());
+                }
+            }
+        }
+    }
+
+    Ok(index)
+}
+
+/// Deletes vault entries nothing references any more, returning only the keys
+/// confirmed finished. The caller removes exactly those from the queue — a
+/// plain `Result<(), String>` could not say which, and an incomplete index
+/// would then look like "pruned everything" and drop the whole queue.
+fn prune_orphan_vault_keys(
+    candidates: &[String],
+    index: &VaultKeyIndex,
+) -> Result<Vec<String>, String> {
+    if !index.complete {
+        return Ok(Vec::new());
+    }
+
+    let mut done = Vec::new();
+    for candidate in candidates {
+        if index.refs.contains_key(candidate) {
+            continue;
+        }
+
+        // Already gone counts as finished; that is what makes a retry after a
+        // partial round idempotent.
+        if load_secret_value(candidate)?.is_empty() {
+            done.push(candidate.clone());
+            continue;
+        }
+
+        // One failure aborts the round and nothing is reported done, so the
+        // whole batch stays queued. Erring towards one more retry is always
+        // safer than erring towards deleting a live credential.
+        delete_secret_value(candidate)?;
+        done.push(candidate.clone());
+    }
+
+    Ok(done)
+}
+
+/// The single rule shared by collision detection and orphan cleanup.
+///
+/// A recorded key is what the previous version actually wrote on disk; a
+/// derived one is a guess. When a recorded key exists the guess is dropped,
+/// because it can coincide with a key another environment is genuinely using —
+/// and acting on that guess copies someone else's credential into this
+/// environment, or deletes theirs.
+fn legacy_vault_key_candidates(
+    project_dir: &Path,
+    env_name: &str,
+    variable: &EnvVariable,
+) -> Vec<String> {
+    let target = vault_key_for(project_dir, env_name, &variable.key);
+    let recorded = variable.vault_key.trim();
+
+    if !recorded.is_empty() {
+        if recorded == target {
+            return Vec::new();
+        }
+        return vec![recorded.to_string()];
+    }
+
+    let derived = legacy_vault_key_for(project_dir, env_name, &variable.key);
+    if derived == target {
+        return Vec::new();
+    }
+    vec![derived]
+}
+
+/// Runs the deferred cleanup queue and records failures without blocking the
+/// user. Cleanup is maintenance, not part of what the user asked for: refusing
+/// to open an environment because a stale prune never finished points exactly
+/// the wrong way. Failures are still never swallowed — they leave a dated,
+/// classified marker on disk.
+fn retry_pending_prune(pending: &[String]) {
+    if pending.is_empty() {
+        return;
+    }
+
+    let outcome = match index_referenced_vault_keys() {
+        Err(_) => Err(PruneFailureKind::IndexUnreadable),
+        Ok(index) if !index.complete => Err(PruneFailureKind::IndexIncomplete),
+        Ok(index) => prune_orphan_vault_keys(pending, &index)
+            .map_err(|_| PruneFailureKind::BackendDelete),
+    };
+
+    match outcome {
+        Ok(done) => {
+            // A failure here writes to the very file it would report to, so
+            // there is nowhere to record it but the log.
+            if resolve_pending_prune(&done).is_err() {
+                eprintln!(
+                    "[vault-maintenance] resolve failed kind=resolve-write pending={}",
+                    pending.len()
+                );
+            }
+        }
+        Err(kind) => {
+            // Fixed classification only. Backend error strings can carry paths
+            // or key material, and the log is the same boundary as the file.
+            eprintln!(
+                "[vault-maintenance] deferred cleanup failed kind={kind:?} pending={}",
+                pending.len()
+            );
+            if note_pending_prune_failure(kind).is_err() {
+                eprintln!("[vault-maintenance] failure marker not persisted kind={kind:?}");
+            }
+        }
+    }
+}
+
+#[tauri::command]
+fn get_secret_key_collisions() -> Result<Vec<SecretKeyCollision>, String> {
+    Ok(read_maintenance_snapshot()?.collisions)
+}
+
+/// Clears one collision record. Nothing else does — not completing the
+/// migration, not restarting, not loading the environment again. The user has
+/// to be told which credential to re-enter, and the record is what tells them.
+#[tauri::command]
+fn acknowledge_secret_key_collision(legacy_vault_key: String) -> Result<(), String> {
+    let _guard = lock_vault_maintenance_tx();
+    checkpoint("maintenance_enter");
+    let mut snapshot = read_maintenance_snapshot()?;
+    snapshot
+        .collisions
+        .retain(|collision| collision.legacy_vault_key != legacy_vault_key);
+    write_maintenance_snapshot(&snapshot)
+}
+
 fn resolve_secret_variables(
     project_dir: &Path,
     env_name: &str,
     variables: Vec<EnvVariable>,
     secrets_path: &Path,
 ) -> Result<Vec<EnvVariable>, String> {
-    let mut migrated = false;
+    // Step 0: pick up cleanup a previous run could not finish. Failures here
+    // never block the load.
+    retry_pending_prune(&read_pending_prune()?);
+
+    let mut candidates: Vec<String> = Vec::new();
+    for variable in &variables {
+        for candidate in legacy_vault_key_candidates(project_dir, env_name, variable) {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    // Step 1: evidence before migration, and this one *does* block. Once the
+    // pointers flip, nothing on disk shows that two environments ever shared a
+    // slot — better to refuse to open than to erase the only proof.
+    if !candidates.is_empty() {
+        let index_before = index_referenced_vault_keys()?;
+        record_vault_key_collisions(&candidates, &index_before)?;
+        enqueue_pending_prune(&candidates)?;
+    }
+
+    let mut changed = false;
     let mut resolved = Vec::with_capacity(variables.len());
 
     for mut variable in variables {
         variable.secret = true;
-        let vault_key = if variable.vault_key.trim().is_empty() {
-            migrated = true;
-            vault_key_for(project_dir, env_name, &variable.key)
-        } else {
-            variable.vault_key.clone()
-        };
+        let target = vault_key_for(project_dir, env_name, &variable.key);
+        let recorded = variable.vault_key.trim().to_string();
 
         if !variable.value.is_empty() {
-            save_secret_value(&vault_key, &variable.value)?;
-            migrated = true;
+            // Plaintext left in the metadata file by an old version.
+            save_secret_value(&target, &variable.value)?;
+            changed = true;
+        } else if load_secret_value(&target)?.is_empty() {
+            // Copy forward only into an empty slot: that keeps the migration
+            // idempotent and stops it overwriting something the user has since
+            // typed in.
+            for candidate in legacy_vault_key_candidates(project_dir, env_name, &variable) {
+                let legacy_value = load_secret_value(&candidate)?;
+                if legacy_value.is_empty() {
+                    continue;
+                }
+                save_secret_value(&target, &legacy_value)?;
+                changed = true;
+                break;
+            }
         }
 
-        variable.value = load_secret_value(&vault_key)?;
-        variable.vault_key = vault_key;
+        if recorded != target {
+            changed = true;
+        }
+
+        variable.value = load_secret_value(&target)?;
+        variable.vault_key = target;
         resolved.push(variable);
     }
 
-    if migrated {
+    if changed {
+        // Step 3: the pointer flips here, and only then is the old key
+        // genuinely unreferenced. The queue was written before the flip, so an
+        // interrupted cleanup is retried on the next load rather than lost.
         write_secret_metadata(secrets_path, &resolved)?;
+        retry_pending_prune(&candidates);
     }
 
     Ok(resolved)
@@ -4049,6 +4554,8 @@ pub fn run() {
             delete_history_entry,
             update_history_entries,
             get_history_health,
+            get_secret_key_collisions,
+            acknowledge_secret_key_collision,
             get_data_dir,
             get_secret_storage_state,
             configure_secret_storage,
@@ -9516,5 +10023,472 @@ mod tests {
             1,
             "the vault was created more than once"
         );
+    }
+
+    // ------------------------------------------------- D03 §一 (migration)
+    // Copying legacy vault entries forward, and recording the collisions the
+    // old key scheme already caused before erasing the evidence of them.
+
+    fn d03_env_file(home: &Path, project_slug: &str, env_stem: &str, secrets: bool) -> PathBuf {
+        let suffix = if secrets {
+            ".env.secrets.json"
+        } else {
+            ".env.json"
+        };
+        home.join("ApiSolo/projects")
+            .join(project_slug)
+            .join("environments")
+            .join(format!("{env_stem}{suffix}"))
+    }
+
+    /// Writes secret metadata the way an older version did: a recorded vault
+    /// key and no value.
+    fn d03_write_recorded_metadata(path: &Path, rows: &[(&str, &str)]) {
+        let variables: Vec<EnvVariable> = rows
+            .iter()
+            .map(|(key, vault_key)| EnvVariable {
+                key: key.to_string(),
+                value: String::new(),
+                secret: true,
+                vault_key: vault_key.to_string(),
+            })
+            .collect();
+        std::fs::write(path, pretty_json(&variables).unwrap()).unwrap();
+    }
+
+    fn d03_read_metadata(path: &Path) -> Vec<EnvVariable> {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn d03_maintenance_json() -> serde_json::Value {
+        match std::fs::read_to_string(vault_maintenance_path().unwrap()) {
+            Ok(text) => serde_json::from_str(&text).unwrap(),
+            Err(_) => serde_json::json!({}),
+        }
+    }
+
+    fn d03_pending_prune() -> Vec<String> {
+        d03_maintenance_json()
+            .get("pendingPrune")
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .map(|value| value.as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    fn d03_env_value(project: &str, env: &str, key: &str) -> String {
+        load_environment(project.to_string(), env.to_string())
+            .unwrap()
+            .variables
+            .into_iter()
+            .find(|variable| variable.key == key)
+            .map(|variable| variable.value)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn test_legacy_vault_entry_is_migrated_on_load() {
+        // Upper case, underscore, punctuation and CJK: four shapes whose old
+        // key differs from the new one.
+        for env_name in ["My Env", "my_env", "prod!", "生产"] {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            create_project("Legacy".to_string(), String::new()).unwrap();
+            configure_local_secret_storage_for_test();
+
+            let project_dir = temp_home.path().join("ApiSolo/projects/legacy");
+            let stem = slugify(env_name);
+            let legacy = legacy_vault_key_for(&project_dir, env_name, "token");
+            let target = vault_key_for(&project_dir, env_name, "token");
+            assert_ne!(legacy, target, "{env_name} needs no migration; bad fixture");
+
+            save_secret_value(&legacy, "PROD-SECRET").unwrap();
+            let secrets_path = d03_env_file(temp_home.path(), "legacy", &stem, true);
+            d03_write_recorded_metadata(&secrets_path, &[("token", &legacy)]);
+
+            assert_eq!(
+                d03_env_value("Legacy", env_name, "token"),
+                "PROD-SECRET",
+                "{env_name}: value did not survive migration"
+            );
+            let metadata = d03_read_metadata(&secrets_path);
+            assert_eq!(metadata[0].vault_key, target, "{env_name}: pointer not flipped");
+
+            // Opening again must be stable, not a second migration.
+            assert_eq!(d03_env_value("Legacy", env_name, "token"), "PROD-SECRET");
+
+            // Half-migrated state: the value already sits under the new key but
+            // the metadata still names the old one. Reopening self-heals.
+            d03_write_recorded_metadata(&secrets_path, &[("token", &legacy)]);
+            assert_eq!(
+                d03_env_value("Legacy", env_name, "token"),
+                "PROD-SECRET",
+                "{env_name}: half-migrated state lost the value"
+            );
+            assert_eq!(d03_read_metadata(&secrets_path)[0].vault_key, target);
+        }
+    }
+
+    #[test]
+    fn test_migration_does_not_overwrite_existing_new_key_value() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Legacy".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/legacy");
+        let legacy = legacy_vault_key_for(&project_dir, "My Env", "token");
+        let target = vault_key_for(&project_dir, "My Env", "token");
+        save_secret_value(&legacy, "old").unwrap();
+        save_secret_value(&target, "new").unwrap();
+
+        let secrets_path = d03_env_file(temp_home.path(), "legacy", "my-env", true);
+        d03_write_recorded_metadata(&secrets_path, &[("token", &legacy)]);
+
+        assert_eq!(
+            d03_env_value("Legacy", "My Env", "token"),
+            "new",
+            "migration overwrote a value the user had already entered"
+        );
+    }
+
+    #[test]
+    fn test_migration_prunes_unreferenced_legacy_vault_key() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Legacy".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/legacy");
+        let legacy = legacy_vault_key_for(&project_dir, "My Env", "token");
+        save_secret_value(&legacy, "PROD-SECRET").unwrap();
+        d03_write_recorded_metadata(
+            &d03_env_file(temp_home.path(), "legacy", "my-env", true),
+            &[("token", &legacy)],
+        );
+
+        assert_eq!(d03_env_value("Legacy", "My Env", "token"), "PROD-SECRET");
+        assert_eq!(
+            load_secret_value(&legacy).unwrap(),
+            "",
+            "the orphaned legacy entry is still in the vault"
+        );
+        assert!(d03_pending_prune().is_empty(), "queue was not resolved");
+    }
+
+    #[test]
+    fn test_migration_keeps_legacy_vault_key_referenced_by_another_environment() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Legacy".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/legacy");
+        // Two CJK names that the old scheme collapsed onto one slot.
+        let shared = legacy_vault_key_for(&project_dir, "生产", "token");
+        assert_eq!(shared, legacy_vault_key_for(&project_dir, "测试", "token"));
+        save_secret_value(&shared, "SURVIVOR").unwrap();
+
+        for stem in ["生产", "测试"] {
+            d03_write_recorded_metadata(
+                &d03_env_file(temp_home.path(), "legacy", stem, true),
+                &[("token", &shared)],
+            );
+        }
+
+        assert_eq!(d03_env_value("Legacy", "生产", "token"), "SURVIVOR");
+        assert_eq!(
+            load_secret_value(&shared).unwrap(),
+            "SURVIVOR",
+            "the shared legacy entry was deleted while 测试 still pointed at it"
+        );
+    }
+
+    #[test]
+    fn test_collided_environments_both_keep_the_surviving_secret() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Legacy".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/legacy");
+        let shared = legacy_vault_key_for(&project_dir, "生产", "token");
+        save_secret_value(&shared, "SURVIVOR").unwrap();
+        for stem in ["生产", "测试"] {
+            d03_write_recorded_metadata(
+                &d03_env_file(temp_home.path(), "legacy", stem, true),
+                &[("token", &shared)],
+            );
+        }
+
+        // Both environments end up holding a copy of the one value that
+        // survived the old overwrite. Neither is blanked: an empty box reads as
+        // "deleted", which misleads harder than a wrong value.
+        assert_eq!(d03_env_value("Legacy", "生产", "token"), "SURVIVOR");
+        assert_eq!(d03_env_value("Legacy", "测试", "token"), "SURVIVOR");
+
+        let production = vault_key_for(&project_dir, "生产", "token");
+        let staging = vault_key_for(&project_dir, "测试", "token");
+        assert_ne!(production, staging);
+        assert_eq!(load_secret_value(&production).unwrap(), "SURVIVOR");
+        assert_eq!(load_secret_value(&staging).unwrap(), "SURVIVOR");
+
+        // From now on they are independent.
+        save_secret_value(&production, "REAL-PROD").unwrap();
+        assert_eq!(load_secret_value(&staging).unwrap(), "SURVIVOR");
+    }
+
+    #[test]
+    fn test_prune_is_skipped_when_a_secrets_metadata_file_is_unreadable() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Legacy".to_string(), String::new()).unwrap();
+        create_project("Unrelated".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/legacy");
+        let legacy = legacy_vault_key_for(&project_dir, "My Env", "token");
+        save_secret_value(&legacy, "PROD-SECRET").unwrap();
+        d03_write_recorded_metadata(
+            &d03_env_file(temp_home.path(), "legacy", "my-env", true),
+            &[("token", &legacy)],
+        );
+
+        // A broken file in a completely different project must stop the whole
+        // round: better an orphan than a wrong deletion.
+        std::fs::write(
+            d03_env_file(temp_home.path(), "unrelated", "dev", true),
+            "{ not json",
+        )
+        .unwrap();
+
+        assert_eq!(d03_env_value("Legacy", "My Env", "token"), "PROD-SECRET");
+        assert_eq!(
+            load_secret_value(&legacy).unwrap(),
+            "PROD-SECRET",
+            "pruned against an index that was known to be incomplete"
+        );
+        assert_eq!(d03_pending_prune(), vec![legacy]);
+    }
+
+    #[test]
+    fn test_prune_respects_implicit_reference_from_empty_vault_key() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Legacy".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/legacy");
+        let shared = legacy_vault_key_for(&project_dir, "生产", "token");
+        save_secret_value(&shared, "SHARED").unwrap();
+
+        // 生产 records the key explicitly; 测试 is older still and records
+        // nothing, so its reference exists only by derivation.
+        d03_write_recorded_metadata(
+            &d03_env_file(temp_home.path(), "legacy", "生产", true),
+            &[("token", &shared)],
+        );
+        std::fs::write(
+            d03_env_file(temp_home.path(), "legacy", "测试", true),
+            r#"[{"key":"token","value":"","secret":true,"vault_key":""}]"#,
+        )
+        .unwrap();
+
+        assert_eq!(d03_env_value("Legacy", "生产", "token"), "SHARED");
+        assert_eq!(
+            load_secret_value(&shared).unwrap(),
+            "SHARED",
+            "deleted a key that an old-format row still referenced implicitly"
+        );
+        assert_eq!(
+            d03_env_value("Legacy", "测试", "token"),
+            "SHARED",
+            "测试 lost its value"
+        );
+    }
+
+    #[test]
+    fn test_collision_candidates_come_from_recorded_keys_only() {
+        // (a) Two environments whose files differ but whose metadata names the
+        // same old key. Recomputing a candidate from the file stem finds
+        // neither, so the collision would go unrecorded and migration would
+        // then erase the only evidence it ever happened.
+        {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            create_project("Rec".to_string(), String::new()).unwrap();
+            configure_local_secret_storage_for_test();
+
+            let project_dir = temp_home.path().join("ApiSolo/projects/rec");
+            let recorded = legacy_vault_key_for(&project_dir, "a_b", "token");
+            // Fixture self-check: the two names really do land on different
+            // files while sharing one recorded key.
+            assert_eq!(slugify("a.b"), "ab");
+            assert_eq!(slugify("a_b"), "a-b");
+            assert_eq!(recorded, legacy_vault_key_for(&project_dir, "a.b", "token"));
+            save_secret_value(&recorded, "SHARED").unwrap();
+
+            for stem in ["ab", "a-b"] {
+                d03_write_recorded_metadata(
+                    &d03_env_file(temp_home.path(), "rec", stem, true),
+                    &[("token", &recorded)],
+                );
+            }
+
+            load_environment("Rec".to_string(), "a.b".to_string()).unwrap();
+
+            let collisions = get_secret_key_collisions().unwrap();
+            assert_eq!(collisions.len(), 1, "collision was not recorded");
+            assert_eq!(
+                collisions[0].legacy_vault_key, recorded,
+                "recorded the recomputed guess instead of the key that really existed"
+            );
+            assert_eq!(collisions[0].variable_key, "token");
+            assert_eq!(collisions[0].environments.len(), 2);
+        }
+
+        // (b) The recorded key points at something the vault no longer has,
+        // while the *derived* key is one another environment genuinely uses.
+        // Falling back to the derived candidate would copy that environment's
+        // credential into this one - and sub-case (a) cannot see that at all.
+        {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            create_project("Rec".to_string(), String::new()).unwrap();
+            configure_local_secret_storage_for_test();
+
+            let project_dir = temp_home.path().join("ApiSolo/projects/rec");
+            let gone = format!(
+                "rec:GONE:{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("token")
+            );
+            let derived = legacy_vault_key_for(&project_dir, "生产", "token");
+            assert_eq!(derived, legacy_vault_key_for(&project_dir, "测试", "token"));
+            save_secret_value(&derived, "TEST-SECRET").unwrap();
+
+            d03_write_recorded_metadata(
+                &d03_env_file(temp_home.path(), "rec", "生产", true),
+                &[("token", &gone)],
+            );
+            d03_write_recorded_metadata(
+                &d03_env_file(temp_home.path(), "rec", "测试", true),
+                &[("token", &derived)],
+            );
+
+            assert_eq!(
+                d03_env_value("Rec", "生产", "token"),
+                "",
+                "生产 was handed 测试's credential"
+            );
+            assert!(
+                get_secret_key_collisions().unwrap().is_empty(),
+                "invented a collision from a guessed key"
+            );
+            assert!(
+                !d03_pending_prune().contains(&derived),
+                "queued another environment's live key for deletion"
+            );
+            assert_eq!(load_secret_value(&derived).unwrap(), "TEST-SECRET");
+        }
+    }
+
+    #[test]
+    fn test_migration_aborts_when_collision_record_cannot_be_persisted() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Legacy".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/legacy");
+        let shared = legacy_vault_key_for(&project_dir, "生产", "token");
+        save_secret_value(&shared, "SURVIVOR").unwrap();
+        let secrets_path = d03_env_file(temp_home.path(), "legacy", "生产", true);
+        for stem in ["生产", "测试"] {
+            d03_write_recorded_metadata(
+                &d03_env_file(temp_home.path(), "legacy", stem, true),
+                &[("token", &shared)],
+            );
+        }
+
+        let scratch = temp_home.path().join("ApiSolo/scratch");
+        let restore = std::fs::metadata(&scratch).unwrap().permissions();
+        let mut readonly = restore.clone();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut readonly, 0o555);
+        std::fs::set_permissions(&scratch, readonly).unwrap();
+
+        let outcome = load_environment("Legacy".to_string(), "生产".to_string());
+
+        // Restore before asserting, or TempDir cleanup fails and buries the
+        // real failure under an unrelated one.
+        std::fs::set_permissions(&scratch, restore).unwrap();
+
+        assert!(
+            outcome.is_err(),
+            "load must fail when the collision record cannot land"
+        );
+        assert_eq!(
+            load_secret_value(&shared).unwrap(),
+            "SURVIVOR",
+            "cleaned up the legacy key without recording the collision"
+        );
+        assert_eq!(
+            d03_read_metadata(&secrets_path)[0].vault_key, shared,
+            "flipped the pointer without recording the collision"
+        );
+    }
+
+    #[test]
+    fn test_collision_record_survives_reload_until_acknowledged() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Legacy".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/legacy");
+        let shared = legacy_vault_key_for(&project_dir, "生产", "token");
+        save_secret_value(&shared, "SURVIVOR").unwrap();
+        for stem in ["生产", "测试"] {
+            d03_write_recorded_metadata(
+                &d03_env_file(temp_home.path(), "legacy", stem, true),
+                &[("token", &shared)],
+            );
+        }
+
+        load_environment("Legacy".to_string(), "生产".to_string()).unwrap();
+        assert_eq!(get_secret_key_collisions().unwrap().len(), 1);
+
+        // Completing the migration, reloading either environment, and reading
+        // the file again must all leave the record alone.
+        for _ in 0..2 {
+            load_environment("Legacy".to_string(), "生产".to_string()).unwrap();
+            load_environment("Legacy".to_string(), "测试".to_string()).unwrap();
+        }
+        assert_eq!(
+            get_secret_key_collisions().unwrap().len(),
+            1,
+            "the collision record was quietly dropped"
+        );
+        assert_eq!(
+            d03_maintenance_json()["collisions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        acknowledge_secret_key_collision(shared).unwrap();
+        assert!(get_secret_key_collisions().unwrap().is_empty());
     }
 }
