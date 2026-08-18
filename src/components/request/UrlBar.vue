@@ -147,6 +147,7 @@ onUnmounted(() => {
 
     <div
       v-if="detectedVariables.length > 0"
+      data-testid="url-variables"
       class="mt-2 text-xs text-[var(--text-secondary)]"
     >
       {{ t("request.containsVariables") }}

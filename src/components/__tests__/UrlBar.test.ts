@@ -24,6 +24,48 @@ function mountBar() {
   })
 }
 
+/**
+ * Both cases here read from the rendered field rather than from a call. That is
+ * the fifth assertion class ruling A27 added to A20: a form control's `value`
+ * binding is not decoration, it is the only wire between the draft the code
+ * keeps and the text the user edits. Everything downstream of that wire can be
+ * correct while the wire itself is cut, which is exactly what happened — this
+ * pair of cases exists because both mutations below survived all 313 tests.
+ */
+describe("§8/§12 the field renders the draft, not the value handed back to it", () => {
+  beforeEach(() => {
+    reconcile.mockClear()
+  })
+
+  it("keeps showing what was typed after a re-render", async () => {
+    const wrapper = mountBar()
+    await wrapper.find("input").setValue("https://x/a?q=a%20b")
+
+    // The re-render matters and must not be tidied away. Binding the field to
+    // `props.url` only overwrites the text when Vue patches the element, so
+    // without a render in between, a cut wire still looks intact.
+    await wrapper.setProps({ method: "POST" as const })
+
+    expect((wrapper.find("input").element as HTMLInputElement).value).toBe(
+      "https://x/a?q=a%20b",
+    )
+  })
+
+  it("reads the variable hint off the draft", async () => {
+    const wrapper = shallowMount(UrlBar, {
+      props: { method: "GET" as const, url: "https://x/a?b=1", tabId: "t", urlRevision: 0 },
+    })
+    // A whitespace-only key is dropped from the rendered url (§3), so this
+    // variable exists in the draft and nowhere else. Reading the hint off the
+    // rendered url instead would tell the user there is no variable in a URL
+    // they just wrote one into.
+    await wrapper.find("input").setValue("https://x/a?  ={{v}}&b=1")
+    await wrapper.setProps({ method: "POST" as const })
+
+    expect(wrapper.find('[data-testid="url-variables"]').exists()).toBe(true)
+  })
+})
+
 describe("§12(a) an outside write is reconciled even when the string is identical", () => {
   beforeEach(() => {
     reconcile.mockClear()
