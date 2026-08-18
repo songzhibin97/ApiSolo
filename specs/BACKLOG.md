@@ -87,7 +87,8 @@
 | `src/stores/environments.ts:144` | high | 用已存在的名字新建环境静默清空它，下次保存把原环境（含密钥）整个覆盖 |
 | `lib.rs:1544` | med | collections 目录里一个无法解析的 `.json` 让整个项目树加载失败 |
 | `lib.rs:1981` | med | `save_environment` 覆盖同 slug 的另一个环境，孤立其密钥 |
-| `lib.rs:1965` | med | 删除 secret 变量后其值永久留在 vault/keychain |
+| `lib.rs:1965` | med | 删除 secret 变量后其值永久留在 vault/keychain（**范围扩大**：同一根因也覆盖「重命名 secret 变量」与「secret 改回普通变量」两种情形） |
+| `lib.rs:1204` `:1232` | high | **本地 vault 的 read-modify-write 并发丢条目**。`save_secret_value` / `delete_secret_value` 是「读整个 map → 改 → 重写整个 map」，两个并发保存各读到旧 map、各写各的，后写者静默抹掉先写者的密钥。**文件级原子替换修不了 lost update**，与 `lib.rs:1081` 是两个不同的缺陷。<br>**出处：D03 R1 评审新发现，不在原始 49 条之内**——登记于此以免验收时被读成 scope 蔓延 |
 
 顺带加固：`write_history_entries` 改 tmp + rename（`lib.rs:672`）。
 
@@ -186,6 +187,8 @@
 | A7 | 跨 spec 引用 | **禁止引用对方的章节号** | 章节号每轮都变（D01 已 27→34→39）。只能引用行为本身 |
 | A8 | D06 的 scope 从 10 项扩到 39 条行为 | **全部保留，不拆分** | 都落在本就要重写的同一批函数里，拆出去意味着同一函数改两次。可追溯性由 D06 在 TECH 里补一张「backlog 原始条目 → 不变式」对照表 |
 | A9 | D01 遗留明文清洗对**坏文件用户不可达** | **记录，不设为不变式** | `read_history_entries` 遇任一坏行整体失败，所以 D01 的清洗对这些用户静默失效。它断言的是 D01 的代码，编号进 D03 会破坏 1:1 映射。改为 D03 的一条**显式具名、标注为跨切片**的集成测试，站在 30 条不变式之外。**已核实 owner 本机文件 94/94 可解析、零坏行**，故对 owner 自身不适用 |
+| A11 | D02 的文件范围例外 | **批准**：D02 可改 `src-tauri/Cargo.toml` 与 `src-tauri/Cargo.lock`，**仅限依赖声明** | owner 原先把 D02 边界写成「只有 `lib.rs` 的 HTTP 段」，漏考虑了加 crate 必然要动这两个文件。`Cargo.lock` 是已跟踪文件，漏提交会破坏可复现的离线构建——而离线构建正是本项目 Rust 测试的前提。不得借该例外改动其他 Cargo 配置 |
+| A12 | D03 的 I6（history 健康度） | **采纳起草者的偏离**：新增 `get_history_health`，不改 `load_history` 的签名 | owner 原倾向改签名。起草者指出按钮禁用条件在 `HistoryPanel.vue:287`，D05 无论如何都要改——改签名换来一次边界违规，用户却依然点不动清空。理由成立 |
 | A10 | `HistoryEntry` 的 schema 追加 | D02 的 `responseBodyKind` 归 **D03**；D07b 的 `note`/`starred` 归 **D07** | 三者都是 `#[serde(default)]` 追加字段，磁盘格式向后兼容。**已知缺口**：D02 合并到 D03 合并之间，从历史重放二进制响应会把 marker 当普通文本显示，需记录 |
 
 ### spec 阶段新发现（尚未归入任何切片）
