@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
-import { exportPostmanCollection } from "../postman-export"
-import type { CollectionNode, SavedRequest } from "../../types"
+import { collectPostmanExportWarnings, exportPostmanCollection } from "../postman-export"
+import type { CollectionNode, FormDataItem, SavedRequest } from "../../types"
 
 function makeRequest(overrides: Partial<SavedRequest> = {}): SavedRequest {
   return {
@@ -74,6 +74,11 @@ describe("exportPostmanCollection", () => {
     expect(parsed.item[0].item[0].event).toHaveLength(2)
   })
 
+  // Rewritten: the previous version of this test asserted
+  // `body.file.src === "payload.bin"` and `formdata[0].src === "hello.txt"`
+  // for two fixtures that both carry in-memory content, so it was asserting
+  // the fabricated path this slice exists to remove. The binary fixture had
+  // `binaryContent: ""`, which is exactly the zero-byte case.
   it("preserves binary and multipart file body semantics", () => {
     const requests = [
       makeRequest({
@@ -138,9 +143,246 @@ describe("exportPostmanCollection", () => {
     const parsed = JSON.parse(exported)
 
     expect(parsed.item[0].item[0].request.body.mode).toBe("file")
-    expect(parsed.item[0].item[0].request.body.file.src).toBe("payload.bin")
+    expect(parsed.item[0].item[0].request.body.file.src).toBeUndefined()
     expect(parsed.item[0].item[1].request.body.mode).toBe("formdata")
     expect(parsed.item[0].item[1].request.body.formdata[0].type).toBe("file")
-    expect(parsed.item[0].item[1].request.body.formdata[0].src).toBe("hello.txt")
+    expect(parsed.item[0].item[1].request.body.formdata[0].src).toBeUndefined()
+  })
+
+  function exportSingle(request: SavedRequest) {
+    const tree: CollectionNode[] = [
+      {
+        name: request.name,
+        path: request.name,
+        nodeType: "request",
+        children: [],
+        method: request.method,
+      },
+    ]
+
+    return JSON.parse(exportPostmanCollection("My API", [request], tree)).item[0]
+  }
+
+  function fileField(overrides: Partial<FormDataItem> = {}): FormDataItem {
+    return {
+      id: "file-1",
+      enabled: true,
+      key: "file",
+      value: "",
+      description: "",
+      valueType: "file",
+      fileName: "报告.pdf",
+      contentType: "application/pdf",
+      ...overrides,
+    }
+  }
+
+  // Behavior 36
+  it("does not fabricate a src for an in-memory multipart file", () => {
+    const item = exportSingle(
+      makeRequest({
+        name: "Upload",
+        method: "POST",
+        body: {
+          type: "form-data",
+          content: "",
+          formData: [fileField({ fileContent: "aGVsbG8=" })],
+          binaryPath: "",
+        },
+      })
+    )
+
+    expect(item.request.body.formdata[0].src).toBeUndefined()
+    expect(item.request.body.formdata[0].type).toBe("file")
+    expect(item.request.body.formdata[0].description).toContain("报告.pdf")
+    expect(item.request.body.formdata[0].description).toContain("ApiSolo")
+  })
+
+  // Behavior 37
+  it("does not fabricate a src for an in-memory binary body", () => {
+    const item = exportSingle(
+      makeRequest({
+        name: "Upload Binary",
+        method: "POST",
+        body: {
+          type: "binary",
+          content: "",
+          formData: [],
+          binaryPath: "报告.pdf",
+          binaryContent: "aGVsbG8=",
+        },
+      })
+    )
+
+    expect(item.request.body.mode).toBe("file")
+    expect(item.request.body.file.src).toBeUndefined()
+    expect(item.request.description).toContain("报告.pdf")
+  })
+
+  // Behavior 38 — a zero-byte upload has an empty base64 string, so a
+  // truthiness check would send it back down the fabricated-path route.
+  it("treats a zero-byte upload exactly like a non-empty one", () => {
+    const multipart = exportSingle(
+      makeRequest({
+        name: "Empty Multipart",
+        method: "POST",
+        body: {
+          type: "form-data",
+          content: "",
+          formData: [fileField({ fileContent: "" })],
+          binaryPath: "",
+        },
+      })
+    )
+    expect(multipart.request.body.formdata[0].src).toBeUndefined()
+    expect(multipart.request.body.formdata[0].description).toContain("报告.pdf")
+
+    const binary = exportSingle(
+      makeRequest({
+        name: "Empty Binary",
+        method: "POST",
+        body: {
+          type: "binary",
+          content: "",
+          formData: [],
+          binaryPath: "报告.pdf",
+          binaryContent: "",
+        },
+      })
+    )
+    expect(binary.request.body.file.src).toBeUndefined()
+    expect(binary.request.description).toContain("报告.pdf")
+
+    expect(
+      collectPostmanExportWarnings([
+        makeRequest({
+          name: "Empty Multipart",
+          body: {
+            type: "form-data",
+            content: "",
+            formData: [fileField({ fileContent: "" })],
+            binaryPath: "",
+          },
+        }),
+        makeRequest({
+          name: "Empty Binary",
+          body: {
+            type: "binary",
+            content: "",
+            formData: [],
+            binaryPath: "报告.pdf",
+            binaryContent: "",
+          },
+        }),
+      ])
+    ).toHaveLength(2)
+  })
+
+  // Behavior 39 — a name we received from an import is not a path we invented.
+  it("keeps the src of a file field that never had in-memory content", () => {
+    const multipart = exportSingle(
+      makeRequest({
+        name: "Imported Multipart",
+        method: "POST",
+        body: {
+          type: "form-data",
+          content: "",
+          formData: [fileField({ fileName: "hello.txt", fileContent: undefined })],
+          binaryPath: "",
+        },
+      })
+    )
+    expect(multipart.request.body.formdata[0].src).toBe("hello.txt")
+    expect(multipart.request.body.formdata[0].description).toBeUndefined()
+
+    const binary = exportSingle(
+      makeRequest({
+        name: "Imported Binary",
+        method: "POST",
+        body: {
+          type: "binary",
+          content: "",
+          formData: [],
+          binaryPath: "payload.bin",
+          binaryContent: undefined,
+        },
+      })
+    )
+    expect(binary.request.body.file.src).toBe("payload.bin")
+  })
+
+  // Behavior 40
+  it("does not duplicate a query string left in the saved url", () => {
+    const item = exportSingle(
+      makeRequest({
+        name: "Dup",
+        url: "https://api.example.com/s?q=cat",
+        params: [{ id: "1", enabled: true, key: "q", value: "cat", description: "" }],
+      })
+    )
+
+    expect(item.request.url.raw).toBe("https://api.example.com/s?q=cat")
+  })
+
+  // Behavior 41
+  it("keeps the fragment after the query string in url.raw", () => {
+    const item = exportSingle(
+      makeRequest({
+        name: "Hash",
+        url: "https://api.example.com/a#frag",
+        params: [{ id: "1", enabled: true, key: "k", value: "v", description: "" }],
+      })
+    )
+
+    expect(item.request.url.raw).toBe("https://api.example.com/a?k=v#frag")
+  })
+
+  // Behavior 42
+  it("collectPostmanExportWarnings lists every unexportable upload", () => {
+    const warnings = collectPostmanExportWarnings([
+      makeRequest({
+        name: "Upload",
+        body: {
+          type: "form-data",
+          content: "",
+          formData: [fileField({ fileContent: "aGVsbG8=" })],
+          binaryPath: "",
+        },
+      }),
+      makeRequest({
+        name: "Upload Binary",
+        body: {
+          type: "binary",
+          content: "",
+          formData: [],
+          binaryPath: "报告.pdf",
+          binaryContent: "aGVsbG8=",
+        },
+      }),
+      makeRequest({
+        name: "Imported Placeholder",
+        body: {
+          type: "form-data",
+          content: "",
+          formData: [fileField({ fileName: "hello.txt", fileContent: undefined })],
+          binaryPath: "",
+        },
+      }),
+    ])
+
+    expect(warnings).toEqual([
+      {
+        code: "file-content-not-exportable",
+        requestName: "Upload",
+        fileName: "报告.pdf",
+      },
+      {
+        code: "file-content-not-exportable",
+        requestName: "Upload Binary",
+        fileName: "报告.pdf",
+      },
+    ])
+
+    expect(collectPostmanExportWarnings([makeRequest({ name: "Plain" })])).toEqual([])
   })
 })
