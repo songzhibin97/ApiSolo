@@ -60,4 +60,21 @@ describe("the request panel hands the url bar what it needs", () => {
     expect(urlBar.props("urlRevision")).toBe(expected)
     expect(urlBar.props("tabId")).toBe(tabs.activeTab.id)
   })
+
+  it("writes a keystroke back through the one path that does not bump the revision", async () => {
+    // Supports §8/§10. The store has both paths and the reconciler reads the
+    // signal correctly; neither fact says which path this panel reaches for.
+    // Picking the bumping one makes every keystroke replace the text being
+    // typed — the defect this slice exists to remove, reintroduced one call
+    // site away from code that is entirely correct.
+    const tabs = useTabsStore()
+    const fromUrlBar = vi.spyOn(tabs, "updateTabFromUrlBar")
+    const bumping = vi.spyOn(tabs, "updateTab")
+    const wrapper = mountPanel()
+
+    await wrapper.findComponent(UrlBar).vm.$emit("update:url", "https://x/a?q=a%20b")
+
+    expect(fromUrlBar).toHaveBeenCalledTimes(1)
+    expect(bumping).not.toHaveBeenCalled()
+  })
 })
