@@ -11,10 +11,16 @@ vi.mock("vue-i18n", async (importOriginal) => ({
 }))
 
 import RequestPanel from "../panels/RequestPanel.vue"
+import KeyValueEditor from "../request/KeyValueEditor.vue"
 import UrlBar from "../request/UrlBar.vue"
 import { useTabsStore } from "../../stores/tabs"
+import type { KeyValuePair } from "../../types"
 
 let pinia: ReturnType<typeof createPinia>
+
+function pair(key: string, value: string): KeyValuePair {
+  return { id: `${key}-1`, enabled: true, key, value, description: "" }
+}
 
 function mountPanel() {
   // The same instance the test writes into — a second createPinia() here would
@@ -76,5 +82,64 @@ describe("the request panel hands the url bar what it needs", () => {
 
     expect(fromUrlBar).toHaveBeenCalledTimes(1)
     expect(bumping).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * §10 names two of the writes that come from outside the field — the params
+ * table and a cURL import — and both reach it through this panel. The
+ * reconciler and the store were already covered; what was not covered is
+ * whether these two call sites hand anything over at all. Both could be cut
+ * with the whole suite staying green, so these assert the resulting state
+ * rather than spying on a call: a spy proves a function ran, not that the
+ * request changed.
+ */
+describe("§10 the panel forwards the writes that come from outside the field", () => {
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+  })
+
+  it("carries a params-table edit into the request, the rendered url and the revision", async () => {
+    const tabs = useTabsStore()
+    tabs.updateTab(tabs.activeTab.id, {
+      url: "https://api.test/items",
+      params: [pair("seed-param", "1")],
+      headers: [pair("Seed-Header", "2")],
+    })
+    const before = tabs.activeTab.urlRevision
+    const wrapper = mountPanel()
+
+    const paramsEditor = wrapper.findAllComponents(KeyValueEditor)[0]
+    // Self-check the pick: the params and headers editors are the same
+    // component and differ only by template order, so a wrong index would
+    // quietly assert against the headers editor instead.
+    expect((paramsEditor.props("modelValue") as KeyValuePair[]).map((row) => row.key)).toEqual([
+      "seed-param",
+    ])
+
+    await paramsEditor.vm.$emit("update:modelValue", [pair("q", "a b")])
+
+    expect(tabs.activeTab.params.map((row) => [row.key, row.value])).toEqual([["q", "a b"]])
+    expect(wrapper.findComponent(UrlBar).props("url")).toBe("https://api.test/items?q=a+b")
+    expect(tabs.activeTab.urlRevision).toBe(before + 1)
+  })
+
+  it("carries a pasted curl into the request and marks the write as external", async () => {
+    const tabs = useTabsStore()
+    tabs.updateTab(tabs.activeTab.id, { url: "https://old.test/a", params: [] })
+    const before = tabs.activeTab.urlRevision
+    const wrapper = mountPanel()
+
+    await wrapper
+      .findComponent(UrlBar)
+      .vm.$emit("pasteCurl", "curl 'https://api.test/items?q=a+b'")
+
+    expect(tabs.activeTab.params.map((row) => [row.key, row.value])).toEqual([["q", "a b"]])
+    // The revision is the half that decides whether the field adopts the new
+    // string. Writing this through the URL bar's own exempt path would leave
+    // the user's old draft sitting on top of an imported request.
+    expect(tabs.activeTab.urlRevision).toBe(before + 1)
+    expect(wrapper.findComponent(UrlBar).props("url")).toBe("https://api.test/items?q=a+b")
   })
 })
