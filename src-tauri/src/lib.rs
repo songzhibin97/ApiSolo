@@ -6000,6 +6000,9 @@ mod tests {
         Clear,
         Delete,
         Update,
+        /// Harness-only: reaches the I/O checkpoint without taking the lock, so
+        /// the probe can observe a free-but-poisoned lock.
+        UnlockedRead,
     }
 
     struct LockProbe {
@@ -6082,6 +6085,10 @@ mod tests {
             HistoryCommand::Delete => {
                 delete_history_entry("A".to_string()).unwrap();
                 record("delete completed");
+            }
+            HistoryCommand::UnlockedRead => {
+                let entries = read_history_entries().unwrap();
+                record(&format!("unlocked read returned {} entries", entries.len()));
             }
             HistoryCommand::Update => {
                 let mut updated = sample_history_entry("A", "2026-03-27T10:00:00Z");
@@ -6296,6 +6303,53 @@ mod tests {
 
         // The lock must not stay poisoned for the next case.
         assert!(history_lock().try_lock().is_ok());
+    }
+
+    /// Poisons the history lock by letting a thread panic while holding it.
+    fn poison_history_lock() {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let _ = std::thread::spawn(|| {
+            let _guard = history_lock().lock().unwrap();
+            panic!("poisoning the history lock on purpose");
+        })
+        .join();
+        std::panic::set_hook(previous_hook);
+    }
+
+    #[test]
+    fn test_poisoned_lock_is_reported_and_cleared_not_read_as_held() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        seed_history(&["A"]);
+
+        poison_history_lock();
+        assert!(
+            history_lock().try_lock().is_err(),
+            "precondition: the lock must be poisoned before the probe"
+        );
+
+        // The command does not take the lock, so at the checkpoint the lock is
+        // free *and* poisoned — the one situation that reaches the poisoned
+        // branch. Reporting it as LockHeld would silently turn a broken
+        // environment into a passing lock assertion.
+        let probe = run_lock_probe(HistoryCommand::UnlockedRead, std::time::Duration::ZERO);
+
+        assert_eq!(probe.verdict, LockVerdict::HarnessError);
+        assert_eq!(probe.note, Some("history lock poisoned"));
+        assert!(probe.child_ok, "the probe must not panic on the poisoned path");
+        assert_eq!(probe.outcome.as_deref(), Some("unlocked read returned 1 entries"));
+
+        // Cleanup::drop calls clear_poison, so one panicking child cannot
+        // contaminate every later case.
+        assert!(
+            history_lock().try_lock().is_ok(),
+            "cleanup must clear the poison for the next case"
+        );
+
+        let next = run_lock_probe(HistoryCommand::Append, std::time::Duration::ZERO);
+        assert_lock_probe(&next, "append completed", &["A", "N"]);
     }
 
     #[test]

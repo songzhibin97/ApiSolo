@@ -40,7 +40,7 @@ import {
   hasPendingRedactedFields,
   sanitizeHistoryEntry,
 } from "../../utils/redaction"
-import type { HistoryEntry, HttpResponse, KeyValuePair, SavedRequest } from "../../types"
+import type { HistoryEntry, HttpResponse, KeyValuePair, SavedRequest, Tab } from "../../types"
 
 function pair(key: string, value: string, overrides: Partial<KeyValuePair> = {}): KeyValuePair {
   return { id: `${key}-1`, enabled: true, key, value, description: "", ...overrides }
@@ -1135,5 +1135,148 @@ describe("the console network line", () => {
 
     expect(networkMessages).toContain("[network] GET {{base}}/users started")
     expect(networkMessages.join("\n")).not.toContain("https://api.example.com/users")
+  })
+})
+
+// Every field of a history entry is redacted by one line inside
+// `sanitizeHistoryEntry`. Testing that helper directly proves the *logic* but
+// not the *wiring*: an independent review reverted five of those lines and the
+// whole suite stayed green. Each test below drives the real send path and puts
+// the credential in exactly one place, so reverting that one line — and only
+// that line — turns it red. See specs/PROCESS.md P8.
+describe("each sanitizeHistoryEntry call site is reachable from the send path", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    invokeMock.mockReset()
+    executeScriptMock.mockClear()
+  })
+
+  async function sendAndCaptureHistory(
+    patch: Partial<Tab>,
+    response: Partial<HttpResponse> = {},
+  ): Promise<HistoryEntry> {
+    invokeMock.mockImplementation(okInvoke({ send_request: buildResponse(response) }))
+
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+    tabsStore.updateTab(tabsStore.activeTab.id, patch)
+    await requestStore.sendRequest(tabsStore.activeTab)
+
+    expect(tabsStore.activeTab.responseError).toBeNull()
+    const call = invokeMock.mock.calls.find(([command]) => command === "append_history")
+    expect(call, "append_history was never called").toBeDefined()
+    return (call![1] as { entry: HistoryEntry }).entry
+  }
+
+  it("redacts the url query on the way to append_history", async () => {
+    const entry = await sendAndCaptureHistory({
+      method: "GET",
+      url: "https://api.example.com/s?access_token=abcdef123456&page=2",
+    })
+
+    expect(entry.url).toBe(`https://api.example.com/s?access_token=${REDACTION_SENTINEL}&page=2`)
+  })
+
+  it("redacts request params on the way to append_history", async () => {
+    const entry = await sendAndCaptureHistory({
+      method: "GET",
+      url: "https://api.example.com/s",
+      params: [pair("access_token", "abcdef123456"), pair("page", "2")],
+    })
+
+    expect(entry.requestParams?.map((item) => item.value)).toEqual([REDACTION_SENTINEL, "2"])
+  })
+
+  it("redacts request headers on the way to append_history", async () => {
+    const entry = await sendAndCaptureHistory({
+      method: "GET",
+      url: "https://api.example.com/s",
+      headers: [pair("Cookie", "sid=abcdef123456; theme=dark"), pair("Accept", "*/*")],
+    })
+
+    expect(entry.requestHeaders?.map((item) => item.value)).toEqual([REDACTION_SENTINEL, "*/*"])
+  })
+
+  it("redacts the request body on the way to append_history", async () => {
+    const entry = await sendAndCaptureHistory({
+      method: "POST",
+      url: "https://api.example.com/token",
+      body: {
+        type: "json",
+        content: '{"user":"bob","password":"hunter2","id":9007199254740993123456789}',
+        formData: [],
+        binaryPath: "",
+        binaryContent: "",
+      },
+    })
+
+    expect(entry.requestBodyContent).toBe(
+      `{"user":"bob","password":"${REDACTION_SENTINEL}","id":9007199254740993123456789}`,
+    )
+  })
+
+  it("redacts form-data values on the way to append_history", async () => {
+    const entry = await sendAndCaptureHistory({
+      method: "POST",
+      url: "https://api.example.com/token",
+      body: {
+        type: "form-data",
+        content: "",
+        formData: [pair("password", "hunter2"), pair("grant_type", "password")],
+        binaryPath: "",
+        binaryContent: "",
+      },
+    })
+
+    expect(entry.requestBodyFormData?.map((item) => item.value)).toEqual([
+      REDACTION_SENTINEL,
+      "password",
+    ])
+  })
+
+  it("redacts the response body on the way to append_history", async () => {
+    const entry = await sendAndCaptureHistory(
+      { method: "GET", url: "https://api.example.com/me" },
+      { body: '{"id":7,"refreshToken":"rt-abcdef123456"}' },
+    )
+
+    expect(entry.responseBody).toBe(`{"id":7,"refreshToken":"${REDACTION_SENTINEL}"}`)
+  })
+
+  it("redacts response headers on the way to append_history", async () => {
+    const entry = await sendAndCaptureHistory(
+      { method: "GET", url: "https://api.example.com/me" },
+      {
+        headers: [
+          ["set-cookie", "sid=abcdef123456; theme=dark"],
+          ["content-type", "application/json"],
+        ],
+      },
+    )
+
+    expect(entry.responseHeaders).toEqual([
+      ["set-cookie", REDACTION_SENTINEL],
+      ["content-type", "application/json"],
+    ])
+  })
+
+  it("keeps a non-sensitive value byte-identical through the whole send path", async () => {
+    const entry = await sendAndCaptureHistory({
+      method: "POST",
+      url: "https://api.example.com/notes",
+      headers: [pair("X-Note", "password: hunter2")],
+      params: [pair("hint", `Bearer ${JWT}`)],
+      body: {
+        type: "raw",
+        content: `Digest ${DIGEST}`,
+        formData: [],
+        binaryPath: "",
+        binaryContent: "",
+      },
+    })
+
+    expect(entry.requestHeaders?.[0].value).toBe("password: hunter2")
+    expect(entry.requestParams?.[0].value).toBe(`Bearer ${JWT}`)
+    expect(entry.requestBodyContent).toBe(`Digest ${DIGEST}`)
   })
 })

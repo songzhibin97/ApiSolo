@@ -9,7 +9,7 @@ import { executeScript } from "../utils/script-executor"
 import { invoke } from "../utils/invoke"
 import {
   findSentinelFields,
-  redactValue,
+  redactFormDataValues,
   sanitizeHistoryEntry,
 } from "../utils/redaction"
 import { stripQueryFromUrl } from "../utils/url-params"
@@ -460,7 +460,7 @@ function buildScriptRequest(tab: Tab) {
       .map(({ key, value }) => ({ key, value })),
     body:
       tab.body.type === "form-data"
-        ? JSON.stringify(sanitizeHistoryFormData(tab.body.formData))
+        ? JSON.stringify(redactFormDataValues(sanitizeHistoryFormData(tab.body.formData)))
         : tab.body.type === "binary"
           ? `[binary ${sanitizeFileLabel(tab.body.binaryPath) || "file"}]`
           : buildBody(tab).content,
@@ -499,10 +499,15 @@ function buildHistoryEntry(tab: Tab, response: HttpResponse): HistoryEntry {
   return sanitizeHistoryEntry(raw)
 }
 
+/**
+ * Strips upload bytes and raw paths only. Value redaction is owned by
+ * `sanitizeHistoryEntry` alone — redacting here as well made that call site
+ * unreachable, so reverting it could not fail any test.
+ */
 function sanitizeHistoryFormData(formData: FormDataItem[]) {
   return formData.map((item) => ({
     ...item,
-    value: item.valueType === "file" ? "" : redactValue(item.key, item.value),
+    value: item.valueType === "file" ? "" : item.value,
     fileName:
       item.valueType === "file"
         ? sanitizeFileLabel(item.fileName || item.filePath || item.key)

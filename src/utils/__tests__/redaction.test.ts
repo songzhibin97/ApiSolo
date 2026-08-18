@@ -362,6 +362,34 @@ describe("§21 documented over-redaction", () => {
   })
 })
 
+describe("§21 malformed json values degrade to the text path", () => {
+  // `skipLiteral` used to read to the next delimiter, which accepted garbage
+  // primitives as valid values and kept the body on the structured json path.
+  it.each([
+    [
+      "a truncated keyword",
+      '{"note":truX,"password":"hunter2"}',
+      `{"note":truX,"password":${REDACTION_SENTINEL}`,
+    ],
+    ["an incomplete number", '{"a":1e,"password":"p"}', `{"a":1e,"password":${REDACTION_SENTINEL}`],
+    ["a doubled sign", '{"a":--1,"password":"p"}', `{"a":--1,"password":${REDACTION_SENTINEL}`],
+    ["a hex literal", '{"a":0x1F,"password":"p"}', `{"a":0x1F,"password":${REDACTION_SENTINEL}`],
+    [
+      "an overlong keyword",
+      '{"a":nulll,"password":"p"}',
+      `{"a":nulll,"password":${REDACTION_SENTINEL}`,
+    ],
+  ])("degrades %s to the text path", (_name, input, expected) => {
+    expect(redactBodyText("json", input)).toBe(expected)
+  })
+
+  it("still accepts every legal json primitive", () => {
+    expect(redactBodyText("json", '{"a":[true,false,null,-0,1.5e-3,1E+10,9007199254740993123456789],"password":"p"}')).toBe(
+      `{"a":[true,false,null,-0,1.5e-3,1E+10,9007199254740993123456789],"password":"${REDACTION_SENTINEL}"}`,
+    )
+  })
+})
+
 describe("§22–§24 the field-name hard list", () => {
   it("matches camelCase sensitive keys", () => {
     for (const key of [

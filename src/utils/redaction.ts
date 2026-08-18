@@ -153,15 +153,71 @@ function scanJsonSpans(text: string): JsonSpan[] {
     fail()
   }
 
-  function skipLiteral() {
-    const start = i
-    while (i < text.length && ",]} \t\n\r".indexOf(text[i]) === -1) {
+  function isDigit(ch: string | undefined) {
+    return ch !== undefined && ch >= "0" && ch <= "9"
+  }
+
+  /**
+   * Strict JSON number grammar. Reading to the next delimiter instead would
+   * accept garbage like `truX` or `0x1F` as a value, and the body would then be
+   * treated as structured JSON rather than degrading to the text path.
+   */
+  function skipNumber() {
+    if (text[i] === "-") {
       i += 1
     }
 
-    if (i === start) {
+    if (text[i] === "0") {
+      i += 1
+    } else if (isDigit(text[i])) {
+      while (isDigit(text[i])) {
+        i += 1
+      }
+    } else {
       fail()
     }
+
+    if (text[i] === ".") {
+      i += 1
+      if (!isDigit(text[i])) {
+        fail()
+      }
+      while (isDigit(text[i])) {
+        i += 1
+      }
+    }
+
+    if (text[i] === "e" || text[i] === "E") {
+      i += 1
+      if (text[i] === "+" || text[i] === "-") {
+        i += 1
+      }
+      if (!isDigit(text[i])) {
+        fail()
+      }
+      while (isDigit(text[i])) {
+        i += 1
+      }
+    }
+  }
+
+  function skipLiteral() {
+    if (text.startsWith("true", i)) {
+      i += 4
+      return
+    }
+
+    if (text.startsWith("false", i)) {
+      i += 5
+      return
+    }
+
+    if (text.startsWith("null", i)) {
+      i += 4
+      return
+    }
+
+    skipNumber()
   }
 
   function skipValue(sensitiveKey: boolean) {
@@ -412,7 +468,7 @@ function stripHistoryMarkers(entry: HistoryEntry): HistoryEntry {
   }
 }
 
-function redactFormDataValues(items: FormDataItem[]): FormDataItem[] {
+export function redactFormDataValues(items: FormDataItem[]): FormDataItem[] {
   return items.map((item) => ({
     ...item,
     value: item.valueType === "file" ? item.value : redactValue(item.key, item.value),
