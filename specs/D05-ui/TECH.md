@@ -21,6 +21,13 @@
 > | **I1** 正文交叉引用停在旧编号 | 全文扫描（脚本，排除映射表与变更日志行）共 11 处：owner 点名 6 处 + 自查再发现 5 处（0.9 的 §9、types 注释两处、4.7 两行）；`§7` 的历史表述改为**不带编号的行为描述**；`RequestPanel` 改动行补上 `url-revision`（漏它即重造 R2-C1）|
 > | **I2** 声称的人工检查点不存在 | 4.5 补 **h / i / j** 三项，分别对应 §4 / §6 / §12(b) 的降级落点；5.1 的那句声称改为指向它们 |
 >
+> **rev6 — 应 R4 修订（1C + 1I）**：
+>
+> | R4 项 | 本文改动区域 |
+> |---|---|
+> | **C** VERIFIED 的两条也是模型层，不是生产代码 | 判据补第三条（被变异的必须是落盘生产代码）；三态改 **0 / 57 / 1**；已取得的成果改称「变异设计已在临时模型上验证」并单列一表；写明转正条件；0.13 加定性更正；映射表 §11 / §12 状态列改写；5.1 一处措辞跟改 |
+> | **I** 检查点 h 的观测手段行不通且有泄密风险 | h 改为受控本地 echo endpoint 双断言；**删除 `[network]` 那条路径**并写明两个理由（构造时机在追加之前；打印最终 URL = 密钥进日志）|
+>
 > 全部 `file:line` 基于 `dfb2d2e` 实际读过的代码。
 
 ## 0. 起草期的实跑记录
@@ -168,9 +175,11 @@ rev3 声称「把守卫移到 `activeRequestIds.set` 之后」是 §15 的 kille
 
 它是一个**真实的实现者会犯的错**（「早退时顺手记一下最新的尝试」），并且实测 `send_request` 仍然恰好一次（§14 绿）、第一次的响应与历史双双消失（§15 红）。**单塌成立，且是实跑出来的，不是推断出来的。**
 
-### 0.13 R3 要求的独立性复核（本轮实跑，**推翻 rev4 自己的 VERIFIED 桶**）
+### 0.13 独立性复核（**全部在临时模型上，不是生产代码**）
 
-rev4 把 6 条标成 VERIFIED，判据写的是「该用例转红、且相邻用例不红」。**我没有拿这条判据去查自己。** R3 逐条核完，只剩 2 条站得住。逐项复核结果：
+> **rev6 的定性更正（R4-C）**：本节的实跑对象是 `/tmp` 里的**重新实现**与临时测试文件，**不是生产代码**——`reconcileUrlBarValue` / `splitTemplateSpans` / `encodeFormComponentPreservingTemplates` 在 `src/utils/url-params.ts` 里**都不存在**（该文件存在，但只有另一切片搬进去的四个函数）；`UrlBar.vue` 至今只有 `method / url / isLoading` 三个 prop、没有 `urlRevision`、也没有 watcher。因此下面的颜色证明的是**变异设计站得住**，**不是**「生产代码在生产补丁下单塌」。这两件事在 rev5 被我混成了一件，详见 4.6。
+
+rev4 把 6 条标成 VERIFIED，判据写的是「该用例转红、且相邻用例不红」。**我没有拿这条判据去查自己。** R3 逐条核完只剩 2 条，R4 进一步指出那 2 条也是模型层。逐项复核结果：
 
 **(1) §11 —— 成立，本轮补测了第二个邻居。** mutant「revision 判据换回 `sameParse`」：
 
@@ -515,8 +524,8 @@ owner 采纳该边界时的措辞是「rev1 那半论证成立，现在它是这
 | 8 | url-params | 纯函数 | DESIGNED | 末态显示串 === 目标串（10 个目标） | `return previous.draft` → `return incoming.url` |
 | 9 | url-params | 纯函数 | 冗余 | — | **与 §8 共用 killer，不独立可杀**，登记为 §8 在单次输入下的实例 |
 | 10 | url-params | 纯函数 | DESIGNED | Params 表改值后显示新值 | 删掉 `previous.revision !== incoming.revision` 整行 |
-| 11 | url-params | 纯函数 | **VERIFIED**（0.9 + 0.13） | 草稿 `%20` 被导入后的 `+` 取代 | 判据换回 `sameParse(...) ? previous.draft : incoming.url`。**§10 在此 mutant 下仍绿**——实跑确认 |
-| 12 | url-params-reactivity（**无 DOM**） + RequestPanel.spec | reactivity / 组件 | **VERIFIED 仅 (a)**（0.13）；**(b) DESIGNED，从未运行** | (a) revision-only 变化时协调器执行次数 === 1；(b) RequestPanel 传给 UrlBar 的 `url-revision` prop 存在 | (a) watch 源 `[props.url, props.tabId, props.urlRevision]` → `[props.url, props.tabId]` —— 实跑：mutant 下 (a) 用例 RED、§13 邻居用例 GREEN；(b) 模板里 `:url-revision="activeTab.urlRevision"` 整行删除（**未跑**） |
+| 11 | url-params | 纯函数 | DESIGNED（变异设计已在**临时模型**上验证，0.13） | 草稿 `%20` 被导入后的 `+` 取代 | 判据换回 `sameParse(...) ? previous.draft : incoming.url`。**§10 在此 mutant 下仍绿**——实跑确认 |
+| 12 | url-params-reactivity（**无 DOM**） + RequestPanel.spec | reactivity / 组件 | DESIGNED（(a) 的变异设计已在**临时模型**上验证，0.13；(b) 从未运行） | (a) revision-only 变化时协调器执行次数 === 1；(b) RequestPanel 传给 UrlBar 的 `url-revision` prop 存在 | (a) watch 源 `[props.url, props.tabId, props.urlRevision]` → `[props.url, props.tabId]` —— 实跑：mutant 下 (a) 用例 RED、§13 邻居用例 GREEN；(b) 模板里 `:url-revision="activeTab.urlRevision"` 整行删除（**未跑**） |
 | 13 | url-params | 纯函数 | DESIGNED | 切 tab 后显示新 tab 的 url | 删掉 `previous.tabId !== incoming.tabId` 整行 |
 | 14 | request | store | DESIGNED（0.13：无单塌 mutant） | `send_request` 次数 === 1（**该用例只断言这一项**） | 守卫整行删除 → 实测 2 次 |
 | 15 | request | store | DESIGNED（0.13：两条断言同塌） | 在途请求的响应落到 tab 上 + `append_history` 恰好一次（**该用例不断言调用次数**） | `{ return }` → `{ activeRequestIds.set(tab.id, crypto.randomUUID()); return }` → 实测调用次数仍为 1（§14 绿）、响应与历史双双消失 |
@@ -609,51 +618,54 @@ P12 的原话是：判据必须**正向匹配「确实执行了」的证据**。
 
 **以下三项是 5.1 声明的降级落点**——`@vue/test-utils` / `happy-dom` 自检（4.3）未通过时，§4 / §6 / §12(b) 失去自动化覆盖，改由这三条承担。**rev4 声称它们已存在，实际 4.5 里一条都没有；rev5 补齐。** 三项都在 PR-A 的验收范围内：
 
-- **h（§4 的降级落点）**：认证页选 API Key、`添加到` 选 Query，填 `key=X` / `value=SECRET123`。**地址栏里不得出现 `SECRET123`，也不得出现 `X=`**。随后点 Send，在调试控制台的 `[network]` 行或响应面板确认该参数**确实上线了**——两件事必须同时成立，只看地址栏没有它不足以区分「刻意不显示」与「根本没发」。
+- **h（§4 的降级落点）**：先在本机起一个受控的 echo 服务（把收到的 query 原样打印即可），例如
+  `python3 -c "import http.server;\nclass H(http.server.BaseHTTPRequestHandler):\n    def do_GET(self):\n        print('QUERY', self.path, flush=True); self.send_response(200); self.end_headers()\nhttp.server.HTTPServer(('127.0.0.1',8099),H).serve_forever()"`。
+  在认证页选 API Key、`添加到` 选 Query，填 `key=X` / `value=SECRET123`，URL 指向 `http://127.0.0.1:8099/probe`。断言两件事：**(1) 地址栏里既没有 `SECRET123` 也没有 `X=`**；**(2) echo 服务打印出的 query 里恰好有 `X=SECRET123`**。两件事必须同时成立——只看地址栏没有它，无法区分「刻意不显示」与「根本没发」。
+  > **不得用调试控制台的 `[network]` 行来做第 (2) 步。** 两个原因，都是硬的：该行在**发送之前**由 `requestSnapshot.url` 构造（`src/stores/request.ts:110`、`:112`），而 query API key 是**进了 Rust 之后**才追加到最终 URL 的（`lib.rs:2381`），所以控制台里根本看不到它；更要紧的是，**为了让它看得见而去打印最终 URL，等于把真实密钥写进日志**，直接违反本仓库「密钥绝不进日志」。rev5 写的就是这条路径——**为了修一个「UI 说谎」的检查点，差点造出一个密钥泄露**。
 - **i（§6 的降级落点）**：同一页面，`添加到` 在 Header 与 Query 之间来回切换。选 Query 时必须就地出现那句说明（`auth.queryKeyHidden`），选 Header 时必须消失；中文界面下该说明为中文。
 - **j（§12(b) 的降级落点）**：URL 栏手打 `https://x/a?q=a%20b` 但**不要**离开输入框（此时 store 里已规范成 `q=a+b`，框内仍是你打的 `%20`）。接着从「更多操作 → 导入 cURL」导入 `curl 'https://x/a?q=a+b'`。**地址栏必须立刻变成 `q=a+b`**。若仍显示 `%20`，说明 `url-revision` 没接上——这正是 R2-C1 的原始形态。
 
-### 4.6 覆盖台账（三态；rev5 重新核定）
+### 4.6 覆盖台账（三态；rev6 终定）
 
-这一格连错四轮，每轮错在不同层次，全部留痕：
+这一格连错五轮，每轮错在不同层次，全部留痕：
 
-| 轮次 | 错法 |
-|---|---|
-| rev1 | 手数数错，并声称「没有 killer 落在 `.vue` 里」，与自己表里的字面量 gate 矛盾 |
-| rev2 | 仍手数，把 30 写成 31、漏一条 |
-| rev3 | 改用脚本解析表格——**数字对了，判据错了**：把「填了 patch 栏」当成「单塌已成立」 |
-| rev4 | 改成三态——**判据写对了，没拿它查自己**：VERIFIED 桶里 6 条只有 2 条经得起该判据。§14 的反证数据**就在我自己交的那张四实现矩阵里**，我记录了推翻自己分类的证据然后没有回头看 |
+| 轮次 | 数字 | 错法 |
+|---|---|---|
+| rev1–rev3 | 51 | 把「表里填了 patch 栏」当成「单塌已成立」——关于文档的陈述冒充关于覆盖的陈述 |
+| rev4 | 6 | 判据写对了，**没拿它查自己**：VERIFIED 桶里 6 条只有 2 条经得起该判据 |
+| rev5 | 2 | 判据也拿来查自己了，但**漏了判据的隐含前提**：被变异的必须是**生产代码** |
+| **rev6** | **0** | ↓ |
 
-**rev4 的错法值得单独说**：我上一轮撤回「51 条独立 killer」，理由是「表里填了 patch」是关于文档的陈述而非关于覆盖的陈述。换成三态之后，VERIFIED 桶犯了**结构完全相同**的错——「我跑了一个变异」被当成了「单塌已成立」，而没有检查邻居。**P9 的原话是「多项同时失败的 fixture 不能作为任何单条断言的承重证据」，我把它用在了别人身上。**
+**0 从第一轮起就是唯一可能的答案。** 这是一个 greenfield 切片——`reconcileUrlBarValue`、`splitTemplateSpans`、`encodeFormComponentPreservingTemplates`、`UrlBar` 的 `urlRevision` prop 与 watcher、`env-rows.ts`、`curl-import.ts` 全都还不存在（`src/utils/url-params.ts` 这个文件存在，但里面只有另一切片搬进去的四个函数）。**在不存在的代码上没法验证变异。** 此前每一个非零数字，都是「**模型顶替了生产代码**」这一件事的不同伪装：rev1–rev3 用文档顶替，rev4–rev5 用 `/tmp` 里的重新实现和临时测试文件顶替。
 
-**判据（rev5 起写死，避免再含糊）**：
+**判据（写死，含 rev5 漏掉的第三条）**：
 
-> **VERIFIED** = 已实跑「应用该 patch ⇒ 该不变式的用例转红」，**并且**已实跑确认**与它共用同一处生产代码**的其他不变式用例**保持绿**。
-> 两个条件缺一不可。只跑了前半 ⇒ DESIGNED。
+> **VERIFIED** = ① 已实跑「应用该 patch ⇒ 该不变式的用例转红」；② 已实跑确认与它共用同一处生产代码的其他不变式用例**保持绿**；**③ 被变异的是落盘的生产代码，被观测的是落盘的测试**。
+> 三者缺一不可。①② 成立而 ③ 不成立 ⇒ 仍是 **DESIGNED**，只能称「变异设计已在模型上验证」。
 
 | 状态 | 条数 | 编号 |
 |---|---|---|
-| **VERIFIED** | **2** | §11、§12(a) |
-| **DESIGNED**（有最小可编译 patch，单塌未成立或未运行） | **55** | 其余全部（含 §12(b)、§14、§15、§54、§55） |
+| **VERIFIED**（生产代码上单塌成立） | **0** | —— |
+| **DESIGNED**（有最小可编译 patch，未在生产代码上验证） | **57** | §1–§8、§10–§58 |
 | **冗余**（明确不独立可杀） | **1** | §9 |
 
-证据出处：§11 见 0.9 与 0.13(1)（两个共用同一函数的邻居都实测保持绿）；§12(a) 见 0.13(2)（本轮由测量升级为对照，邻居用例实测保持绿）。
+**已取得但不得计入 VERIFIED 的成果**（这些是真的，只是不能顶替生产验证）：
 
-**本轮降级的四条及其原因**（0.13 有实跑数据）：
+| 条目 | 已在临时模型上验证的内容 | 出处 |
+|---|---|---|
+| §11 | mutant「revision 判据换回 `sameParse`」下，§11 用例 RED，共用同一函数的 §8 / §9 / §10 / §13 邻居**全绿**（§8/§9 两个邻居由评审者补跑） | 0.9、0.13(1) |
+| §12(a) | mutant「watch 源去掉 revision」下，(a) 用例 RED，§10 / §11 / §13 类邻居**全绿**（后两者由评审者补跑） | 0.13(2) |
+| §14 / §15 | 在**真实 `src/stores/request.ts`** 上跑过四种实现的矩阵——这是本切片唯一一处真正碰到生产代码的实验；但结论是**两条都没有单塌**，所以它证伪了分类，没有产生 VERIFIED | 0.12、0.13(3) |
+| §54 / §55 | 在**真实 `src/stores/console.ts`** 上跑过；结论同样是不可分离 | 0.5、0.13(4) |
 
-| 条目 | 降级原因 |
-|---|---|
-| §14 | 唯一能让它红的 mutant 同时让 §15 红；两条属性经同一张 `activeRequestIds` 表耦合，守卫这一行的变异空间里无法分离 |
-| §15 | 有专属 mutant，但该 mutant 下用例内**两条断言同时失败**，没有一条被证明单独承重 |
-| §54 / §55 | 生产改动只有一行，两个用例在同一 mutant 下一起红，无 patch 能让一红一绿 |
-| §12(b) | 从未运行 |
+**转正条件（实现阶段逐条执行）**：等实现落盘之后，对**真实的** `src/utils/url-params.ts`、`src/components/request/UrlBar.vue`、`src/utils/curl-import.ts`、`src/utils/env-rows.ts` 等文件应用本表第六列的 patch，对**落盘的**测试文件观测颜色，按上面三条判据转正。**转正前，本切片的任何汇报都不得出现非零的 VERIFIED 计数。**
 
 **结论及其适用范围（与度量分开写）**：
 
-- **「58 条中 57 条有 killer」是关于文档的陈述。** 经实验证明单塌的只有 **2** 条。规格阶段的诚实上限就是这个数——rev4 说「六是规格阶段诚实的上限」，那句话本身没有过这把尺子。
+- **「58 条中 57 条有 killer」是关于文档的陈述。** 生产代码上经实验证明单塌的：**0 条**。这不是缺陷，是 greenfield 切片在规格阶段的**必然值**。
 - 实现阶段交付要求：每一条 DESIGNED 转 VERIFIED，按 4.3 协议记录，`INCONCLUSIVE` 不计入。**自检报告须给出三态分布**，不得给「N 个变异全红」这类只有分子的数字。
-- §14/§15、§54/§55 两组要转 VERIFIED，需要在**更大的变异空间**里找分离点（例如变异 `isRequestActive` 的回写判据，使响应与历史可以分别塌）——那要等实现存在。**在此之前不得声称这两组「已被覆盖」。**
-- §12(a) 已 VERIFIED 且**不依赖组件 harness**；§12(b) 随 4.3 结论生效或作废。
+- §14/§15、§54/§55 两组即使到了实现阶段也需要在**更大的变异空间**里找分离点（例如变异 `isRequestActive` 的回写判据，使响应与历史可以分别塌）。**在此之前不得声称这两组「已被覆盖」。**
+- §12(a) 的变异设计不依赖组件 harness（模型层已验证）；§12(b) 随 4.3 结论生效或作废。
 - 组件层与源码 gate 各条的有效性**全部以 4.3 两阶段自检通过为前提**。
 - §2 的成立**以 4.4-a 的后端编码实测为前提**（0.7 仍是推断）。
 - **仍未被任何自动化覆盖**：WebKit 焦点/选区行为（§18）、重复 `:key` 的错误 patch 行为（§25）、翻译文案的实际渲染（§34 / §53）、1024×768 排版，以及 5.1 列出的三条组件降级项。全部在 4.5 有检查点，不计入任何覆盖统计。
@@ -702,7 +714,7 @@ owner 派单时写的是「PR-A 自足，且不依赖组件 harness」。**前�
 | §6 | AuthEditor 在 `addTo === "query"` 时调用注入的 `t` |
 | §12(b) | RequestPanel 传入 `url-revision` prop |
 
-其余 10 条（§1/§2/§3/§7–§11/§13 纯函数、§5 源码 gate、§12(a) reactivity）**确实与 DOM 无关**，在现有 `environment: "node"` 下就能跑——§12(a) 已在 0.11 实跑验证过。
+其余 10 条（§1/§2/§3/§7–§11/§13 纯函数、§5 源码 gate、§12(a) reactivity）**确实与 DOM 无关**，在现有 `environment: "node"` 下就能跑——§12(a) 的变异设计已在临时模型上验证过（0.13(2)，**非生产代码**）。
 
 **因此准确的表述是**：4.3 自检失败时，PR-A **仍可交付**，其行为内核仍被证明；但 §4 / §6 / §12(b) 三条**降级为验证缺口**，各自配 4.5 的人工检查点（**h / i / j**，rev5 补齐——rev4 声称它们存在而实际为空），并且**必须在 ACCEPTANCE 里登记为缺口，不得计入覆盖**。这三条恰好都是「接线」类断言——也就是 P8 那一类最容易漏、也最难用非组件手段证明的东西，所以降级的代价要写清楚，不能含糊成「PR-A 不受影响」。
 
