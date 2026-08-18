@@ -8069,4 +8069,213 @@ mod tests {
         assert_eq!(decoded.body_kind, ResponseBodyKind::Text);
     }
 
+
+    // ---------- 评审 R1 IMPORTANT 的补强 ----------
+
+    #[tokio::test]
+    async fn test_json_body_that_is_only_whitespace_sends_no_body() {
+        // Pins the branch the §33 test missed. Empty or whitespace-only JSON
+        // content is treated as "no body", not as malformed JSON: that guard
+        // predates this change and §33 ties the rejection wording to the
+        // previous behaviour, so leaving the editor blank must not start
+        // erroring. Malformed-but-present content is still rejected - see
+        // test_invalid_json_body_is_rejected_before_sending.
+        let server = d02_serve(b"ok", &[]).await;
+        let mut args = d02_args("POST", server.uri());
+        args.body = RequestBodyInput {
+            body_type: "json".to_string(),
+            content: "   \n\t ".to_string(),
+            form_data: vec![],
+            binary_path: String::new(),
+            binary_content: None,
+        };
+        send_request(args).await.unwrap();
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        assert!(received[0].body.is_empty(), "{:?}", received[0].body);
+        // No body means no content-type of ours either.
+        assert_eq!(
+            d02_header_values(&received[0], "content-type"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_undecodable_encoding_preserves_the_original_bytes_and_length() {
+        // §11 promised the bytes are untouched and Content-Length survives, but
+        // the original test only looked at the marker text, so returning an
+        // empty Vec from the undecodable branch left it green. These assertions
+        // are the ones that collapse if the bytes stop being preserved.
+        const PLAIN: &[u8] = b"this is valid utf-8 and contains no nul byte";
+        let server = d02_serve(
+            PLAIN,
+            &[
+                ("content-encoding", "zstd"),
+                ("content-type", "application/json"),
+            ],
+        )
+        .await;
+        let response = send_request(d02_args("GET", server.uri())).await.unwrap();
+        // size is the byte count of the untouched body ...
+        assert_eq!(response.size as usize, PLAIN.len());
+        // ... and the marker reports that same count back to the user.
+        assert!(
+            response.body.contains(&format!("{} bytes", PLAIN.len())),
+            "{}",
+            response.body
+        );
+        // ... and Content-Length still describes those same bytes.
+        let content_length = response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map(|(_, value)| value.clone());
+        assert_eq!(content_length, Some(PLAIN.len().to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_corrupt_stream_error_carries_the_underlying_cause() {
+        // §13 asks for the encoding name *and* the underlying reason. The
+        // original test only checked the name, so replacing the cause with a
+        // fixed string kept it green.
+        const NOT_GZIP: &[u8] = b"this is definitely not a gzip stream";
+        let server = d02_serve(NOT_GZIP, &[("content-encoding", "gzip")]).await;
+        let error = send_request(d02_args("GET", server.uri()))
+            .await
+            .unwrap_err();
+        let (_, cause) = error.rsplit_once(": ").expect("no cause segment");
+        assert!(
+            !cause.trim().is_empty() && cause != "gzip",
+            "no underlying cause carried: {error}"
+        );
+        // flate2 reports the header mismatch; assert something specific enough
+        // that a hard-coded string would have to impersonate it.
+        assert!(
+            error.to_lowercase().contains("header"),
+            "cause is not the decoder's own: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_user_supplied_accept_encoding_is_sent_unchanged() {
+        // §16 has two halves. The existing test covers "we add none"; this one
+        // covers "we keep the user's", which is the half that matters for the
+        // pasted-cURL workflow and which a blanket remove() would pass.
+        let server = d02_serve(b"ok", &[]).await;
+        let mut args = d02_args("GET", server.uri());
+        args.headers = vec![d02_header("Accept-Encoding", "gzip")];
+        send_request(args).await.unwrap();
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            d02_header_values(&received[0], "accept-encoding"),
+            vec!["gzip".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_declared_charset_is_honoured_through_the_request_path() {
+        // §17-§22 were only exercised against the decoder helper, so the
+        // production path could have ignored Content-Type entirely and every
+        // one of them would still pass. This drives the whole path.
+        // gb2312: 中=D6D0 文=CEC4 测=B2E2 试=CAD4, then "abc".
+        const GBK: &[u8] = &[
+            0xD6, 0xD0, 0xCE, 0xC4, 0xB2, 0xE2, 0xCA, 0xD4, 0x61, 0x62, 0x63,
+        ];
+        let server = d02_serve(GBK, &[("content-type", "text/html; charset=gb2312")]).await;
+        let response = send_request(d02_args("GET", server.uri())).await.unwrap();
+        assert_eq!(response.body, "中文测试abc");
+        assert!(!response.body.contains('\u{FFFD}'), "{}", response.body);
+    }
+
+    #[tokio::test]
+    async fn test_binary_and_none_bodies_add_no_content_type() {
+        // §28 covers raw / binary / none; only raw was exercised.
+        let server = d02_serve(b"ok", &[]).await;
+
+        let mut binary = d02_args("POST", server.uri());
+        binary.body = RequestBodyInput {
+            body_type: "binary".to_string(),
+            content: String::new(),
+            form_data: vec![],
+            binary_path: "payload.bin".to_string(),
+            binary_content: Some("AQIDBA==".to_string()),
+        };
+        send_request(binary).await.unwrap();
+
+        send_request(d02_args("GET", server.uri())).await.unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        for request in &received {
+            assert_eq!(
+                d02_header_values(request, "content-type"),
+                Vec::<String>::new(),
+                "{:?}",
+                request.method
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_basic_auth_replaces_a_manual_authorization_header() {
+        // §29 names basic and bearer; only bearer was exercised.
+        let server = d02_serve(b"ok", &[]).await;
+        let mut args = d02_args("GET", server.uri());
+        args.headers = vec![d02_header("Authorization", "Basic c3RhbGU6c3RhbGU=")];
+        args.auth = AuthInput {
+            auth_type: "basic".to_string(),
+            basic: Some(BasicAuth {
+                username: "alice".to_string(),
+                // A colon in the password is legal and must survive.
+                password: "p:w".to_string(),
+            }),
+            bearer: None,
+            api_key: None,
+        };
+        send_request(args).await.unwrap();
+        let received = server.received_requests().await.unwrap();
+        let values = d02_header_values(&received[0], "authorization");
+        assert_eq!(values.len(), 1, "{values:?}");
+        assert_ne!(values[0], "Basic c3RhbGU6c3RhbGU=");
+        // base64("alice:p:w")
+        assert_eq!(values[0], "Basic YWxpY2U6cDp3");
+    }
+
+    #[tokio::test]
+    async fn test_api_key_mode_leaves_a_manual_authorization_header_alone() {
+        // §30 says anything other than basic/bearer must not touch a manual
+        // Authorization row; api-key mode was never exercised for that.
+        let server = d02_serve(b"ok", &[]).await;
+        let mut args = d02_args("GET", server.uri());
+        // Two rows, not one: with a single value a keep-last collapse is
+        // indistinguishable from leaving the header alone, which is exactly how
+        // the api-key insert/append mutation escaped the first ledger run.
+        args.headers = vec![
+            d02_header("Authorization", "Bearer hand-written-a"),
+            d02_header("Authorization", "Bearer hand-written-b"),
+        ];
+        args.auth = AuthInput {
+            auth_type: "api-key".to_string(),
+            basic: None,
+            bearer: None,
+            api_key: Some(ApiKeyAuth {
+                key: "X-Api-Key".to_string(),
+                value: "secret".to_string(),
+                add_to: "header".to_string(),
+            }),
+        };
+        send_request(args).await.unwrap();
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            d02_header_values(&received[0], "authorization"),
+            vec![
+                "Bearer hand-written-a".to_string(),
+                "Bearer hand-written-b".to_string()
+            ]
+        );
+        assert_eq!(
+            d02_header_values(&received[0], "x-api-key"),
+            vec!["secret".to_string()]
+        );
+    }
+
 }
