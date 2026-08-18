@@ -2,7 +2,9 @@
 
 范围：**PR-A（§1–§13 + 裁定 A22 的 §5 / §6 / §56 机制）**。§14–§58 属 PR-B，本台账不覆盖。
 
-全部变异跑在 **HEAD `f2c43b6`**（PR-A 最终态），每个 mutant 跑**全套 313 个用例**。台账初稿在 `ce0a33d` 上跑过一次，`f2c43b6` 上**整批重跑**，26 行结果逐字相同。
+全部变异跑在 **HEAD `bcb7bc7`**（PR-A 最终态），每个 mutant 跑**全套 315 个用例**。
+
+**本台账整批重跑过三次，没有一次是把两次运行拼起来的**：`ce0a33d`（初稿）→ `f2c43b6`（加 glob override 后）→ `bcb7bc7`（裁定 A27 补断言、并把两条新用例归到正确的不变式名下之后）。前两次结果逐字相同；第三次因为 A27 新增了 2 条用例，两行的杀伤集合**变大**（K7 由 2 增至 3、KWIRE3 由 1 增至 2），两行由 GREEN 转 RED（KWIRE2 / KWIRE4）。**下表是第三次的数字。**
 
 ---
 
@@ -56,7 +58,7 @@ append_pair("a b", "c d")                                            ⇒  a+b=c+
 3. 全部失败都不是 assertion mismatch（import / setup / transform error）⇒ `INCONCLUSIVE`，**不得记为杀死**。
 4. 打补丁前校验 anchor 在目标文件里**恰好出现 1 次**，否则 `INCONCLUSIVE`。
 5. 每个 mutant 先跑 `vue-tsc --noEmit`；编译不过 ⇒ `ILLEGAL-PATCH`（P3），**不得记为杀死**。
-6. 每个 mutant 跑**全套** 313 个用例，记录**完整杀伤集合**，不只记「红了」。
+6. 每个 mutant 跑**全套** 315 个用例，记录**完整杀伤集合**，不只记「红了」。
 7. 跑完 `git status --porcelain` 必须为空，否则整批作废。
 8. **（P14 第一层）** 补丁必须**文本非空**（`from !== to`）且锚点唯一。本批 25 条，文本空操作 **0** 条。第二层（语义空操作）机械挡不住，逐条人工核对见 4.0。
 
@@ -69,36 +71,37 @@ append_pair("a b", "c d")                                            ⇒  a+b=c+
 ## 1. 台账
 
 `H/W`：`H` = 变异在纯函数内部；`W` = 变异在生产调用点（接线）。
-杀伤集合列出的是**全套 313 用例**里所有转红的用例，不限于目标不变式。
+杀伤集合列出的是**全套 315 用例**里所有转红的用例，不限于目标不变式。
 
 | § | 变异（落盘生产代码，单行/单块，可编译） | H/W | 结果 | 完整杀伤集合 | P9 对照 | 状态 |
 |---|---|---|---|---|---|---|
-| **§1** | `url-params.ts`：`if (isTemplateSpan(segment))` → `if (isTemplateSpan(""))` | H | RED 5/313 | §1 全 5 条 | ✅ 删断言 ⇒ GREEN | **VERIFIED** |
-| **§2** | `url-params.ts`：`encoded.toString().slice(2)` → `encodeURIComponent(segment)` | H | RED 2/313 | §2 全 2 条 | ✅ | **VERIFIED** |
-| **§3** | `url-params.ts`：`item.key.trim()` → `item.key` | H | RED 1/313 | §3 | ✅ | **VERIFIED** |
-| **§4** | `RequestPanel.vue`：模板把 `auth.apiKey` 拼进传给 `UrlBar` 的 params | **W** | RED 1/313 | §4 | ✅ | **VERIFIED** |
-| **§5** | `README.md` 删掉该句 / `README.zh-CN.md` 删掉该句（两个独立 mutant） | — | RED 1/313 各 | 英文条 / 中文条，**互不牵连** | ✅ ×2 | **VERIFIED** |
-| **§6** | `AuthEditor.vue`：`v-if="isQueryApiKey"` → `&& false`（正向）／ → `\|\| true`（负向） | **W** | RED 1/313 各 | 「query 时调 t」／「header 时不调 t」，**互不牵连** | ✅ ×2 | **VERIFIED** |
-| **§7** | `url-params.ts`：`/\{\{…\}\}/g` → `/^\{\{…\}\}/g` | H | RED 2/313 | §7「查询里的变量」「去重与顺序」；**§7「路径里的变量」保持绿** | ✅ | **VERIFIED** |
-| **§8** | `url-params.ts`：`return previous.draft` → `return incoming.url` | H | RED 2/313 | §8、**§9** | ✅ | **VERIFIED**（§9 见下） |
+| **§1** | `url-params.ts`：`if (isTemplateSpan(segment))` → `if (isTemplateSpan(""))` | H | RED 5/315 | §1 全 5 条 | ✅ 删断言 ⇒ GREEN | **VERIFIED** |
+| **§2** | `url-params.ts`：`encoded.toString().slice(2)` → `encodeURIComponent(segment)` | H | RED 2/315 | §2 全 2 条 | ✅ | **VERIFIED** |
+| **§3** | `url-params.ts`：`item.key.trim()` → `item.key` | H | RED 1/315 | §3 | ✅ | **VERIFIED** |
+| **§4** | `RequestPanel.vue`：模板把 `auth.apiKey` 拼进传给 `UrlBar` 的 params | **W** | RED 1/315 | §4 | ✅ | **VERIFIED** |
+| **§5** | `README.md` 删掉该句 / `README.zh-CN.md` 删掉该句（两个独立 mutant） | — | RED 1/315 各 | 英文条 / 中文条，**互不牵连** | ✅ ×2 | **VERIFIED** |
+| **§6** | `AuthEditor.vue`：`v-if="isQueryApiKey"` → `&& false`（正向）／ → `\|\| true`（负向） | **W** | RED 1/315 各 | 「query 时调 t」／「header 时不调 t」，**互不牵连** | ✅ ×2 | **VERIFIED** |
+| **§7** | `url-params.ts`：`/\{\{…\}\}/g` → `/^\{\{…\}\}/g` | H | RED 3/315 | §7「查询里的变量」「去重与顺序」**＋§7 接线用例「提示按草稿计算」**；**§7「路径里的变量」保持绿** | ✅ | **VERIFIED** |
+| **§8** | `url-params.ts`：`return previous.draft` → `return incoming.url` | H | RED 2/315 | §8、**§9** | ✅ | **VERIFIED**（§9 见下） |
 | **§9** | 无独立 killer | — | — | 与 §8 共用 killer | — | **冗余**（冻结规格已如此登记） |
-| **§10** | `url-params.ts`：删掉 `previous.revision !== incoming.revision` 整块（冻结 killer） | H | RED 2/313 | §10、**§11** | ✅ 断言承重 | **DESIGNED**（②不满足，见 §2 节） |
-| **§11** | `url-params.ts`：revision 判据换回 `sameParse` 单行（冻结 killer） | H | RED 2/313 | §11、**§8** | ✅ 断言承重 | **DESIGNED**（②不满足，见 §2 节） |
-| **§12(a)** | `UrlBar.vue`：watch 源 `[url, tabId, urlRevision]` → `[url, tabId, 0]` | **W** | RED 2/313 | §12(a) 两条；**§12(a) 的「url 变」「tab 变」两条邻居保持绿** | ✅ | **VERIFIED** |
-| **§12(b)** | `RequestPanel.vue`：`:url-revision="activeTab.urlRevision"` → `:url-revision="0"` | **W** | RED 1/313 | §12(b) | ✅ | **VERIFIED**（只覆盖「值写错」；「整行不写」由类型系统另行保证，两条证据不折算，见第 3 节） |
-| **§13** | `url-params.ts`：删掉 `previous.tabId !== incoming.tabId` 整块 | H | RED 1/313 | §13 第一条；§13 第二条（previous 为 null）保持绿 | ✅ | **VERIFIED** |
-| **§56**（机制） | `zh-CN.ts`：`auth.queryKeyHidden` 换成其英文文案 | H | RED 1/313 | §56 | ✅ | **VERIFIED（仅本 PR 新增的 1 个 key）** |
+| **§10** | `url-params.ts`：删掉 `previous.revision !== incoming.revision` 整块（冻结 killer） | H | RED 2/315 | §10、**§11** | ✅ 断言承重 | **DESIGNED**（②不满足，见 §2 节） |
+| **§11** | `url-params.ts`：revision 判据换回 `sameParse` 单行（冻结 killer） | H | RED 2/315 | §11、**§8** | ✅ 断言承重 | **DESIGNED**（②不满足，见 §2 节） |
+| **§12(a)** | `UrlBar.vue`：watch 源 `[url, tabId, urlRevision]` → `[url, tabId, 0]` | **W** | RED 2/315 | §12(a) 两条；**§12(a) 的「url 变」「tab 变」两条邻居保持绿** | ✅ | **VERIFIED** |
+| **§12(b)** | `RequestPanel.vue`：`:url-revision="activeTab.urlRevision"` → `:url-revision="0"` | **W** | RED 1/315 | §12(b) | ✅ | **VERIFIED**（只覆盖「值写错」；「整行不写」由类型系统另行保证，两条证据不折算，见第 3 节） |
+| **§13** | `url-params.ts`：删掉 `previous.tabId !== incoming.tabId` 整块 | H | RED 1/315 | §13 第一条；§13 第二条（previous 为 null）保持绿 | ✅ | **VERIFIED** |
+| **§56**（机制） | `zh-CN.ts`：`auth.queryKeyHidden` 换成其英文文案 | H | RED 1/315 | §56 | ✅ | **VERIFIED（仅本 PR 新增的 1 个 key）** |
+| **§7 / §8 的接线** | `UrlBar.vue`：`:value="draft"` → `:value="props.url"`；`detectTemplateVariables(draft)` → `(props.url)` | **W** | RED 1/315 各 | 各自单塌，见第 4 节（裁定 A27） | ✅ ×2 | **VERIFIED** |
 
 ### 支撑性变异（不对应编号不变式，但锁住 §8/§10/§12 依赖的前提）
 
 | 变异 | H/W | 结果 | 完整杀伤集合 | P9 |
 |---|---|---|---|---|
-| `tabs.ts`：`tab.urlRevision += 1` → `+= 0` | H | RED 2/313 | 「params 写入递增」「url 写入递增」 | — |
-| `tabs.ts`：`updateTabFromUrlBar` 改成递增 | H | RED 1/313 | 「URL 栏回写不递增」 | ✅ |
-| `tabs.ts`：`openHistoryEntry` 复用分支不再递增 | H | RED 1/313 | 「历史条目接管空白 tab 时递增」 | ✅ |
-| `RequestPanel.vue`：`updateTabFromUrlBar` → `updateTab` | **W** | RED 1/313 | 「回写走不递增的那条路径」 | ✅ |
-| `UrlBar.vue`：`onUrlInput` 不写 `draft` | **W** | RED 1/313 | §12(a)「把草稿与新来源交给协调器」 | — |
-| `url-query.ts`：`splitTemplateSpans` → `[value]`（共享原语） | H | RED 2/313 | §1 两条（混排、模板旁的字节） | — |
+| `tabs.ts`：`tab.urlRevision += 1` → `+= 0` | H | RED 2/315 | 「params 写入递增」「url 写入递增」 | — |
+| `tabs.ts`：`updateTabFromUrlBar` 改成递增 | H | RED 1/315 | 「URL 栏回写不递增」 | ✅ |
+| `tabs.ts`：`openHistoryEntry` 复用分支不再递增 | H | RED 1/315 | 「历史条目接管空白 tab 时递增」 | ✅ |
+| `RequestPanel.vue`：`updateTabFromUrlBar` → `updateTab` | **W** | RED 1/315 | 「回写走不递增的那条路径」 | ✅ |
+| `UrlBar.vue`：`onUrlInput` 不写 `draft` | **W** | RED 2/315 | §12(a)「把草稿与新来源交给协调器」＋§7 接线用例 | — |
+| `url-query.ts`：`splitTemplateSpans` → `[value]`（共享原语） | H | RED 2/315 | §1 两条（混排、模板旁的字节） | — |
 
 ---
 
@@ -158,7 +161,7 @@ K11（revision 判据换回 sameParse）⇒ RED: §11、§8
 
 `urlRevision` 被做成 `Tab` 的必填字段与 `UrlBar` 的必填 prop。由此产生**两条互不替代的证据**，按 P10 分两句写：
 
-**① 测试证据（度量）**：把 `:url-revision="activeTab.urlRevision"` 改成 `:url-revision="0"`，全套 313 用例中**恰好 1 条转红**（§12(b) 用例），P9 对照通过（删掉该断言 ⇒ 转绿）。
+**① 测试证据（度量）**：把 `:url-revision="activeTab.urlRevision"` 改成 `:url-revision="0"`，全套 315 用例中**恰好 1 条转红**（§12(b) 用例），P9 对照通过（删掉该断言 ⇒ 转绿）。
 **它证明的是**：这个 prop **写错了值**，行为会变、测试会红。
 
 **② 结构证据（另一件事）**：把该行**整行删除**，`vue-tsc` 报 `TS2345: Property 'urlRevision' is missing`。
@@ -172,7 +175,7 @@ K11（revision 判据换回 sameParse）⇒ RED: §11、§8
 
 ## 4. 曾经存活的两条变异 —— 裁定 A27 之后已关闭
 
-**先记历史，因为它是这条流水线唯一一次真正接住东西的地方**：两条 P8 型接线变异，在 313 用例下**全绿存活**。其中第一条能让本切片的中心缺陷完整复活——重新绑到 `props.url`，输入框又开始改写用户正在打的字，`?` 又被吃掉——而**全套自动化测试毫无反应**。当时唯一的防线是人工检查点 4.5-f，而人工检查点不进 CI。
+**先记历史，因为它是这条流水线唯一一次真正接住东西的地方**：两条 P8 型接线变异，在当时的 313 用例下**全绿存活**。其中第一条能让本切片的中心缺陷完整复活——重新绑到 `props.url`，输入框又开始改写用户正在打的字，`?` 又被吃掉——而**全套自动化测试毫无反应**。当时唯一的防线是人工检查点 4.5-f，而人工检查点不进 CI。
 
 **裁定 A27**：A20 的四类断言增加**第五类——表单控件（`input` / `textarea` / `select`）的 `value` 绑定**。理由是 A20 禁 DOM 文本针对的是**装饰性渲染断言**，而 `<input>` 的 `value` 绑定不是外观，**它就是「代码持有的草稿」与「用户看见并编辑的文本」之间那条唯一的连线**。规则的目的没覆盖这个情形 ⇒ 边界画窄了。
 
@@ -180,8 +183,10 @@ K11（revision 判据换回 sameParse）⇒ RED: §11、§8
 
 | 曾存活的变异 | H/W | 关闭后结果 | 完整杀伤集合 | P9 对照 | 状态 |
 |---|---|---|---|---|---|
-| `UrlBar.vue`：`:value="draft"` → `:value="props.url"` | **W** | **RED 1/315** | 「输入框仍显示打进去的字」**单塌** | ✅ 删断言 ⇒ GREEN | **已关闭** |
-| `UrlBar.vue`：`detectTemplateVariables(draft.value)` → `(props.url)` | **W** | **RED 1/315** | 「变量提示按草稿计算」**单塌** | ✅ 删断言 ⇒ GREEN | **已关闭** |
+| `UrlBar.vue`：`:value="draft"` → `:value="props.url"` | **W** | **RED 1/315** | 「§8 接线：输入框仍显示打进去的字」**单塌** | ✅ 删断言 ⇒ GREEN | **已关闭** |
+| `UrlBar.vue`：`detectTemplateVariables(draft.value)` → `(props.url)` | **W** | **RED 1/315** | 「§7 接线：变量提示按草稿计算」**单塌** | ✅ 删断言 ⇒ GREEN | **已关闭** |
+
+补上这两条用例，使**另外两行的杀伤集合变大**——K7 由 2 增至 3，「`onUrlInput` 不写 `draft`」由 1 增至 2。方向与 D02 的实测一致：**真实杀伤集合只会比预期大，不会比预期小。**
 
 第二条用的是**已获准的第三类**（`v-if` 存在性），此前挡住它的不是断言类别而是**没有稳定选择器**。加了 `data-testid="url-variables"`——不改变任何行为，属 P7 明写的「测试设施」而非「产品让步」。
 
@@ -236,7 +241,7 @@ P14 说存活有**三种**成因，第三种是「补丁是空操作、生产代
 | **INCONCLUSIVE** | **0** | —— |
 | **SURVIVED** | **0** | 曾有 2 条 P8 接线变异存活；裁定 **A27** 扩展 A20 后已各自补上单塌断言，见第 4 节 |
 
-**度量**：PR-A 的 13 条不变式加 §56 机制，共跑 28 个合法 mutant（另有 3 个冻结 killer 被 `vue-tsc` 判为 ILLEGAL-PATCH 并已换成合法变体），**21 条 P9 承重对照全部 `LOAD-BEARING`**，全套用例 **315 passed**。
+**度量**：最终 HEAD `bcb7bc7` 上整批跑 **25 个 mutant ⇒ RED 24 / ILLEGAL-PATCH 1 / SURVIVED 0 / INCONCLUSIVE 0**（那 1 条 ILLEGAL-PATCH 是 §12(b) 的冻结 killer，被类型系统挡下，见第 3 节）。**21 条 P9 承重对照全部 `LOAD-BEARING`**。基线全套 **315 passed**。
 
 **结论及其适用范围**：PR-A 的行为内核（§1–§8、§12、§13）与 A22 的三项（§5、§6、§56 机制）**已在落盘生产代码上被证明单塌**。**但**：
 
