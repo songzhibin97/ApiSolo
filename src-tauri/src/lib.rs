@@ -10909,4 +10909,337 @@ mod tests {
         );
         assert_eq!(d03_env_value("Legacy", "生产", "token"), "SURVIVOR");
     }
+
+    // ------------------------------------------- D03 §一/§三 (maintenance)
+    // The maintenance file's lock, and the cleanup queue's survival across
+    // every way a round can fail to finish.
+
+    fn d03_seed_maintenance(collisions: &[&str], pending: &[&str]) {
+        let snapshot = MaintenanceSnapshot {
+            version: MAINTENANCE_VERSION,
+            collisions: collisions
+                .iter()
+                .map(|key| SecretKeyCollision {
+                    legacy_vault_key: (*key).to_string(),
+                    variable_key: "token".to_string(),
+                    environments: vec![
+                        EnvironmentRef {
+                            project: "legacy".to_string(),
+                            environment: "生产".to_string(),
+                        },
+                        EnvironmentRef {
+                            project: "legacy".to_string(),
+                            environment: "测试".to_string(),
+                        },
+                    ],
+                    detected_at: "2026-08-18T00:00:00Z".to_string(),
+                })
+                .collect(),
+            pending_prune: pending.iter().map(|key| (*key).to_string()).collect(),
+            last_failure: None,
+        };
+        write_maintenance_snapshot(&snapshot).unwrap();
+    }
+
+    fn d03_last_failure() -> Option<serde_json::Value> {
+        d03_maintenance_json()
+            .get("lastFailure")
+            .filter(|value| !value.is_null())
+            .cloned()
+    }
+
+    /// Asserts the failure marker records a classification and nothing else.
+    /// A structural check, not a search for a particular error string: a
+    /// negative assertion would pass simply because the injected sentinel never
+    /// appeared in serde's message.
+    fn d03_assert_failure_marker(kind: &str) {
+        let failure = d03_last_failure().expect("no failure marker was written");
+        let object = failure.as_object().expect("lastFailure is not an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["at", "kind"],
+            "the failure marker carries fields beyond the classification"
+        );
+        assert_eq!(object["kind"], serde_json::json!(kind));
+        assert!(
+            !object["at"].as_str().unwrap_or_default().is_empty(),
+            "failure marker has no timestamp"
+        );
+    }
+
+    struct SystemVaultFailure;
+
+    impl SystemVaultFailure {
+        fn on() -> Self {
+            set_system_secret_vault_failure(true);
+            Self
+        }
+    }
+
+    impl Drop for SystemVaultFailure {
+        fn drop(&mut self) {
+            set_system_secret_vault_failure(false);
+        }
+    }
+
+    fn d03_reset_system_vault() {
+        test_system_secret_vault()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        set_system_secret_vault_failure(false);
+    }
+
+    #[test]
+    fn test_maintenance_lock_is_alive_at_the_checkpoint() {
+        for function in [
+            "record_vault_key_collisions",
+            "acknowledge_secret_key_collision",
+            "enqueue_pending_prune",
+            "read_pending_prune",
+            "resolve_pending_prune",
+        ] {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            d03_seed_maintenance(&["GROUP-A", "GROUP-B"], &["queued"]);
+
+            let probe =
+                probe_lock_at_checkpoint("maintenance_enter", vault_maintenance_tx(), move || {
+                    match function {
+                        "record_vault_key_collisions" => {
+                            let index = VaultKeyIndex {
+                                refs: BTreeMap::new(),
+                                complete: true,
+                            };
+                            record_vault_key_collisions(&["queued".to_string()], &index)
+                        }
+                        "acknowledge_secret_key_collision" => {
+                            acknowledge_secret_key_collision("GROUP-A".to_string())
+                        }
+                        "enqueue_pending_prune" => enqueue_pending_prune(&["other".to_string()]),
+                        "read_pending_prune" => read_pending_prune().map(|_| ()),
+                        _ => resolve_pending_prune(&["queued".to_string()]),
+                    }
+                });
+
+            assert_named_lock_probe(function, &probe, LockVerdict::LockHeld);
+        }
+
+        // One installed gate, two arrivals: the second must pass straight
+        // through. Otherwise any correct implementation that touches the file
+        // twice deadlocks against a test that releases once.
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        d03_seed_maintenance(&["GROUP-A", "GROUP-B"], &[]);
+
+        let probe = probe_lock_at_checkpoint("maintenance_enter", vault_maintenance_tx(), || {
+            enqueue_pending_prune(&["queued-by-child".to_string()])?;
+            acknowledge_secret_key_collision("GROUP-A".to_string())
+        });
+        assert_named_lock_probe("two arrivals", &probe, LockVerdict::LockHeld);
+
+        let remaining = get_secret_key_collisions().unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "the second call never completed: {remaining:?}",
+            remaining = remaining
+                .iter()
+                .map(|collision| collision.legacy_vault_key.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(remaining[0].legacy_vault_key, "GROUP-B");
+        assert_eq!(d03_pending_prune(), vec!["queued-by-child".to_string()]);
+    }
+
+    #[test]
+    fn test_pending_prune_survives_every_interruption_point() {
+        // (a) Reading the queue is non-destructive. An earlier design took the
+        // queue out of the file first; a crash before the deletion then lost
+        // the cleanup intent for good.
+        {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            d03_seed_maintenance(&[], &["orphan-key"]);
+            let before = std::fs::read(vault_maintenance_path().unwrap()).unwrap();
+
+            assert_eq!(read_pending_prune().unwrap(), vec!["orphan-key".to_string()]);
+
+            assert_eq!(
+                std::fs::read(vault_maintenance_path().unwrap()).unwrap(),
+                before,
+                "reading the queue rewrote the file"
+            );
+        }
+
+        // (b) Interrupted between the delete and the resolve: the entry is
+        // already gone from the backend, so the retry confirms it and clears
+        // the queue rather than blocking on it forever.
+        {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            create_project("Retry".to_string(), String::new()).unwrap();
+            configure_local_secret_storage_for_test();
+            save_environment(
+                "Retry".to_string(),
+                d03_env("dev", vec![sample_env_variable("token", "value", true)]),
+                Some(true),
+            )
+            .unwrap();
+            d03_seed_maintenance(&[], &["already-deleted-key"]);
+
+            load_environment("Retry".to_string(), "dev".to_string()).unwrap();
+
+            assert!(
+                d03_pending_prune().is_empty(),
+                "a key confirmed absent stayed queued forever"
+            );
+        }
+
+        // (c) The index could not be trusted because of an unrelated broken
+        // file. Nothing is deleted and nothing leaves the queue.
+        {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            create_project("Retry".to_string(), String::new()).unwrap();
+            create_project("Unrelated".to_string(), String::new()).unwrap();
+            configure_local_secret_storage_for_test();
+            save_environment(
+                "Retry".to_string(),
+                d03_env("dev", vec![sample_env_variable("token", "value", true)]),
+                Some(true),
+            )
+            .unwrap();
+            save_secret_value("orphan-key", "orphan-value").unwrap();
+            d03_seed_maintenance(&[], &["orphan-key"]);
+            std::fs::write(
+                d03_env_file(temp_home.path(), "unrelated", "dev", true),
+                "{ not json",
+            )
+            .unwrap();
+
+            load_environment("Retry".to_string(), "dev".to_string()).unwrap();
+
+            assert_eq!(d03_pending_prune(), vec!["orphan-key".to_string()]);
+            assert_eq!(load_secret_value("orphan-key").unwrap(), "orphan-value");
+            d03_assert_failure_marker("index-incomplete");
+        }
+
+        // (d) Still referenced by another environment: it stays queued while
+        // the rest of the batch completes.
+        {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            create_project("Retry".to_string(), String::new()).unwrap();
+            configure_local_secret_storage_for_test();
+            save_environment(
+                "Retry".to_string(),
+                d03_env("dev", vec![sample_env_variable("token", "value", true)]),
+                Some(true),
+            )
+            .unwrap();
+            save_environment(
+                "Retry".to_string(),
+                d03_env("other", vec![sample_env_variable("token", "other", true)]),
+                Some(true),
+            )
+            .unwrap();
+
+            let project_dir = temp_home.path().join("ApiSolo/projects/retry");
+            let referenced = vault_key_for(&project_dir, "other", "token");
+            save_secret_value("free-orphan", "gone-soon").unwrap();
+            d03_seed_maintenance(&[], &[&referenced, "free-orphan"]);
+
+            load_environment("Retry".to_string(), "dev".to_string()).unwrap();
+
+            assert_eq!(
+                d03_pending_prune(),
+                vec![referenced.clone()],
+                "the referenced key left the queue, or the free one did not"
+            );
+            assert_eq!(load_secret_value(&referenced).unwrap(), "other");
+            assert_eq!(load_secret_value("free-orphan").unwrap(), "");
+        }
+
+        // (e) The backend genuinely refuses. Driven through load_environment,
+        // not through the helper: the mutant this kills lives in the caller,
+        // and calling the helper directly leaves pending unchanged either way.
+        //
+        // The refusal is injected in the keychain stub rather than by making
+        // scratch read-only, because an unwritable scratch would also stop the
+        // wrong-resolve mutant from shortening the queue and the test would
+        // pass under it.
+        {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            d03_reset_system_vault();
+            create_project("Retry".to_string(), String::new()).unwrap();
+            configure_secret_storage("system-keychain".to_string(), None).unwrap();
+
+            let project_dir = temp_home.path().join("ApiSolo/projects/retry");
+            let legacy = legacy_vault_key_for(&project_dir, "My Env", "token");
+            let target = vault_key_for(&project_dir, "My Env", "token");
+            save_secret_value(&legacy, "LEGACY-SECRET").unwrap();
+            d03_write_recorded_metadata(
+                &d03_env_file(temp_home.path(), "retry", "my-env", true),
+                &[("token", &legacy)],
+            );
+
+            {
+                let _failure = SystemVaultFailure::on();
+                // Cleanup failure must not block the user.
+                assert_eq!(
+                    d03_env_value("Retry", "My Env", "token"),
+                    "LEGACY-SECRET",
+                    "a failed cleanup blocked the load"
+                );
+                assert_eq!(
+                    d03_pending_prune(),
+                    vec![legacy.clone()],
+                    "the queue was cleared even though the delete failed"
+                );
+                assert_eq!(load_secret_value(&legacy).unwrap(), "LEGACY-SECRET");
+                d03_assert_failure_marker("backend-delete");
+            }
+
+            // Fault cleared: the retry finishes on the next load.
+            assert_eq!(d03_env_value("Retry", "My Env", "token"), "LEGACY-SECRET");
+            assert_eq!(load_secret_value(&legacy).unwrap(), "");
+            assert_eq!(load_secret_value(&target).unwrap(), "LEGACY-SECRET");
+            assert!(d03_pending_prune().is_empty());
+            d03_reset_system_vault();
+        }
+
+        // (f) delete_environment drains the queue before its "does not exist"
+        // early return. A previous call may have removed the files without
+        // finishing cleanup, and this is the only entry point a user retries.
+        {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            create_project("Retry".to_string(), String::new()).unwrap();
+            configure_local_secret_storage_for_test();
+            save_secret_value("left-behind", "still-here").unwrap();
+            d03_seed_maintenance(&[], &["left-behind"]);
+
+            let outcome = delete_environment("Retry".to_string(), "gone".to_string());
+
+            assert!(outcome.is_err(), "the environment really is absent");
+            assert_eq!(
+                load_secret_value("left-behind").unwrap(),
+                "",
+                "the early return skipped the queue"
+            );
+            assert!(d03_pending_prune().is_empty());
+        }
+    }
 }
