@@ -20,6 +20,8 @@ export default {
     environmentNameRequired: "环境名称不能为空。",
     binaryBodyUnsupported: "暂不支持二进制请求体。",
     fileSelectionRequired: "发送上传请求前请重新选择文件。",
+    redactionSentinelOnWire:
+      "请求未发送：{field} 的值仍是占位符 [redacted]。请填入真实值；若确实要发送这段字面文本，请把它放进环境变量并用 {'{{'}变量名{'}}'} 引用。",
   },
   layout: {
     collections: "集合",
@@ -47,6 +49,9 @@ export default {
     cancel: "取消",
     sending: "发送中...",
     urlRequired: "请输入请求 URL",
+    historyRedactedBanner:
+      "此请求来自历史记录，以下内容在保存时已被脱敏，需要重新填写：{fields}。留空则按空值发送。",
+    historyRedactedBody: "请求体",
     containsVariables: "包含变量：",
     params: "参数",
     headers: "请求头",
@@ -77,6 +82,7 @@ export default {
     on: "启用",
     del: "删除",
     deleteRow: "删除行",
+    redactedPlaceholder: "已脱敏，请重新填写",
   },
   body: {
     none: "无",
@@ -210,7 +216,8 @@ export default {
     method: "方法",
     depth: "深度",
     securityNotice:
-      "历史记录会按编辑态保存请求。对于不希望持久化到磁盘的敏感值，请使用环境变量。",
+      "历史记录按字段名脱敏：cookie / authorization / token / password 等字段的值不会写入磁盘；写在其他字段名下的内容按原样保存。从历史打开的请求需要重新填写这些值才能发送成功。",
+    legacySanitized: "已清理 {count} 条历史记录中的明文凭据。",
     empty: "暂无历史记录",
     emptyDescription: "发送过的请求会显示在这里，支持分组、搜索和快速重新打开。",
     clearHistory: "清空历史",

@@ -19,6 +19,11 @@ ApiSolo is a local desktop API client. It can send requests to arbitrary user-pr
 - The local vault master password is not persisted; it unlocks the current app session only.
 - Window size preference is stored in `$HOME/ApiSolo/scratch/window-state.json` and does not contain request data.
 - Saved requests and history redact direct auth values and uploaded file bytes by default.
+- Redaction is driven by the field name only; credentials written under a non-sensitive field name — including the value of an ordinary header or param — are neither redacted nor marked, and are stored as-is.
+- A request opened from history has its redacted values restored as empty, marked fields. They must be re-entered before the request will succeed; the placeholder `[redacted]` is never sent on the wire.
+- Request scripts still read plaintext secret values through `pm.environment.get`; only a whole-value copy into a new variable inherits the secret marker.
+- After upgrading, `signature` / `credential` / `subscription-key` style fields in existing collection requests are shown empty and need re-entering; the file on disk is untouched until that request is saved.
+- A redacted non-string JSON value comes back as an empty string when replayed from history.
 - Request scripts run in a QuickJS WebAssembly sandbox with a timeout and a small exposed API surface.
 - The browser development bridge is for trusted local development only and requires a per-session token.
 
