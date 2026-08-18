@@ -106,6 +106,63 @@ describe("exportCurl", () => {
     expect(curl).toContain("file=@hello.txt;type=text/plain")
   })
 
+  // Behavior 32
+  it("exports templated and protocol-less URLs verbatim", () => {
+    const leading = exportCurl(makeTab({ url: "{{baseUrl}}/users" }))
+    expect(leading).toBe("curl '{{baseUrl}}/users'")
+    expect(leading).not.toContain("%7B")
+
+    const midPath = exportCurl(makeTab({ url: "https://api.example.com/{{id}}/x" }))
+    expect(midPath).toBe("curl 'https://api.example.com/{{id}}/x'")
+
+    const protocolLess = exportCurl(makeTab({ url: "api.example.com/users" }))
+    expect(protocolLess).toBe("curl 'api.example.com/users'")
+    expect(protocolLess).not.toContain("'/api.example.com")
+  })
+
+  // Behavior 33
+  it("percent-encodes params but keeps {{templates}} intact", () => {
+    const curl = exportCurl(
+      makeTab({
+        url: "https://api.example.com/x",
+        params: [
+          { id: "1", enabled: true, key: "token", value: "{{apiToken}}", description: "" },
+          { id: "2", enabled: true, key: "q", value: "a b", description: "" },
+        ],
+      })
+    )
+
+    expect(curl).toContain("token={{apiToken}}")
+    expect(curl).toContain("q=a%20b")
+    expect(curl).not.toContain("%7B%7BapiToken")
+  })
+
+  // Behavior 34 — the state a cURL import leaves behind: the query string
+  // lives in tab.url and in params at the same time.
+  it("does not duplicate a query string left in tab.url", () => {
+    const curl = exportCurl(
+      makeTab({
+        url: "https://api.example.com/s?q=cat",
+        params: [{ id: "1", enabled: true, key: "q", value: "cat", description: "" }],
+      })
+    )
+
+    expect(curl.match(/q=cat/g)).toHaveLength(1)
+    expect(curl).toBe("curl 'https://api.example.com/s?q=cat'")
+  })
+
+  // Behavior 35
+  it("keeps the fragment after the query string", () => {
+    const curl = exportCurl(
+      makeTab({
+        url: "https://api.example.com/a#frag",
+        params: [{ id: "1", enabled: true, key: "k", value: "v", description: "" }],
+      })
+    )
+
+    expect(curl).toBe("curl 'https://api.example.com/a?k=v#frag'")
+  })
+
   it("exports binary bodies without dropping the payload semantics", () => {
     const curl = exportCurl(
       makeTab({

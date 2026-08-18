@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { parsePostmanCollection } from "../postman-import"
+import { exportPostmanCollection } from "../postman-export"
+import type { CollectionNode, SavedRequest } from "../../types"
 
 describe("parsePostmanCollection", () => {
   it("parses a simple Postman collection", () => {
@@ -180,5 +182,58 @@ describe("parsePostmanCollection", () => {
     expect(result.requests[0].request.testScript).toContain("pm.test('boom', () => {})")
     expect(result.requests[0].request.preRequestScript).toContain("// while(true){}")
     expect(result.requests[0].request.testScript).toContain("// pm.test('boom', () => {})")
+  })
+
+  // Behavior 43 — an upload whose bytes only exist inside ApiSolo must come
+  // back as an empty slot the user has to refill, never as a phantom name
+  // pointing at a file Postman could not have resolved either.
+  it("round-trips an in-memory upload into an empty file slot", () => {
+    const request: SavedRequest = {
+      name: "Upload",
+      method: "POST",
+      url: "https://api.example.com/upload",
+      params: [],
+      headers: [],
+      body: {
+        type: "form-data",
+        content: "",
+        formData: [
+          {
+            id: "file-1",
+            enabled: true,
+            key: "file",
+            value: "",
+            description: "",
+            valueType: "file",
+            fileName: "报告.pdf",
+            fileContent: "aGVsbG8=",
+            contentType: "application/pdf",
+          },
+        ],
+        binaryPath: "",
+      },
+      auth: { type: "none" },
+      preRequestScript: "",
+      testScript: "",
+    }
+    const tree: CollectionNode[] = [
+      {
+        name: "Upload",
+        path: "Upload",
+        nodeType: "request",
+        children: [],
+        method: "POST",
+      },
+    ]
+
+    const reimported = parsePostmanCollection(
+      exportPostmanCollection("My API", [request], tree)
+    )
+    const field = reimported.requests[0].request.body.formData[0]
+
+    expect(field.valueType).toBe("file")
+    expect(field.fileName).toBe("")
+    expect(field.filePath).toBe("")
+    expect(field.fileContent).toBeUndefined()
   })
 })

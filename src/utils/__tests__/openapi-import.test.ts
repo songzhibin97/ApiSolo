@@ -217,4 +217,116 @@ paths:
       ),
     )
   })
+
+  // Behavior 44 — a self-referential model is the ordinary shape of a tree,
+  // and it used to abort the entire import with a RangeError, taking every
+  // unrelated endpoint in the same document with it.
+  const cyclicSchemas: Array<[string, Record<string, unknown>, (body: any) => void]> = [
+    [
+      "direct self reference",
+      {
+        Node: {
+          type: "object",
+          properties: { name: { type: "string" }, child: { $ref: "#/components/schemas/Node" } },
+        },
+      },
+      (body) => expect(body.child).toBeNull(),
+    ],
+    [
+      "mutual reference",
+      {
+        Node: {
+          type: "object",
+          properties: { name: { type: "string" }, peer: { $ref: "#/components/schemas/Other" } },
+        },
+        Other: {
+          type: "object",
+          properties: { back: { $ref: "#/components/schemas/Node" } },
+        },
+      },
+      (body) => expect(body.peer.back).toBeNull(),
+    ],
+    [
+      "array item self reference",
+      {
+        Node: {
+          type: "object",
+          properties: {
+            name: { type: "string" },
+            children: { type: "array", items: { $ref: "#/components/schemas/Node" } },
+          },
+        },
+      },
+      (body) => expect(body.children).toEqual([null]),
+    ],
+  ]
+
+  it.each(cyclicSchemas)("imports specs whose schema graph is cyclic (%s)", (_label, schemas, check) => {
+    const spec = JSON.stringify({
+      openapi: "3.0.0",
+      info: { title: "Recursive Demo" },
+      servers: [{ url: "https://api.example.com" }],
+      components: { schemas },
+      paths: {
+        "/nodes": {
+          post: {
+            summary: "Create node",
+            requestBody: {
+              content: { "application/json": { schema: { $ref: "#/components/schemas/Node" } } },
+            },
+          },
+        },
+        "/health": { get: { summary: "Health check" } },
+      },
+    })
+
+    const result = parseOpenApiSpec(spec)
+
+    expect(result.requests).toHaveLength(2)
+    expect(result.requests.some((item) => item.name === "Health check")).toBe(true)
+    check(JSON.parse(result.requests[0].request.body.content))
+  })
+
+  // Behavior 45 — the depth backstop, exercised with distinct refs so the
+  // cycle set cannot be what stops it.
+  it("truncates a $ref chain deeper than the depth cap", () => {
+    const schemas: Record<string, unknown> = {}
+    for (let index = 0; index < 25; index += 1) {
+      schemas[`S${index}`] = {
+        type: "object",
+        properties:
+          index === 24
+            ? { leaf: { type: "string" } }
+            : { next: { $ref: `#/components/schemas/S${index + 1}` } },
+      }
+    }
+
+    const spec = JSON.stringify({
+      openapi: "3.0.0",
+      info: { title: "Deep" },
+      servers: [{ url: "https://api.example.com" }],
+      components: { schemas },
+      paths: {
+        "/deep": {
+          post: {
+            summary: "Deep",
+            requestBody: {
+              content: { "application/json": { schema: { $ref: "#/components/schemas/S0" } } },
+            },
+          },
+        },
+      },
+    })
+
+    const body = JSON.parse(parseOpenApiSpec(spec).requests[0].request.body.content)
+
+    // Level 0 is the body itself, so the cap at MAX_SCHEMA_DEPTH = 20 makes
+    // level 21 the first null.
+    let cursor: any = body
+    for (let depth = 0; depth <= 20; depth += 1) {
+      expect(cursor).not.toBeNull()
+      cursor = cursor.next
+    }
+    expect(cursor).toBeNull()
+  })
 })
