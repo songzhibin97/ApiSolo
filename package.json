@@ -40,10 +40,15 @@
     "vue-router": "^4.6.3",
     "yaml": "^2.8.3"
   },
+  "overrides": {
+    "glob": "^10.5.0"
+  },
   "devDependencies": {
     "@tailwindcss/vite": "^4.2.2",
     "@tauri-apps/cli": "^2",
     "@vitejs/plugin-vue": "^5.2.1",
+    "@vue/test-utils": "^2.4.11",
+    "happy-dom": "^20.11.2",
     "tailwindcss": "^4.2.2",
     "typescript": "~5.6.2",
     "vite": "^6.4.2",

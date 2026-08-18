@@ -118,6 +118,8 @@ export default {
     addTo: "Add to",
     header: "Header",
     query: "Query",
+    queryKeyHidden:
+      "The API key is appended to the query string when the request is sent. It is not shown in the URL bar so the key does not appear in an address you might copy or screenshot.",
     description: {
       none: "This request does not use authentication",
       basic: "Username and password are sent in the Authorization header as Base64",

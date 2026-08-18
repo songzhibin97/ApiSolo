@@ -1,13 +1,16 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue"
+import { computed, onMounted, onUnmounted, ref, watch } from "vue"
 import { Send, X } from "lucide-vue-next"
 import { useI18n } from "vue-i18n"
 
+import { detectTemplateVariables, reconcileUrlBarValue } from "../../utils/url-params"
 import type { HttpMethod } from "../../types"
 
 const props = defineProps<{
   method: HttpMethod
   url: string
+  tabId: string
+  urlRevision: number
   isLoading?: boolean
 }>()
 
@@ -35,17 +38,39 @@ const methodClasses = computed<Record<HttpMethod, string>>(() => ({
   OPTIONS: "text-slate-400",
 }))
 
-const detectedVariables = computed(() => {
-  const matches = props.url.match(/\{\{\s*([^{}]+?)\s*\}\}/g) ?? []
-  return [...new Set(matches.map((item) => item.replace(/[{}]/g, "").trim()))]
-})
+/**
+ * What the field shows. It is not `props.url` directly: the panel writes every
+ * keystroke into the store and hands back the canonical rendering, and echoing
+ * that straight back into the field is what used to swallow a freshly typed
+ * `?`.
+ */
+const draft = ref(props.url)
+const seen = ref({ tabId: props.tabId, revision: props.urlRevision })
+
+// All three sources are load-bearing. Without `urlRevision` an outside write
+// that renders to the identical string — a cURL import that only normalizes
+// `%20` to `+` — never wakes this watcher, and the field keeps showing the old
+// draft.
+watch(
+  () => [props.url, props.tabId, props.urlRevision] as const,
+  ([url, tabId, revision]) => {
+    draft.value = reconcileUrlBarValue(
+      { tabId: seen.value.tabId, revision: seen.value.revision, draft: draft.value },
+      { tabId, revision, url },
+    )
+    seen.value = { tabId, revision }
+  },
+)
+
+const detectedVariables = computed(() => detectTemplateVariables(draft.value))
 
 function onMethodChange(event: Event) {
   emit("update:method", (event.target as HTMLSelectElement).value as HttpMethod)
 }
 
 function onUrlInput(event: Event) {
-  emit("update:url", (event.target as HTMLInputElement).value)
+  draft.value = (event.target as HTMLInputElement).value
+  emit("update:url", draft.value)
 }
 
 function onKeydown(event: KeyboardEvent) {
@@ -103,7 +128,7 @@ onUnmounted(() => {
         class="h-9 min-w-0 flex-1 rounded border border-[var(--border)] bg-[var(--bg-primary)] px-3 font-mono text-sm text-[var(--text-primary)] outline-none transition placeholder:text-[color-mix(in_srgb,var(--text-secondary)_72%,transparent)] focus:border-[color-mix(in_srgb,var(--accent)_70%,white)]"
         type="text"
         :placeholder="t('request.enterUrl')"
-        :value="props.url"
+        :value="draft"
         @input="onUrlInput"
         @keydown="onKeydown"
         @paste="onPaste"
@@ -122,6 +147,7 @@ onUnmounted(() => {
 
     <div
       v-if="detectedVariables.length > 0"
+      data-testid="url-variables"
       class="mt-2 text-xs text-[var(--text-secondary)]"
     >
       {{ t("request.containsVariables") }}
