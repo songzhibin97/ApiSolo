@@ -2127,9 +2127,9 @@ fn update_history_entries(entries: Vec<HistoryEntry>) -> Result<(), String> {
     let _guard = lock_history();
     let mut merged = read_history_entries()?;
 
-    for update in entries {
+    for update in entries.iter() {
         if let Some(existing) = merged.iter_mut().find(|entry| entry.id == update.id) {
-            *existing = update;
+            *existing = update.clone();
         }
     }
 
