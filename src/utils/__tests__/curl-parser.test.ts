@@ -138,4 +138,112 @@ describe("parseCurl", () => {
     expect(result.headers[0].key).toBe("Cookie")
     expect(result.headers[0].value).toBe("foo=bar;user_auth_name=abc/def;login_country=SG")
   })
+
+  // Behavior 1
+  it("decodes $'...' ANSI-C quoted headers copied from DevTools", () => {
+    const result = parseCurl(
+      `curl 'https://example.com/a' -H $'cookie: sid=abc!def' -H $'authorization: Bearer xyz'`
+    )
+
+    expect(result.headers).toHaveLength(1)
+    expect(result.headers[0].key).toBe("cookie")
+    expect(result.headers[0].key).not.toMatch(/^\$/)
+    expect(result.headers[0].value).toBe("sid=abc!def")
+    expect(result.auth.type).toBe("bearer")
+    expect(result.auth.bearer?.token).toBe("xyz")
+    expect(
+      result.headers.some((header) => header.key.toLowerCase() === "authorization")
+    ).toBe(false)
+  })
+
+  // Behavior 2 — asserted on the body so header normalization cannot mask a
+  // decoded control character. BACKSLASH is built at runtime: a literal
+  // backslash in a nested template is exactly the thing that silently
+  // degrades when a fixture is copied around (PROCESS P6).
+  const BACKSLASH = String.fromCharCode(92)
+
+  it("decodes every documented ANSI-C escape class", () => {
+    // Every payload is prefixed with a sentinel `Z`: a body that decodes to
+    // whitespace only (\t \n \v \f \r) would otherwise be collapsed to
+    // type "none" with an empty content by inferTextBodyType, and the
+    // assertion would pass for the wrong reason.
+    const cases: Array<[string, string]> = [
+      [`${BACKSLASH}${BACKSLASH}`, BACKSLASH],
+      [`${BACKSLASH}'`, "'"],
+      [`${BACKSLASH}"`, '"'],
+      [`${BACKSLASH}a`, "\x07"],
+      [`${BACKSLASH}b`, "\b"],
+      [`${BACKSLASH}e`, "\x1b"],
+      [`${BACKSLASH}E`, "\x1b"],
+      [`${BACKSLASH}f`, "\f"],
+      [`${BACKSLASH}v`, "\v"],
+      [`${BACKSLASH}t`, "\t"],
+      [`${BACKSLASH}n`, "\n"],
+      [`${BACKSLASH}r`, "\r"],
+      [`${BACKSLASH}x7`, "\x07"],
+      [`${BACKSLASH}x21`, "!"],
+      [`${BACKSLASH}u4e2d`, "中"],
+      [`${BACKSLASH}u41`, "A"],
+      [`${BACKSLASH}U0001F600`, "\u{1F600}"],
+      [`${BACKSLASH}101`, "A"],
+      [`${BACKSLASH}7`, "\x07"],
+      [`${BACKSLASH}z`, `${BACKSLASH}z`],
+      [`${BACKSLASH}xZZ`, `${BACKSLASH}xZZ`],
+    ]
+
+    // Fixture self-check (PROCESS P6): every input must still start with a
+    // real backslash by the time it reaches the parser.
+    for (const [input] of cases) {
+      expect(input.charCodeAt(0)).toBe(92)
+    }
+
+    for (const [input, expected] of cases) {
+      const result = parseCurl(`curl https://example.com/a -d $'Z${input}'`)
+      expect(result.body.content).toBe(`Z${expected}`)
+    }
+
+    // A trailing lone backslash cannot appear before a closing quote (it would
+    // escape the quote), so the only way to reach that decoder branch is an
+    // unterminated $'… at the end of the command.
+    const unterminated = parseCurl(`curl https://example.com/a -d $'Z${BACKSLASH}`)
+    expect(unterminated.body.content).toBe(`Z${BACKSLASH}`)
+  })
+
+  // Behavior 3
+  it("folds decoded CR and LF inside header values", () => {
+    const crlf = parseCurl(
+      `curl https://example.com/a -H $'x-note: line1${BACKSLASH}r${BACKSLASH}nline2'`
+    )
+    expect(crlf.headers[0].value).toBe("line1 line2")
+    expect(crlf.headers[0].value).not.toContain("\r")
+    expect(crlf.headers[0].value).not.toContain("\n")
+    expect(crlf.headers[0].value).not.toContain(`${BACKSLASH}r`)
+
+    const loneCr = parseCurl(`curl https://example.com/a -H $'x-note: a${BACKSLASH}rb'`)
+    expect(loneCr.headers[0].value).toBe("a b")
+
+    const cookie = parseCurl(
+      `curl https://example.com/a -H $'cookie: a=1${BACKSLASH}r${BACKSLASH}n  b=2'`
+    )
+    expect(cookie.headers[0].value).toBe("a=1b=2")
+  })
+
+  // Behavior 4 — shares its killer with Behavior 1 (same pendingDollar branch);
+  // kept because -b is what modern Chrome actually emits for cookies.
+  it("decodes $'...' on the -b cookie flag", () => {
+    const result = parseCurl(`curl 'https://example.com/a' -b $'sid=abc!def'`)
+
+    expect(result.headers).toHaveLength(1)
+    expect(result.headers[0].key).toBe("Cookie")
+    expect(result.headers[0].value).toBe("sid=abc!def")
+  })
+
+  // Behavior 5
+  it("treats an escaped dollar as a literal dollar", () => {
+    const escaped = parseCurl(`curl https://example.com/a -d ${BACKSLASH}$'x'`)
+    expect(escaped.body.content).toBe("$x")
+
+    const quoted = parseCurl(`curl https://example.com/a -d '$x'`)
+    expect(quoted.body.content).toBe("$x")
+  })
 })

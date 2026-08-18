@@ -312,27 +312,72 @@ function tokenizeCurlCommand(command: string) {
   let current = ""
   let quote: "'" | '"' | null = null
   let escapeNext = false
+  // `$` immediately before an opening quote turns it into an ANSI-C quoted word.
+  // Only an unquoted, unescaped `$` counts, so `\$'x'` stays the literal `$x`.
+  let pendingDollar = false
+  let ansiC = false
+  let ansiBuffer = ""
   const normalized = command.replace(/\\\r?\n/g, " ").trim()
 
   for (const char of normalized) {
+    if (ansiC) {
+      // Escapes are not evaluated here — the raw two-character sequence is kept
+      // so decodeAnsiCEscapes sees it. We only need `\'` to not close the quote.
+      if (escapeNext) {
+        ansiBuffer += char
+        escapeNext = false
+        continue
+      }
+
+      if (char === "\\") {
+        ansiBuffer += char
+        escapeNext = true
+        continue
+      }
+
+      if (char === "'") {
+        current += decodeAnsiCEscapes(ansiBuffer)
+        ansiBuffer = ""
+        ansiC = false
+        quote = null
+        continue
+      }
+
+      ansiBuffer += char
+      continue
+    }
+
     if (escapeNext) {
       current += char
       escapeNext = false
+      pendingDollar = false
       continue
     }
 
     if (char === "\\" && quote !== "'") {
       escapeNext = true
+      pendingDollar = false
+      continue
+    }
+
+    if (char === "'" && !quote && pendingDollar) {
+      current = current.slice(0, -1)
+      quote = "'"
+      ansiC = true
+      ansiBuffer = ""
+      pendingDollar = false
       continue
     }
 
     if ((char === "'" || char === '"') && !quote) {
       quote = char
+      pendingDollar = false
       continue
     }
 
     if (char === quote) {
       quote = null
+      pendingDollar = false
       continue
     }
 
@@ -341,10 +386,17 @@ function tokenizeCurlCommand(command: string) {
         tokens.push(current)
         current = ""
       }
+      pendingDollar = false
       continue
     }
 
     current += char
+    pendingDollar = !quote && char === "$"
+  }
+
+  if (ansiC) {
+    // Unterminated $'… — keep what we decoded rather than dropping the word.
+    current += decodeAnsiCEscapes(ansiBuffer)
   }
 
   if (current) {
@@ -352,6 +404,106 @@ function tokenizeCurlCommand(command: string) {
   }
 
   return tokens
+}
+
+const ANSI_C_SIMPLE_ESCAPES: Record<string, string> = {
+  a: "\x07",
+  b: "\b",
+  e: "\x1b",
+  E: "\x1b",
+  f: "\f",
+  n: "\n",
+  r: "\r",
+  t: "\t",
+  v: "\v",
+  "\\": "\\",
+  "'": "'",
+  '"': '"',
+}
+
+const MAX_CODE_POINT = 0x10ffff
+
+function decodeAnsiCEscapes(raw: string) {
+  let result = ""
+  let index = 0
+
+  while (index < raw.length) {
+    const char = raw[index]
+
+    if (char !== "\\") {
+      result += char
+      index += 1
+      continue
+    }
+
+    const next = raw[index + 1]
+    if (next === undefined) {
+      result += "\\"
+      index += 1
+      continue
+    }
+
+    const simple = ANSI_C_SIMPLE_ESCAPES[next]
+    if (simple !== undefined) {
+      result += simple
+      index += 2
+      continue
+    }
+
+    if (next === "x" || next === "u" || next === "U") {
+      const maxDigits = next === "x" ? 2 : next === "u" ? 4 : 8
+      const digits = readDigits(raw, index + 2, maxDigits, isHexDigit)
+      const codePoint = digits ? Number.parseInt(digits, 16) : -1
+      if (codePoint >= 0 && codePoint <= MAX_CODE_POINT) {
+        result += String.fromCodePoint(codePoint)
+        index += 2 + digits.length
+        continue
+      }
+
+      // Unusable escape (no digits, or out of range): keep it literal.
+      result += `\\${next}`
+      index += 2
+      continue
+    }
+
+    if (isOctalDigit(next)) {
+      const digits = readDigits(raw, index + 1, 3, isOctalDigit)
+      result += String.fromCharCode(Number.parseInt(digits, 8))
+      index += 1 + digits.length
+      continue
+    }
+
+    result += `\\${next}`
+    index += 2
+  }
+
+  return result
+}
+
+function readDigits(
+  raw: string,
+  start: number,
+  maxDigits: number,
+  accept: (char: string) => boolean,
+) {
+  let digits = ""
+  while (digits.length < maxDigits) {
+    const char = raw[start + digits.length]
+    if (char === undefined || !accept(char)) {
+      break
+    }
+    digits += char
+  }
+
+  return digits
+}
+
+function isHexDigit(char: string) {
+  return /[0-9a-fA-F]/.test(char)
+}
+
+function isOctalDigit(char: string) {
+  return char >= "0" && char <= "7"
 }
 
 function createHeaderPair(rawHeader: string): KeyValuePair {
@@ -379,12 +531,22 @@ function normalizeHeaderValueByKey(key: string, value: string) {
   return normalizeHeaderValue(value)
 }
 
+/**
+ * Fold the line breaks a browser-copied curl leaves inside a header value.
+ * reqwest's HeaderValue::from_str rejects CR and LF, so this is the one
+ * transformation an imported header value is forced to undergo. The regex is
+ * built per call — no shared lastIndex state.
+ */
+function foldHeaderLineBreaks(value: string, replacement: string) {
+  return value.replace(/(?:\r\n|\r|\n)[ \t]*/g, replacement)
+}
+
 function normalizeHeaderValue(value: string) {
-  return value.replace(/\r?\n[ \t]*/g, " ").trim()
+  return foldHeaderLineBreaks(value, " ").trim()
 }
 
 function normalizeCookieValue(value: string) {
-  return value.replace(/\r?\n[ \t]*/g, "").trim()
+  return foldHeaderLineBreaks(value, "").trim()
 }
 
 function parseAuthorizationHeader(key: string, value: string): AuthConfig | null {
