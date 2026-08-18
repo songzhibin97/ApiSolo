@@ -907,30 +907,110 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn read_history_entries() -> Result<Vec<HistoryEntry>, String> {
+/// A parsed history file plus the raw bytes of every line that could not be
+/// parsed. Corrupt lines are carried as bytes, not text: a line can be invalid
+/// UTF-8, and the whole point of quarantine is that nothing is altered.
+#[derive(Default)]
+struct HistoryFile {
+    entries: Vec<HistoryEntry>,
+    corrupt_lines: Vec<Vec<u8>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryHealth {
+    skipped_lines: usize,
+    quarantined_lines: usize,
+}
+
+fn history_quarantine_path() -> Result<PathBuf, String> {
+    Ok(data_dir()?.join("scratch").join("history.corrupt.jsonl"))
+}
+
+/// Appends raw corrupt lines to the quarantine file and flushes them to disk.
+/// A failure here must abort the caller's write: dropping a bad line from
+/// history.jsonl when its quarantined copy never landed is silent data loss.
+fn quarantine_history_lines(lines: &[Vec<u8>]) -> Result<(), String> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+
+    let path = history_quarantine_path()?;
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .map_err(|error| format!("Failed to open history quarantine file: {error}"))?;
+
+    for line in lines {
+        // The only byte we add is the separating newline; CRLF endings and
+        // invalid UTF-8 go to disk exactly as they were read.
+        file.write_all(line)
+            .map_err(|error| format!("Failed to write history quarantine file: {error}"))?;
+        file.write_all(b"\n")
+            .map_err(|error| format!("Failed to write history quarantine file: {error}"))?;
+    }
+
+    file.sync_all()
+        .map_err(|error| format!("Failed to flush history quarantine file: {error}"))
+}
+
+fn read_history_entries() -> Result<HistoryFile, String> {
     io_checkpoint("read");
     let history_path = history_file_path()?;
     let file = fs::File::open(&history_path)
         .map_err(|error| format!("Failed to open history file: {error}"))?;
-    let reader = BufReader::new(file);
-    let mut entries = Vec::new();
+    let mut reader = BufReader::new(file);
+    let mut history = HistoryFile::default();
 
-    for line in reader.lines() {
-        let line = line.map_err(|error| format!("Failed to read history file: {error}"))?;
-        if line.trim().is_empty() {
+    loop {
+        // read_until, not lines(): `lines()` fails the entire read on the first
+        // byte sequence that is not UTF-8, which is how one torn line used to
+        // brick the whole history panel.
+        let mut raw = Vec::new();
+        let read = reader
+            .read_until(b'\n', &mut raw)
+            .map_err(|error| format!("Failed to read history file: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        if raw.last() == Some(&b'\n') {
+            raw.pop();
+        }
+
+        // Blank lines were never data, so they are not corruption either.
+        if raw.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
 
-        let entry = serde_json::from_str::<HistoryEntry>(&line)
-            .map_err(|error| format!("Failed to parse history entry: {error}"))?;
-        entries.push(entry);
+        let Ok(text) = std::str::from_utf8(&raw) else {
+            history.corrupt_lines.push(raw);
+            continue;
+        };
+
+        match serde_json::from_str::<HistoryEntry>(text) {
+            Ok(entry) => history.entries.push(entry),
+            Err(_) => {
+                history.corrupt_lines.push(raw);
+                continue;
+            }
+        }
     }
 
-    Ok(entries)
+    Ok(history)
 }
 
-fn write_history_entries(entries: &[HistoryEntry]) -> Result<(), String> {
+fn write_history_entries(
+    entries: &[HistoryEntry],
+    corrupt_lines: &[Vec<u8>],
+) -> Result<(), String> {
     io_checkpoint("write");
+
+    // Order matters and is not interchangeable: rewriting first would leave a
+    // state where the bad line is gone from history.jsonl and was never
+    // persisted anywhere else.
+    quarantine_history_lines(corrupt_lines)?;
+
     let history_path = history_file_path()?;
 
     let mut buffer = Vec::new();
@@ -2297,37 +2377,55 @@ fn append_history(mut entry: HistoryEntry) -> Result<(), String> {
         entry.id = Uuid::new_v4().to_string();
     }
 
-    let mut entries = read_history_entries()?;
-    entries.push(entry);
+    let mut file = read_history_entries()?;
+    file.entries.push(entry);
 
-    if entries.len() > MAX_HISTORY_ENTRIES {
-        let overflow = entries.len() - MAX_HISTORY_ENTRIES;
-        entries.drain(0..overflow);
+    if file.entries.len() > MAX_HISTORY_ENTRIES {
+        let overflow = file.entries.len() - MAX_HISTORY_ENTRIES;
+        file.entries.drain(0..overflow);
     }
 
-    write_history_entries(&entries)
+    write_history_entries(&file.entries, &file.corrupt_lines)
 }
 
 #[tauri::command]
 fn load_history() -> Result<Vec<HistoryEntry>, String> {
     let _guard = lock_history();
-    let mut entries = read_history_entries()?;
-    entries.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
-    Ok(entries)
+    let mut file = read_history_entries()?;
+    if !file.corrupt_lines.is_empty() {
+        eprintln!(
+            "[history] skipped {} unreadable line(s)",
+            file.corrupt_lines.len()
+        );
+    }
+    file.entries
+        .sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
+    Ok(file.entries)
 }
 
 #[tauri::command]
 fn clear_history() -> Result<(), String> {
     let _guard = lock_history();
-    write_history_entries(&[])
+    write_history_entries(&[], &[])?;
+
+    // An explicit clear means no residue. Quarantined lines can hold
+    // credentials that older versions wrote in plaintext.
+    let quarantine_path = history_quarantine_path()?;
+    match fs::remove_file(&quarantine_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Failed to delete history quarantine file: {error}"
+        )),
+    }
 }
 
 #[tauri::command]
 fn delete_history_entry(id: String) -> Result<(), String> {
     let _guard = lock_history();
-    let mut entries = read_history_entries()?;
-    entries.retain(|entry| entry.id != id);
-    write_history_entries(&entries)
+    let mut file = read_history_entries()?;
+    file.entries.retain(|entry| entry.id != id);
+    write_history_entries(&file.entries, &file.corrupt_lines)
 }
 
 /// Replaces history rows by id. Rows the caller did not list are kept as they
@@ -2337,15 +2435,41 @@ fn delete_history_entry(id: String) -> Result<(), String> {
 #[tauri::command]
 fn update_history_entries(entries: Vec<HistoryEntry>) -> Result<(), String> {
     let _guard = lock_history();
-    let mut merged = read_history_entries()?;
+    let mut file = read_history_entries()?;
 
     for update in entries.iter() {
-        if let Some(existing) = merged.iter_mut().find(|entry| entry.id == update.id) {
+        if let Some(existing) = file.entries.iter_mut().find(|entry| entry.id == update.id) {
             *existing = update.clone();
         }
     }
 
-    write_history_entries(&merged)
+    // Passing &[] here would silently drop quarantine-bound lines that may
+    // carry plaintext credentials.
+    write_history_entries(&file.entries, &file.corrupt_lines)
+}
+
+/// Counts what the last read had to skip and what is sitting in quarantine, so
+/// the history panel can say so and re-enable its clear button. A new command
+/// rather than a wider `load_history`: the button's disabled condition lives in
+/// the panel, so the UI has to change either way.
+#[tauri::command]
+fn get_history_health() -> Result<HistoryHealth, String> {
+    let _guard = lock_history();
+    let file = read_history_entries()?;
+
+    let quarantine_path = history_quarantine_path()?;
+    let quarantined_lines = match fs::read(&quarantine_path) {
+        Ok(bytes) => bytes.iter().filter(|byte| **byte == b'\n').count(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => {
+            return Err(format!("Failed to read history quarantine file: {error}"))
+        }
+    };
+
+    Ok(HistoryHealth {
+        skipped_lines: file.corrupt_lines.len(),
+        quarantined_lines,
+    })
 }
 
 async fn ws_connect_inner(
@@ -3684,6 +3808,10 @@ async fn api_delete_history_entry(Json(args): Json<DeleteHistoryEntryArgs>) -> i
     api_unit(delete_history_entry(args.id))
 }
 
+async fn api_get_history_health() -> impl IntoResponse {
+    api_response(get_history_health())
+}
+
 async fn api_update_history_entries(Json(args): Json<UpdateHistoryEntriesArgs>) -> impl IntoResponse {
     api_unit(update_history_entries(args.entries))
 }
@@ -3729,6 +3857,7 @@ async fn start_dev_server() {
         .route("/api/ws_drain_events", post(api_ws_drain_events))
         .route("/api/append_history", post(api_append_history))
         .route("/api/load_history", post(api_load_history))
+        .route("/api/get_history_health", post(api_get_history_health))
         .route("/api/clear_history", post(api_clear_history))
         .route("/api/delete_history_entry", post(api_delete_history_entry))
         .route(
@@ -3789,6 +3918,7 @@ pub fn run() {
             clear_history,
             delete_history_entry,
             update_history_entries,
+            get_history_health,
             get_data_dir,
             get_secret_storage_state,
             configure_secret_storage,
@@ -6732,7 +6862,7 @@ mod tests {
         ])
         .unwrap();
 
-        let entries = read_history_entries().unwrap();
+        let entries = read_history_entries().unwrap().entries;
         let ids: Vec<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
         assert_eq!(ids, vec!["keep-1", "rewrite", "keep-2"]);
         assert_eq!(entries[1].url, "https://api.example.com/sanitized");
@@ -6910,12 +7040,13 @@ mod tests {
             .enumerate()
             .map(|(index, id)| sample_history_entry(id, &format!("2026-03-27T10:0{index}:00Z")))
             .collect();
-        write_history_entries(&entries).unwrap();
+        write_history_entries(&entries, &[]).unwrap();
     }
 
     fn history_ids() -> Vec<String> {
         read_history_entries()
             .unwrap()
+            .entries
             .into_iter()
             .map(|entry| entry.id)
             .collect()
@@ -6954,7 +7085,7 @@ mod tests {
                 record("delete completed");
             }
             HistoryCommand::UnlockedRead => {
-                let entries = read_history_entries().unwrap();
+                let entries = read_history_entries().unwrap().entries;
                 record(&format!("unlocked read returned {} entries", entries.len()));
             }
             HistoryCommand::Update => {
@@ -7135,7 +7266,7 @@ mod tests {
 
         let probe = run_lock_probe(HistoryCommand::Update, std::time::Duration::ZERO);
         assert_lock_probe(&probe, "update completed", &["A", "B"]);
-        let entries = read_history_entries().unwrap();
+        let entries = read_history_entries().unwrap().entries;
         assert_eq!(entries[0].url, "https://api.example.com/updated");
         assert_eq!(entries[1].url, "http://example.com/api");
     }
@@ -7249,7 +7380,7 @@ mod tests {
             appender.join().unwrap();
             updater.join().unwrap();
 
-            let entries = read_history_entries().unwrap();
+            let entries = read_history_entries().unwrap().entries;
             let ids: Vec<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
             assert_eq!(ids, vec!["A", "N"], "round {round}");
             assert_eq!(
@@ -8800,5 +8931,245 @@ mod tests {
             vec!["staging".to_string()],
             "an in-flight temp file showed up in the environment list"
         );
+    }
+
+    // ---------------------------------------------------------------- D03 §五
+    // The history file: one bad line used to brick the whole panel, and the
+    // only in-app way out (Clear history) greyed itself out because the list
+    // was empty. Bad lines are now skipped, and their raw bytes are preserved.
+
+    fn d03_history_line(id: &str, timestamp: &str) -> Vec<u8> {
+        serde_json::to_vec(&sample_history_entry(id, timestamp)).unwrap()
+    }
+
+    fn d03_write_raw_history(bytes: &[u8]) {
+        std::fs::write(history_file_path().unwrap(), bytes).unwrap();
+    }
+
+    fn d03_read_raw_history() -> Vec<u8> {
+        std::fs::read(history_file_path().unwrap()).unwrap()
+    }
+
+    fn d03_read_quarantine() -> Vec<u8> {
+        std::fs::read(history_quarantine_path().unwrap()).unwrap_or_default()
+    }
+
+    /// One good line, one unparsable line, one good line — the shape a crash
+    /// mid-write leaves behind.
+    fn d03_seed_torn_history() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&d03_history_line("good-1", "2026-03-27T10:00:00Z"));
+        raw.push(b'\n');
+        raw.extend_from_slice(br#"{"id":"torn","method":"GET""#);
+        raw.push(b'\n');
+        raw.extend_from_slice(&d03_history_line("good-2", "2026-03-27T10:02:00Z"));
+        raw.push(b'\n');
+        d03_write_raw_history(&raw);
+    }
+
+    #[test]
+    fn test_load_history_skips_corrupt_lines() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        d03_seed_torn_history();
+
+        let entries = load_history().unwrap();
+        let ids: Vec<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+        assert_eq!(ids, vec!["good-2", "good-1"]);
+    }
+
+    #[test]
+    fn test_history_mutations_quarantine_corrupt_lines() {
+        for (label, mutate) in [
+            (
+                "append",
+                Box::new(|| {
+                    append_history(sample_history_entry("added", "2026-03-27T10:03:00Z")).unwrap()
+                }) as Box<dyn Fn()>,
+            ),
+            (
+                "delete",
+                Box::new(|| delete_history_entry("good-1".to_string()).unwrap()) as Box<dyn Fn()>,
+            ),
+            (
+                "update",
+                Box::new(|| {
+                    let mut updated = sample_history_entry("good-1", "2026-03-27T10:00:00Z");
+                    updated.url = "https://api.example.com/updated".to_string();
+                    update_history_entries(vec![updated]).unwrap()
+                }) as Box<dyn Fn()>,
+            ),
+        ] {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            d03_seed_torn_history();
+
+            mutate();
+
+            assert_eq!(
+                d03_read_quarantine(),
+                b"{\"id\":\"torn\",\"method\":\"GET\"\n".to_vec(),
+                "{label}: quarantine file does not hold the corrupt line verbatim"
+            );
+            let rewritten = d03_read_raw_history();
+            assert!(
+                !rewritten.windows(4).any(|window| window == b"torn"),
+                "{label}: the corrupt line is still in history.jsonl"
+            );
+        }
+    }
+
+    #[test]
+    fn test_invalid_utf8_line_is_isolated_not_fatal() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&d03_history_line("good-1", "2026-03-27T10:00:00Z"));
+        raw.push(b'\n');
+        raw.extend_from_slice(&[0xFF, 0xFE]);
+        raw.push(b'\n');
+        d03_write_raw_history(&raw);
+
+        let entries = load_history().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "good-1");
+
+        append_history(sample_history_entry("added", "2026-03-27T10:03:00Z")).unwrap();
+        assert_eq!(
+            d03_read_quarantine(),
+            vec![0xFF, 0xFE, b'\n'],
+            "invalid UTF-8 bytes were altered on the way to quarantine"
+        );
+    }
+
+    #[test]
+    fn test_quarantine_preserves_crlf_and_missing_final_newline() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&d03_history_line("good-1", "2026-03-27T10:00:00Z"));
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(b"not json\r\n");
+        // Final line with no trailing newline at all.
+        raw.extend_from_slice(b"also not json");
+        d03_write_raw_history(&raw);
+
+        append_history(sample_history_entry("added", "2026-03-27T10:03:00Z")).unwrap();
+
+        assert_eq!(
+            d03_read_quarantine(),
+            b"not json\r\nalso not json\n".to_vec(),
+            "quarantine normalised the bytes it was supposed to preserve"
+        );
+    }
+
+    #[test]
+    fn test_history_is_not_rewritten_until_quarantine_succeeds() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        d03_seed_torn_history();
+        let before = d03_read_raw_history();
+
+        // A directory where the quarantine file belongs: append/create fails,
+        // and nothing about history.jsonl may change as a result.
+        std::fs::create_dir_all(history_quarantine_path().unwrap()).unwrap();
+
+        let error = append_history(sample_history_entry("added", "2026-03-27T10:03:00Z"))
+            .expect_err("append must fail when the corrupt line cannot be quarantined");
+        assert!(error.contains("quarantine"), "unexpected error: {error}");
+        assert_eq!(
+            d03_read_raw_history(),
+            before,
+            "history.jsonl was rewritten even though quarantine failed"
+        );
+    }
+
+    #[test]
+    fn test_blank_history_lines_are_not_quarantined() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&d03_history_line("good-1", "2026-03-27T10:00:00Z"));
+        raw.extend_from_slice(b"\n\n   \n\t\n");
+        raw.extend_from_slice(&d03_history_line("good-2", "2026-03-27T10:02:00Z"));
+        raw.push(b'\n');
+        d03_write_raw_history(&raw);
+
+        assert_eq!(load_history().unwrap().len(), 2);
+
+        append_history(sample_history_entry("added", "2026-03-27T10:03:00Z")).unwrap();
+        assert!(
+            d03_read_quarantine().is_empty(),
+            "blank lines were treated as corruption"
+        );
+    }
+
+    #[test]
+    fn test_history_read_still_works_after_quarantine_failure() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        d03_seed_torn_history();
+        std::fs::create_dir_all(history_quarantine_path().unwrap()).unwrap();
+
+        assert!(append_history(sample_history_entry("added", "2026-03-27T10:03:00Z")).is_err());
+
+        // The panel must not brick a second time: reading is unaffected by a
+        // failed quarantine.
+        let entries = load_history().unwrap();
+        let ids: Vec<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+        assert_eq!(ids, vec!["good-2", "good-1"]);
+    }
+
+    #[test]
+    fn test_clear_history_removes_quarantine_file() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        d03_seed_torn_history();
+
+        append_history(sample_history_entry("added", "2026-03-27T10:03:00Z")).unwrap();
+        assert!(history_quarantine_path().unwrap().exists());
+
+        clear_history().unwrap();
+
+        assert!(
+            !history_quarantine_path().unwrap().exists(),
+            "an explicit clear left quarantined lines on disk"
+        );
+        assert!(load_history().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_get_history_health_reports_skipped_and_quarantined_counts() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&d03_history_line("good-1", "2026-03-27T10:00:00Z"));
+        raw.push(b'\n');
+        raw.extend_from_slice(b"first bad\n");
+        raw.extend_from_slice(b"second bad\n");
+        d03_write_raw_history(&raw);
+
+        let health = get_history_health().unwrap();
+        assert_eq!(health.skipped_lines, 2);
+        assert_eq!(health.quarantined_lines, 0);
+
+        append_history(sample_history_entry("added", "2026-03-27T10:03:00Z")).unwrap();
+
+        let health = get_history_health().unwrap();
+        assert_eq!(health.skipped_lines, 0);
+        assert_eq!(health.quarantined_lines, 2);
     }
 }
