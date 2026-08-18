@@ -48,11 +48,13 @@ describe("§12(a) an outside write is reconciled even when the string is identic
 
     await wrapper.setProps({ urlRevision: 1 })
 
+    // Only what goes in. What comes back out is §11's subject, and asserting
+    // it here would collapse this case on a §11 regression — the two layers
+    // this pair of invariants exists to keep apart.
     expect(reconcile).toHaveBeenCalledWith(
       { tabId: "tab-a", revision: 0, draft: "https://x/a?q=a%20b" },
       { tabId: "tab-a", revision: 1, url: CANONICAL },
     )
-    expect(reconcile.mock.results[0].value).toBe(CANONICAL)
   })
 
   it("still runs the reconciler when the url string itself changes", async () => {

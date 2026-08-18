@@ -97,7 +97,9 @@ describe("§1 template spans survive the url bar verbatim", () => {
   })
 
   it("encodes the non-template bytes around a template", () => {
-    expect(buildUrlWithParams(BASE, [pair("k", "a b{{v}}c&d")])).toBe(`${BASE}?k=a+b{{v}}c%26d`)
+    // Deliberately no space: how a space is encoded is §2's subject, and
+    // putting it here would make a §2 regression collapse a §1 case too.
+    expect(buildUrlWithParams(BASE, [pair("k", "a{{v}}c&d")])).toBe(`${BASE}?k=a{{v}}c%26d`)
   })
 })
 
@@ -196,12 +198,16 @@ describe("§7 the variable hint covers the path and the query alike", () => {
   })
 
   it("does not count variables inside a disabled param", () => {
-    const displayed = buildUrlWithParams(BASE, [
-      pair("a", "{{used}}"),
+    // The surviving variable sits in the path, not in a param value: reading it
+    // out of a param would make this case depend on §1's encoding as well as on
+    // the disabled-row rule it is here to check.
+    const displayed = buildUrlWithParams("{{baseUrl}}/items", [
+      pair("a", "1"),
       pair("b", "{{unused}}", false),
     ])
 
-    expect(detectTemplateVariables(displayed)).toEqual(["used"])
+    expect(displayed).toBe("{{baseUrl}}/items?a=1")
+    expect(detectTemplateVariables(displayed)).toEqual(["baseUrl"])
   })
 })
 
