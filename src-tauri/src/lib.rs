@@ -1460,11 +1460,52 @@ fn write_local_secret_map(
     .map_err(|error| format!("Failed to save local secret vault: {error}"))
 }
 
-fn unlock_local_secret_storage(master_password: &str) -> Result<(), String> {
-    if master_password.is_empty() {
-        return Err("Local secret vault master password is required".to_string());
-    }
+/// Serialises the local vault's read-decrypt-modify-encrypt-write cycle.
+///
+/// Atomic file replacement is not enough on its own: it stops half a file from
+/// reaching disk, but two savers that each read the same old snapshot will
+/// still have the later one erase the earlier one's entry. Every function that
+/// takes this lock takes it as its very first statement, before any read.
+///
+/// Never nested with VAULT_MAINTENANCE_TX or D01's history lock.
+fn local_vault_tx() -> &'static StdMutex<()> {
+    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| StdMutex::new(()))
+}
 
+fn lock_local_vault_tx() -> MutexGuard<'static, ()> {
+    local_vault_tx()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+fn vault_creations() -> &'static StdMutex<Vec<Vec<u8>>> {
+    static CREATIONS: OnceLock<StdMutex<Vec<Vec<u8>>>> = OnceLock::new();
+    CREATIONS.get_or_init(|| StdMutex::new(Vec::new()))
+}
+
+/// Records every vault that was actually created. Asserting that the finished
+/// file holds one salt proves nothing — a file can only ever show one salt.
+/// Counting creations is what distinguishes "created once" from "created,
+/// then silently recreated over the top".
+#[cfg(test)]
+fn record_vault_creation(salt: &[u8]) {
+    vault_creations()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(salt.to_vec());
+}
+
+/// Everything after the empty-password check, lifted verbatim so the guard can
+/// be the first statement. The decision of whether the vault exists has to sit
+/// inside the critical section: two callers that both read `None` outside it
+/// would both generate a fresh salt, and the later one would overwrite the
+/// vault the earlier one had just created and stored secrets in — with a salt
+/// that cannot decrypt them.
+fn unlock_local_secret_vault_locked(master_password: &str) -> Result<(), String> {
+    let _guard = lock_local_vault_tx();
+    checkpoint("vault_unlock_enter");
     match read_local_secret_vault_file()? {
         Some(vault_file) => {
             let (salt, _, _) = validate_local_secret_vault_file(&vault_file)?;
@@ -1480,6 +1521,8 @@ fn unlock_local_secret_storage(master_password: &str) -> Result<(), String> {
             OsRng.fill_bytes(&mut salt);
             let key = derive_local_secret_key(master_password, &salt)?;
             write_local_secret_map(&HashMap::new(), &key, &salt)?;
+            #[cfg(test)]
+            record_vault_creation(&salt);
             secret_vault_session()
                 .lock()
                 .map_err(|error| format!("Failed to lock secret vault session: {error}"))?
@@ -1488,6 +1531,14 @@ fn unlock_local_secret_storage(master_password: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn unlock_local_secret_storage(master_password: &str) -> Result<(), String> {
+    if master_password.is_empty() {
+        return Err("Local secret vault master password is required".to_string());
+    }
+
+    unlock_local_secret_vault_locked(master_password)
 }
 
 fn current_local_secret_key() -> Result<[u8; LOCAL_SECRET_VAULT_KEY_BYTES], String> {
@@ -1539,7 +1590,31 @@ fn load_system_secret_value(vault_key: &str) -> Result<String, String> {
 }
 
 #[cfg(test)]
+fn system_secret_vault_failure() -> &'static StdMutex<bool> {
+    static FAILING: OnceLock<StdMutex<bool>> = OnceLock::new();
+    FAILING.get_or_init(|| StdMutex::new(false))
+}
+
+/// Makes the keychain stub refuse deletions, so a backend that genuinely says
+/// no can be driven through the real production entry point instead of being
+/// simulated by making the whole scratch directory unwritable — which would
+/// also block the maintenance file and hide the very mutant under test.
+#[cfg(test)]
+fn set_system_secret_vault_failure(enabled: bool) {
+    *system_secret_vault_failure()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = enabled;
+}
+
+#[cfg(test)]
 fn delete_system_secret_value(vault_key: &str) -> Result<(), String> {
+    if *system_secret_vault_failure()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    {
+        return Err("Failed to delete secret from system vault: injected".to_string());
+    }
+
     test_system_secret_vault()
         .lock()
         .map_err(|error| format!("Failed to lock test system secret vault: {error}"))?
@@ -1579,18 +1654,36 @@ fn delete_system_secret_value(vault_key: &str) -> Result<(), String> {
     }
 }
 
+/// The LocalEncrypted branch of `save_secret_value`, lifted verbatim so the
+/// transaction guard can be the first statement of the function. The dispatch
+/// stays outside on purpose: LOCAL_VAULT_TX is a global lock, and holding it
+/// across the keychain path would serialise every keychain write and could
+/// cover a system authorisation prompt.
+fn save_local_secret_value(vault_key: &str, value: &str) -> Result<(), String> {
+    let _guard = lock_local_vault_tx();
+    checkpoint("vault_rmw_enter");
+    let Some((mut values, salt)) = load_local_secret_map()? else {
+        return Err("Local secret vault is missing. Reconfigure secret storage.".to_string());
+    };
+    let key = current_local_secret_key()?;
+    values.insert(vault_key.to_string(), value.to_string());
+    write_local_secret_map(&values, &key, &salt)
+}
+
+fn delete_local_secret_value(vault_key: &str) -> Result<(), String> {
+    let _guard = lock_local_vault_tx();
+    checkpoint("vault_rmw_enter");
+    let Some((mut values, salt)) = load_local_secret_map()? else {
+        return Ok(());
+    };
+    let key = current_local_secret_key()?;
+    values.remove(vault_key);
+    write_local_secret_map(&values, &key, &salt)
+}
+
 fn save_secret_value(vault_key: &str, value: &str) -> Result<(), String> {
     match require_secret_storage_backend()? {
-        SecretStorageBackend::LocalEncrypted => {
-            let Some((mut values, salt)) = load_local_secret_map()? else {
-                return Err(
-                    "Local secret vault is missing. Reconfigure secret storage.".to_string()
-                );
-            };
-            let key = current_local_secret_key()?;
-            values.insert(vault_key.to_string(), value.to_string());
-            write_local_secret_map(&values, &key, &salt)
-        }
+        SecretStorageBackend::LocalEncrypted => save_local_secret_value(vault_key, value),
         SecretStorageBackend::SystemKeychain => save_system_secret_value(vault_key, value),
     }
 }
@@ -1609,14 +1702,7 @@ fn load_secret_value(vault_key: &str) -> Result<String, String> {
 
 fn delete_secret_value(vault_key: &str) -> Result<(), String> {
     match require_secret_storage_backend()? {
-        SecretStorageBackend::LocalEncrypted => {
-            let Some((mut values, salt)) = load_local_secret_map()? else {
-                return Ok(());
-            };
-            let key = current_local_secret_key()?;
-            values.remove(vault_key);
-            write_local_secret_map(&values, &key, &salt)
-        }
+        SecretStorageBackend::LocalEncrypted => delete_local_secret_value(vault_key),
         SecretStorageBackend::SystemKeychain => delete_system_secret_value(vault_key),
     }
 }
@@ -9355,6 +9441,80 @@ mod tests {
             vault_key_for(&project, "my env", "token"),
             vault_key_for(&project, "my_env", "token"),
             "my env and my_env slugify to the same environment"
+        );
+    }
+
+    // ---------------------------------------------------------------- D03 §二
+    // Vault concurrency. These probes assert one thing precisely: the guard is
+    // already held at the moment the snapshot is about to be read. They do not
+    // stage a lost update — a correct implementation would block the second
+    // writer on the lock, which deadlocks against releasing the first one.
+
+    fn d03_reset_vault_creations() {
+        vault_creations()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    fn d03_vault_creation_count() -> usize {
+        vault_creations()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    #[test]
+    fn test_vault_rmw_lock_is_alive_at_the_checkpoint() {
+        for label in ["save_secret_value", "delete_secret_value"] {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            configure_local_secret_storage_for_test();
+            save_secret_value("K1", "v1").unwrap();
+            save_secret_value("K2", "v2").unwrap();
+
+            let probe = probe_lock_at_checkpoint("vault_rmw_enter", local_vault_tx(), move || {
+                if label == "save_secret_value" {
+                    save_secret_value("K3", "v3")
+                } else {
+                    delete_secret_value("K2")
+                }
+            });
+
+            assert_named_lock_probe(label, &probe, LockVerdict::LockHeld);
+
+            // Trailing state check. It carries no killing power - it passes
+            // under every mutant this test targets - and is here only to show
+            // the command did what it was asked.
+            assert_eq!(load_secret_value("K1").unwrap(), "v1");
+        }
+    }
+
+    #[test]
+    fn test_unlock_lock_is_held_before_the_existence_check() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        clear_secret_vault_session();
+        d03_reset_vault_creations();
+
+        // Brand new HOME: the vault does not exist, so the child is about to
+        // take the `None` branch. Holding the lock only around that branch is
+        // not enough - the decision to enter it is the TOCTOU.
+        let probe = probe_lock_at_checkpoint("vault_unlock_enter", local_vault_tx(), || {
+            unlock_local_secret_storage("test-passphrase")
+        });
+
+        assert_named_lock_probe("unlock", &probe, LockVerdict::LockHeld);
+
+        // Serial second unlock: proves the follow-up took the `Some` branch.
+        // Like the check above it carries no killing power for this invariant.
+        unlock_local_secret_storage("test-passphrase").unwrap();
+        assert_eq!(
+            d03_vault_creation_count(),
+            1,
+            "the vault was created more than once"
         );
     }
 }
