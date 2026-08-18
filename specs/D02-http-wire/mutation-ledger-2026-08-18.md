@@ -83,7 +83,7 @@ W（生产调用点）14 个，其中 RED 9、存活 5。
 | `WIRE_NONORM` | W | 25,26,27,29,30 | VERIFIED | `test_bearer_auth_replaces_manual_authorization_header`, `test_form_data_sends_single_content_type_with_real_boundary`, `test_form_urlencoded_keeps_user_content_type`, `test_json_body_keeps_user_content_type` |
 | `WIRE_NOFINISH` | W | 42,43 | VERIFIED | `test_bearer_auth_replaces_manual_authorization_header`, `test_execute_request_with_zero_budget_sends_nothing`, `test_form_data_sends_single_content_type_with_real_boundary`, `test_form_urlencoded_keeps_user_content_type`, `test_json_body_keeps_user_content_type` |
 | `WIRE_DEADLINE_CONST` | W | 42,43 | VERIFIED | `test_execute_request_honours_a_small_budget`, `test_execute_request_with_zero_budget_sends_nothing` |
-| `WIRE_PROBE_CONST` | W | 41 | 存活 | — |
+| `WIRE_PROBE_CONST` | W | 41 | **重分类：缺陷，非缺口** | — （见文末修订：补丁为语义空操作，掩盖了一个已发布的 bug）|
 | `WIRE_DECODE_BYPASS` | W | 44 | 存活 | — |
 | `WIRE_DECODE_NOCHECK` | W | 44 | 存活 | — |
 | `WIRE_NOBLOCKING` | W | 49 | 存活 | — |
@@ -141,3 +141,93 @@ W（生产调用点）14 个，其中 RED 9、存活 5。
 Auth 面板同时设值，于是 `insert`（1 个值）与 `append`（2 个值）可区分。重跑该 mutant：**RED**。
 
 这是本台账唯一一条「测试存在、覆盖率真实、唯一没被证明的恰恰是它要区分的那件事」。
+
+---
+
+# 评审 R1 后的修订（2026-08-18，晚）
+
+## 一条分类被推翻：`WIRE_PROBE_CONST` 不是缺口，是 bug
+
+本台账原先写：
+
+> `WIRE_PROBE_CONST` 把常量而非 `probe_budget(...)` 传给探测 —— 存活 —— 预期，冻结前已登记（缺口 #5）
+
+**这条分类是错的。** 独立评审逐行追参数流后发现：调用点算了预算并传进 `measure_connection_timings`，
+但那个预算只到达外层 timeout；真正干活的 `probe_connection` **根本不接收预算**，
+地址循环里写死 `CONNECTION_PROBE_MAX`。预算在三行之间确定性丢失。
+
+后果正落在这条切分存在的意义上：总预算剩 2 秒、解析到两个地址时，
+第一个地址仍按常量拿到 2.5 秒份额，外层 2 秒 timeout 先到，**第二个地址永远没有机会被尝试**。
+
+而那个 mutant 之所以存活，是因为**它把「传常量」打进了一份本来就在传常量的代码里**——
+补丁在语义上是空的。而且在全部用例里 `probe_budget(...)` 恰好等于 `CONNECTION_PROBE_MAX`
+（预算总是 30 秒，`min(5s, 30s) == 5s`），所以连外层 timeout 都没有差别。
+
+**已修**：预算穿透到 `probe_connection`，DNS 耗时从同一份预算里扣，剩余部分再按地址公平切分。
+新增 `test_probe_connection_hands_the_callers_budget_to_the_addresses`，注入 connect 步骤、
+断言每个地址实际拿到的预算。把原缺陷重新打回去：**恰好该一条用例变红，其余全绿**。
+
+## 这是一个此前没有枚举过的失败形态
+
+变异台账的价值主张是「存活 ⇒ 那段代码没被测到」。存在第三种可能：
+
+> **存活 ⇒ 补丁是空操作 ⇒ 生产代码已经具有该 mutant 的行为 ⇒ 那不是缺口，那是 bug。**
+
+**光看 `SURVIVED` 这个信号区分不了这三种**，必须去看补丁到底改变了什么。
+本轮之所以发现，靠的是独立评审逐行读参数流，不该依赖运气。
+
+harness 已加 P14 守卫：拒绝运行 patch 为空、锚点不唯一、或写回后文件未变的 mutant，
+这类情况打印 `REFUSED(...)` 而不是产生任何三态结论。
+
+## 另外四个存活已按同一把尺子复查
+
+逐个确认**生产代码并不具有该 mutant 的行为**，即补丁确实改变了语义：
+
+| mutant | 生产代码现状（行号为复查时） | 结论 |
+|---|---|---|
+| `WIRE_DECODE_BYPASS` | `run_decode_within_budget(decode_budget, decode)` 确实在调用链上（`:2635`） | 真缺口，非空补丁 |
+| `WIRE_DECODE_NOCHECK` | `ensure_budget_remaining(...)` 确实在 spawn 之前（`:2619`） | 真缺口，非空补丁 |
+| `WIRE_NOBLOCKING` | `spawn_blocking` 确实包着解码（`:2626`） | 真缺口，非空补丁 |
+| `WIRE_TOVEC_OUTSIDE` | `bytes` 确实 move 进闭包、`to_vec()` 确实在闭包内（`:2627`） | 真缺口，非空补丁（owner 已独立核过源码） |
+
+四条都是「补丁改变语义、但没有任何用例能观察到」，与 `WIRE_PROBE_CONST` 的形态**不同**。
+
+## 九条补强断言的单塌验证
+
+评审指出八处「断言存在、但删掉被测的东西依然绿」。逐条补强后，用评审自己的变异复跑，
+每一条都**恰好只让一条用例变红**（单塌，P9）：
+
+| 变异 | 层 | § | 变红的用例 |
+|---|---|---|---|
+| 空 JSON 内容改为参与解析 | W | 33 | `test_json_body_that_is_only_whitespace_sends_no_body` |
+| `Undecodable` 分支返回空 `Vec` | H | 11 | `test_undecodable_encoding_preserves_the_original_bytes_and_length` |
+| 解码错误丢掉底层原因 | H | 13 | `test_corrupt_stream_error_carries_the_underlying_cause` |
+| 剥掉用户提供的 `Accept-Encoding` | W | 16 | `test_user_supplied_accept_encoding_is_sent_unchanged` |
+| 生产路径不把 Content-Type 传给解码器 | W | 17 | `test_declared_charset_is_honoured_through_the_request_path` |
+| binary body 自动加 Content-Type | H | 28 | `test_binary_and_none_bodies_add_no_content_type` |
+| basic 不参与 Authorization 收敛 | H | 29 | `test_basic_auth_replaces_a_manual_authorization_header` |
+| api-key 也参与 Authorization 收敛 | H | 30 | `test_api_key_mode_leaves_a_manual_authorization_header_alone` |
+| 地址循环忽略调用方预算（**已发布的缺陷**） | H | 38,41 | `test_probe_connection_hands_the_callers_budget_to_the_addresses` |
+
+其中「api-key 也参与收敛」**第一次仍然存活**：补强后的用例只放了**一行**手写 `Authorization`，
+而 keep-last 把 1 个值收敛成 1 个值是不可观察的——与最初 `KAPIKEY` 逃脱的是同一个陷阱，
+在同一轮里又犯了一次。改成两行后变红。
+
+## 映射表里一个不存在的测试名
+
+`TECH.md` 提到 59 个不同测试名，其中 **`test_execute_flow_attaches_the_remaining_budget` 在仓库中不存在**。
+它是规格 §4.6 里**模型 crate** 的接线用例名，从未移植到真实代码；
+真实代码里的对应物是 `test_request_timeout_is_taken_from_the_remaining_budget`（存在且通过）。
+规格已冻结，此处只记录，不擅改。
+
+## 修订后的计数
+
+| 三态 | 数量 |
+|---|---|
+| VERIFIED | 60（原 52 + 本轮 9，减去 `WIRE_PROBE_CONST` 由「存活」重分类） |
+| DESIGNED | 0 |
+| INCONCLUSIVE | 0 |
+| 存活（真缺口） | 4 |
+| **重分类为缺陷** | **1**（`WIRE_PROBE_CONST`） |
+
+测试数：main 基线 81 → 本切片 142。
