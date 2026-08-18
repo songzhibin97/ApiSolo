@@ -32,7 +32,7 @@ function mountBar() {
  * correct while the wire itself is cut, which is exactly what happened — this
  * pair of cases exists because both mutations below survived all 313 tests.
  */
-describe("§8/§12 the field renders the draft, not the value handed back to it", () => {
+describe("§8 wiring: the field renders the draft, not the value handed back to it", () => {
   beforeEach(() => {
     reconcile.mockClear()
   })
@@ -52,6 +52,9 @@ describe("§8/§12 the field renders the draft, not the value handed back to it"
     )
   })
 
+})
+
+describe("§7 wiring: the variable hint is computed from the draft", () => {
   it("reads the variable hint off the draft", async () => {
     const wrapper = shallowMount(UrlBar, {
       props: { method: "GET" as const, url: "https://x/a?b=1", tabId: "t", urlRevision: 0 },
