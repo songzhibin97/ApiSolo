@@ -109,6 +109,20 @@
 | `lib.rs:2189` | low | `ws_suppressed_disconnect_pool` 在打包版永久增长 |
 | `useKeyboard.ts:28` | low | WS tab 上 Cmd+Enter 触发 HTTP 请求，错误不可见 |
 
+**注意**：上表的 `lib.rs` 行号在 D01 合并后已整体偏移约 80 行，按行号定位会落空。D04 规格里有一份符号→当前行号的对照表，以符号名定位。
+
+### D04 规格阶段新发现（7 条，评审文档里没有，owner 已采纳）
+
+| 位置 | 严重度 | 问题 |
+|---|---|---|
+| `ws_disconnect` | **high** | 跨 `sender.send(Close).await` 持 `ws_pool` 互斥锁：**一个挂死的对端冻结全部 WS 操作**。评审只找到「不杀 reader」那一半 |
+| `ws_send` | high | 同一形状：锁跨网络 I/O |
+| Connect 按钮 | **high** | 连接中被禁用，**挂死的握手根本没有取消入口**——后端可取消而用户按不到，是「UI 不许说谎」的镜像版 |
+| `ws_drain_events` | med | `entry().or_default()` 每次浏览器模式断连泄漏一个空队列项——与已归档的 suppressed-pool 同类，另一张 map |
+| `connect_async` | med | 无握手预算，可无限期挂起 |
+| `closeOtherTabs` / `closeTabsToRight` | med | 与已归档的 `removeTab` **同一个陈旧快照 bug**——归档了缺陷没扫同类 |
+| `ws_status` | low | 死代码，且会把 pending 槽报成 "connected"。**删除，不要修** |
+
 ---
 
 ## D05 — UI 交互缺陷
@@ -197,6 +211,8 @@
 | A16 | D06 的 i18n key 归属与数量 | **改判归 D05；数量由 6 更正为 7** | A2 原裁定归 D06，但 **D06 合并时一个都没落地**（其 merge commit 未触碰任何 `src/i18n/**`），D01 也没有。既然 D05 无论如何都要动 i18n 且承载全部三条交接，由它一并落地。数量更正：backlog 的「6 个」只数了 `curlImport.*`，漏了 `export.warning.fileContentNotExportable` |
 | A17 | `deleteEntry` 死代码的归属 | **归 D07a**，不归 D05 | D01 的 non-goals 把「历史单条删除 UI」推给「D05 / D07」，而 D05 的表里从未列入。D07a（从历史保存到集合）本来就要改 `HistoryPanel` 的行结构，一并接上更自然 |
 | A18 | D04 与 D05 在 `src/stores/tabs.ts` 上冲突 | **D05 先，D04 后** | 两者写同一文件的不同函数，必须串行。D05 承载 D06 的发布阻断依赖，优先级更高 |
+| A23 | D04 与 D05 在 `src/components/**` 上冲突 | **WS 专属面板归 D04**，其余 `src/components/**` 仍归 D05 | backlog 给 D05 独占 `src/components/**`，却把 `WSMessagePanel.vue` 派给 D04。**这是 owner 第四次画错边界，四次同一个毛病：按缺陷所在的位置画，而不是按「修它要动什么」画**（前三次见 A11 / A13 / A15）。<br>**核实**：owner 已 grep D05 的 58 条规格，**无一条引用 WS 面板**，边界不冲突 |
+| A24 | D04 显式声明 `tokio` 的 `time` feature | **批准**，限该声明 + `Cargo.lock` | 同 A11。目前 `time` 由 axum + reqwest 传递启用——**传递得来的 feature 不是契约**：上游调整 feature 集合会让超时凭空消失且**不产生编译错误**，属最坏的一类失败 |
 
 ### 已发布缺陷（main 上，D06 合并后发现）
 
