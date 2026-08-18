@@ -1,5 +1,13 @@
 # 桌面版手工测试清单 — 2026-08-18
 
+> **勘误 1（2026-08-18，owner）—— T19 第 7 步的期望值本来是错的。**
+>
+> 初版写 `--data-urlencode 'q=a b&c'` 的正确输出是 `q=a%20b%26c`。**这是错的**，真实输出是 `q=a+b%26c`。
+>
+> 验证方式：本机 `curl --libcurl` 实跑 curl 8.7.1，得到 `CURLOPT_POSTFIELDS, "q=a+b%26c"`。curl 在 `curl_easy_escape` 之后会再调用 `replace_url_encoded_space_by_plus`，把编码出来的 `%20` 转成 `+`。
+>
+> 错误源头是 `REVIEW-2026-08-18.md` 的对应条目（见该文件顶部勘误），本清单照抄了它。**若不修正，按本清单验收会把一个正确的实现判为失败。**
+
 按优先级执行。P0 = 确认真实的用户可见 bug；P1 = 确认疑似 bug；P2 = 回归安全网。
 
 每条给出「正常应该怎样 / 有 bug 会怎样」，你只要照着点、照着看即可。
@@ -754,7 +762,7 @@ C. 关 tab 时的索引竞态（仍用 rude 模式，服务端不读数据）：
 10. URL 栏改成 {{baseUrl}}/users，再「复制为 cURL」，粘出来看。
 11. 粘贴 curl -H 'Accept: application/json'（整条命令里没有 URL）到空的 URL 栏，观察发生了什么。
 
-**正常表现**：1/2：报错或提示无法解析，URL 与方法都不被破坏。3/4：两种写法都得到 GET。5：请求体是文件引用并在发送时明确报错（与第 6 条一致）。7：正文是 q=a%20b%26c。8：只有一行 Cookie: b=2（与真 curl 一致）。9：复制出的命令里 q=cat 只出现一次。10：复制出 curl '{{baseUrl}}/users'。11：文本被正常粘贴进 URL 栏，或弹出明确的解析失败提示。
+**正常表现**：1/2：报错或提示无法解析，URL 与方法都不被破坏。3/4：两种写法都得到 GET。5：请求体是文件引用并在发送时明确报错（与第 6 条一致）。7：正文是 `q=a+b%26c`（**空格是 `+` 不是 `%20`** —— 真 curl 在百分号编码之后会把 `%20` 再转成 `+`；本文件初版写的 `%20` 是错的，见顶部勘误）。8：只有一行 Cookie: b=2（与真 curl 一致）。9：复制出的命令里 q=cat 只出现一次。10：复制出 curl '{{baseUrl}}/users'。11：文本被正常粘贴进 URL 栏，或弹出明确的解析失败提示。
 
 **有 bug 的表现**：1：URL 栏变成字面量 PURGE，方法仍是 GET，真实 URL 被丢弃且无任何报错。2：URL 变成 pos。3：方法变成 POST（405 现场）；4：同语义的命令却得到 GET —— 结果依赖 flag 顺序。5：请求体是字面量 @payload.json，发送后服务端收到 13 字节的 @payload.json 字符串。7：正文是未编码的 q=a b&c，服务端会解析出两个参数。8：出现两行 Cookie，报文里也是两行（真 curl 只发一行）。9：复制出 curl 'https://api.example.com/s?q=cat&q=cat'，参数重复。10：复制出 curl '/%7B%7BbaseUrl%7D%7D/users'，主机名没了，粘到终端直接 URL rejected。11：粘贴内容凭空消失，URL 栏依旧为空且无任何错误提示。
 
@@ -807,7 +815,7 @@ PY
 以下这些完全不需要在真机 UI 里手测，应当固化为自动化测试；手测清单里保留它们只是因为当前仓库还没有对应用例，且部分需要先确认真机行为。
 
 **前端 vitest（已有目录，直接加文件/用例）**
-- `src/utils/__tests__/curl-parser.test.ts`（已存在）：T11 的 `$'...'` ANSI-C 解码（断言 header key 不以 `$` 开头、`\r\n` 被解码、authorization 被提取进 auth）；T19 的 `-X PURGE` / `-X pos`（断言抛错或方法/URL 都不被破坏）、`-X GET -d` 两种 flag 顺序都得到 GET、`-d @file` 与 `--data-binary @file` 行为一致、`--data-urlencode` 输出 `q=a%20b%26c`、`-b` 与 `-H 'Cookie:'` 同时存在时只保留 `-H` 那条。
+- `src/utils/__tests__/curl-parser.test.ts`（已存在）：T11 的 `$'...'` ANSI-C 解码（断言 header key 不以 `$` 开头、`\r\n` 被解码、authorization 被提取进 auth）；T19 的 `-X PURGE` / `-X pos`（断言抛错或方法/URL 都不被破坏）、`-X GET -d` 两种 flag 顺序都得到 GET、`-d @file` 与 `--data-binary @file` 行为一致、`--data-urlencode` 输出 `q=a+b%26c`（见顶部勘误）、`-b` 与 `-H 'Cookie:'` 同时存在时只保留 `-H` 那条。
 - `src/utils/__tests__/curl-export.test.ts`（已存在）：T19 第 9/10 步——`{{baseUrl}}/users` 导出后不含 `%7B%7B`、host 不丢失；导入后 url 仍带 query 时导出不重复参数。
 - `src/utils/__tests__/openapi-import.test.ts`（已存在）：自引用 `$ref`（`Node.child -> Node`）不再抛 `RangeError`，且同文件里无关的 `/health` 端点仍能被导入（这条我从手测清单里删掉了，因为纯逻辑、无 UI 依赖）。
 - `src/stores/__tests__/request.test.ts`（已存在）：T13 全部可断言——`redactSensitiveText("Authorization: Basic dXNlcjpwYXNzd29yZA==")` 的输出 `not.toContain("dXNlcjpwYXNzd29yZA==")`；该函数幂等（跑两遍结果相同）；JSON 输入脱敏后仍 `JSON.parse` 得通；`grant_type=password&password=p&client_secret=xyz` 脱敏后仍保留 `client_secret` 字段名；`isSensitiveKey("accessToken"/"clientSecret"/"Ocp-Apim-Subscription-Key")` 为 true；`buildHistoryEntry` 产出的 `url` 字段不含明文敏感 query 值。注意现有断言只写了 `toContain("[redacted]")`，正是它让套件保持绿色——新用例要断言「敏感值不存在」而不是「出现了 redacted 字样」。
