@@ -4,6 +4,10 @@
 
 来源：`docs/review/REVIEW-2026-08-18.md`（49 条提出 / 43 条通过对抗性验证）+ `docs/review/Q1-cookie-redaction.md` + `docs/review/Q2-history-annotations.md`。
 
+> **勘误（owner，D01 spec 阶段）**：下表各切片里写的 `REVIEW #n` 编号整体偏移 +2（如 D01 的 `#29` 实为报告 §27）。定位一律以 `file:line` 为准，不以编号为准。
+>
+> **勘误 2**：D01 的 `Q1 #4` 描述有一半不成立。「重放时 URL 栏显示真值」不可复现——`RequestPanel.vue:466` 传给 UrlBar 的是 `buildUrlWithParams(activeTab.url, activeTab.params)`，`splitUrlParts`（`:435`）已先剥掉 `tab.url` 的 query。可证实的部分只有：`url: tab.url` 原样落盘（`request.ts:460`），并被 `HistoryPanel.vue:64` 与 `tabs.ts:499` 显示出来。修复目标相应改为「落盘脱敏 + 面板/标签仍可辨认」。
+
 流程：`owner-pipeline` skill。owner 调度 + 亲验，subagent 实现，codex 独立评审。
 
 ## 状态图例
@@ -24,7 +28,12 @@
 
 排序理由：D01 是用户亲历的 bug 且踩在「UI 不许说谎」红线上；D02 影响每一个请求的正确性；D03 是数据丢失（最贵的回归）；D04–D06 依次递减；D07 是新功能，排在债务之后。
 
-并行约束：D01/D02/D03/D04 都写 `src-tauri/src/lib.rs`，**必须串行**。D05（纯组件）与 D06（纯 utils）文件不重叠，可与 Rust 切片并行。
+并行约束（按文件独占切分，owner 维护）：
+
+- D01/D02/D03/D04 都写 `src-tauri/src/lib.rs`，**必须串行**。
+- **D06 独占 `src/utils/**`**（curl-parser / curl-export / postman-* / openapi-import）——与 D01 无交集，可并行。D01 新建的 `src/utils/redaction.ts` 是新文件，不冲突。
+- **D05 独占 `src/components/**` 中除 `KeyValueEditor.vue` 外的部分**，且因 D01 也改 `RequestPanel.vue`，**D05 必须排在 D01 之后**。
+- 原属 D06 的 `RequestPanel.vue:225` 已移入 D05，以保住 D06 的 `src/utils/**` 文件独占边界。
 
 ---
 
@@ -112,6 +121,7 @@
 | `UrlBar.vue:51` | med | 回车不判在途请求，重复发送 |
 | `HistoryPanel.vue:230` | med | 分组按 label 做 key，模板 URL 下不唯一 |
 | `src/stores/tabs.ts:411` | med | `openHistoryEntry` 劫持已打开的 saved-request tab，丢失其项目绑定 |
+| `RequestPanel.vue:225` | med | cURL 导入后 query 同时留在 `tab.url` 和 params，导出时重复（**owner 从 D06 移入**：修复点在 `applyCurlImport` / `applyPastedCurl`，属 `RequestPanel.vue`，与 D06 的 `src/utils/**` 文件独占边界冲突） |
 | `RequestPanel.vue:251` | low | 粘贴无法解析的 cURL 静默丢弃 |
 | `DebugConsole.vue:20` | low | level 过滤缺 info 选项，标签绕过 i18n |
 | `src/stores/console.ts:119` | low | `recordConsoleEntry` 全局重绑 activePinia |
@@ -128,12 +138,36 @@
 | `curl-parser.ts:39` | med | 无法识别的 `-X` 方法变成请求 URL，真 URL 被丢弃 |
 | `curl-parser.ts:82` | med | 显式 `-X GET` 在存在 data 标志时被改写成 POST |
 | `curl-parser.ts:72` | med | `-d @file` 与 `--data-urlencode` 原样复制 |
-| `RequestPanel.vue:225` | med | cURL 导入后 query 同时留在 `tab.url` 和 params，导出时重复 |
 | `curl-export.ts:44` | med | Copy as cURL 破坏含 `{{变量}}` 的 URL |
 | `openapi-import.ts:300` | med | 自引用 `$ref` 无限递归，整个导入中止 |
 | `curl-parser.ts:113` | low | `-b` 与 `-H 'Cookie:'` 各自 push，产生两行 Cookie（真 curl 只发一行） |
 | `curl-parser.ts:146` `:411` | 已知债 | Basic 认证密码含冒号被截断 |
 | `postman-export.ts:242` `:129` | 已知债 | 内存态文件静默降级成伪路径 |
+
+### D06 spec 阶段的增补（owner 裁定）
+
+起草者实跑验证后，发现四处代码与 review 文档不符或超出其描述，**均已吸收进 D06**（同一批函数，拆开反而制造冲突）：
+
+1. `curl-export.ts` 破坏的是**任何**无协议头的 URL，不止含模板的：`api.example.com/users` → `curl '/api.example.com/users'`，host 直接丢失。review 只描述了模板那一种。
+2. **review 完全没发现的新缺陷**：`postman-export.ts` 的 `buildRawUrl` 把 query 拼在 fragment **之后** —— `https://api.example.com/a#frag` + `k=v` → `…/a#frag?k=v`，非法 URL。
+3. Basic 认证债有第二种、对中文用户更严重的形态：`atob` 不做 UTF-8 解码，`用户:密码` 解出乱码。
+4. backlog 的 low 行只点名 `-b`，但 `-A`/`-e` 是完全相同的缺陷，`-u` 与 `-H 'Authorization:'` 之间还存在顺序依赖。
+
+另：`postman-export.test.ts:140-144` **当前在断言这个 bug**（对内存态文件断言 `src === "hello.txt"`）。这是 D06 唯一一处需要改写既有断言的地方。
+
+`curl-parser.ts:113`（`-b` 与 `-H Cookie` 重复）在 `REVIEW-2026-08-18.md` 里没有对应的编号条目，它来自 `TEST-CHECKLIST-2026-08-18.md` T19 第 8 步——backlog 先前标注的出处对这一项不完整。
+
+### D06 → 其他切片的交接（owner 裁定）
+
+| 交接 | 内容 | 归属 |
+|---|---|---|
+| C1 | `RequestPanel.vue:222/241` cURL 导入后 query 同时留在 url 与 params 的**根因** | D05（D06 只吸收导出侧症状：两个导出器都以 params 为 query 唯一来源，用户可见的重复因此消失） |
+| C2 | `applyPastedCurl` 静默吞掉解析失败 | D05（已在 D05 列为 `RequestPanel.vue:251`） |
+| C3 | 渲染 `parsed.warnings` | D05 |
+| C4 | 在 `CollectionPanel.vue:303` 调用 `collectPostmanExportWarnings` | D05 |
+| C5 | 6 个新 i18n key + 修 `importCurlDescription` | **owner 改判：归 D06 自己**。原提案推给 D01，但那会让 D01 携带一批自己不使用的 key——正是 doc-drift 纪律要杜绝的死键。D06 实现排在 D01 合并之后，届时对 i18n 文件是纯追加编辑，冲突可控 |
+| C6 | `buildUrlWithParams` 改为复用 D06 新增的 `encodeQueryComponentPreservingTemplates`，而不是长出第 4 份拷贝 | D05 |
+| C7 | README 写明「绝不按路径读 `@file`」这条边界 | **owner 裁定归 D06**：这是 D06 自己引入的产品边界，按项目硬规则「决策必须落到 README 和 UI」，谁引入谁写 |
 
 ---
 
