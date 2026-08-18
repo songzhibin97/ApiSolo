@@ -37,14 +37,15 @@ describe("§8/§12 the field renders the draft, not the value handed back to it"
     reconcile.mockClear()
   })
 
-  it("keeps showing what was typed after a re-render", async () => {
+  it("keeps showing what was typed", async () => {
     const wrapper = mountBar()
-    await wrapper.find("input").setValue("https://x/a?q=a%20b")
 
-    // The re-render matters and must not be tidied away. Binding the field to
-    // `props.url` only overwrites the text when Vue patches the element, so
-    // without a render in between, a cut wire still looks intact.
-    await wrapper.setProps({ method: "POST" as const })
+    // The keystroke alone is enough to expose a cut wire: the draft is a render
+    // dependency, so changing it re-renders, and a field bound to `props.url`
+    // gets patched back to it right there. Measured, not assumed — an earlier
+    // version of this case forced an extra render on the belief that one was
+    // needed, and the mutant dies either way.
+    await wrapper.find("input").setValue("https://x/a?q=a%20b")
 
     expect((wrapper.find("input").element as HTMLInputElement).value).toBe(
       "https://x/a?q=a%20b",
