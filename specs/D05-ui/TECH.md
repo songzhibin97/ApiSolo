@@ -1,18 +1,18 @@
 # D05 — UI 交互缺陷（TECH）
 
-> **rev3 — 应 R1 完整修订（4C + 4I）**。rev2 只回应了 4C + 1I。行为定义见 `PRODUCT.md`（**52** 条不变式）。分支 `songzhibin/d05-ui`，起点 `origin/main@dfb2d2e`。
+> **rev4 — 应 R2 修订（4C + 1I）**。行为定义见 `PRODUCT.md`（**58** 条不变式）。分支 `songzhibin/d05-ui`，起点 `origin/main@dfb2d2e`。
 >
 > 本轮改动区域逐项枚举：
 >
-> | R1 项 / 裁定 | 本文改动区域 |
+> | R2 项 | 本文改动区域 |
 > |---|---|
-> | **I2** `sameParse` 分不清 self-echo 与语义相同的外部更新 | 新增 0.9（实跑复现 + 修法验证）；2.4 的协调器改为 **revision 信号**，`sameParse` **整个删除**；2.9 新增 `updateTab` / `updateTabFromUrlBar` 的默认安全设计；映射表 §6 / §8 / §9 / §10 |
-> | **I3** i18n 数量与本地化行为不完整 | 新增 0.10（两处硬编码英文 detail 的实读）；2.6 三类 parser error 改稳定 code；映射表新增 §30、§34；4.7 登记对交接清单的偏离 |
-> | **I4** `src/types/index.ts` 越界 + 逆向依赖 | 3.1 按裁定 A19 改写；2.2 / 2.6 把 `CurlImportWarningCode` / `CurlImportWarning` 移入 types 层（已核实全仓无第三方 importer，移动无涟漪） |
-> | **A19 / A20 / A21** | 3.1 与 4.1 由「申请」改写为**已裁定事实**；源码 gate 限定在 §22 / §47（rev2 编号的 §21 / §44） |
-> | 映射表 | 49 行 → **52 行**，与 PRODUCT 同轮对齐，脚本机械核对 |
+> | **C1** | 新增 0.11（Vue watcher 源的实跑）；2.5 给 `UrlBar` 加 `urlRevision` prop 并写进 watch 源；2.9 明确「方法切换不递增」；映射表新增 §12，§10 措辞收窄 |
+> | **C2** | 4.3 改**两阶段**自检并说明旧判据为何是 fail-open；4.1 补 A20 的第五类禁令（DOM 文本）；映射表 §34 的承重断言改为「注入的翻译函数被以该 key 调用 + 失败行条数」 |
+> | **C3** | 3.1 纳入裁定 **A22**（`README.md` / `README.zh-CN.md` / `AuthEditor.vue` + 1 个 locale key）；映射表新增 §5、§6 |
+> | **C4** | 新增 0.12（§14/§15 的四种实现实跑矩阵，**推翻 rev3 的 killer**）；映射表 §15 换 killer、§37 换断言、旧两条拆成 §45–§49；**4.6 整节重写为三态台账，不再解析表格** |
+> | **I** | 映射表新增 §56（逐字文案矩阵），并给出两条单塌 mutation |
 >
-> 全部 `file:line` 基于 `dfb2d2e` 实际读过的代码。来源评审文档的行号已过时，一律按符号定位。
+> 全部 `file:line` 基于 `dfb2d2e` 实际读过的代码。
 
 ## 0. 起草期的实跑记录
 
@@ -45,7 +45,7 @@ rev1 写的 20/276 是 `c9221d3` 上的数字；rebase 后 +1 来自另一切片
   probe > writes into the caller's pinia …          → 模块单例里出现了不该有的条目
 ```
 
-**承重性的如实限定（P9）**：去掉修复后，「条目出现在调用方 pinia 里」这一句**仍然通过**（activePinia 已被翻走，未绑定的 `useConsoleStore()` 解析到的正是被写入的那个模块单例）。真正承重的是另外两句，且**各自有单塌用例**：第一个用例只断言 `getActivePinia()` 身份（§48）；第二个用例的前一句通过、只塌「模块单例为空」（§49）。
+**承重性的如实限定（P9）**：去掉修复后，「条目出现在调用方 pinia 里」这一句**仍然通过**（activePinia 已被翻走，未绑定的 `useConsoleStore()` 解析到的正是被写入的那个模块单例）。真正承重的是另外两句，且**各自有单塌用例**：第一个用例只断言 `getActivePinia()` 身份（§54）；第二个用例的前一句通过、只塌「模块单例为空」（§55）。
 
 ### 0.6 rev1 的「起草期新发现」已作废（R1-C1）
 
@@ -61,7 +61,7 @@ rev1 记录的实测——`fileContent: null` 使 `!== undefined` 恒真、导�
 
 **「后端 `query_pairs_mut()` 把空格编码成 `+`」仍是推断，不是实跑。** 依据是它返回 `form_urlencoded::Serializer`。本工作树无预热 `target/`，冷编译 tauri 代价过大。**这条推断是 §2 的前提**，实现者必须在动 `buildUrlWithParams` 之前跑掉它（4.4-a）。若实测为 `%20`，§2 方向反转、改用 `encodeQueryComponentPreservingTemplates`，设计题二的结论随之改变。
 
-「WebKit 下 `:key` 变化导致输入框卸载、焦点掉到 `<body>`」来自来源评审文档的对抗性验证记录，**起草者未独立复现**；§15 的最终确认落在人工验收。
+「WebKit 下 `:key` 变化导致输入框卸载、焦点掉到 `<body>`」来自来源评审文档的对抗性验证记录，**起草者未独立复现**；§18 的最终确认落在人工验收。
 
 ### 0.8 后端 query 构造的完整读取（R1-C2 的依据）
 
@@ -122,6 +122,42 @@ warnings.push({ code: "authorization-not-byte-preserved", detail: "separator whi
 三个 throw 点同理：`Invalid cURL command.` / `Unsupported request method: X` / `Unable to find a request URL in the cURL command.` 全是英文字面量，其中只有第二个在交接清单里有 key。
 
 **另核实**：`grep -rn "CurlImportWarning" src/` 除 `curl-parser.ts` 自身外**零命中**，因此按 A19 把这两个类型移进 `src/types/index.ts` 是一次无涟漪的移动。
+
+### 0.11 Vue watcher 源的实跑（R2-C1）
+
+评审的复现成立，起草者独立跑了一遍（临时用例，跑完即删）：
+
+```
+REVISION-ONLY CHANGE -> without: 0  with: 1
+```
+
+即：只有 `revision` 变化时，监听 `[url, tabId]` 的 watcher **执行 0 次**，监听 `[url, tabId, revision]` 的执行 **1 次**。
+
+**rev3 的组件方案因此是坏的**：2.4 的纯函数收下了 `revision` 参数，2.5 的 `UrlBar` 却只加了 `tabId` prop、watch 源里也没有 revision。于是 I2 的原始形态换个位置复活——草稿 `%20` self-echo 之后 store 里已是规范的 `+`；随后一次 cURL 导入写入同样的 `+`、只改 revision，**渲染出的 URL 字符串一字未变**，watcher 不触发，界面继续挂着那份 `%20`。
+
+**教训写在这里**：`reconcileUrlBarValue` 的签名里有 `revision` ≠ 组件真的把 revision 传了进去。**纯函数正确 + 调用点未接 = P8**，而这正是本切片自己列为 HIGH 的那一类缺陷。它连着两轮从我手里溜过去，第一次在 rev2（判据错），第二次在 rev3（判据对、接线错）。
+
+### 0.12 §14 / §15 的实现矩阵（R2-C4，**推翻 rev3 的 killer**）
+
+rev3 声称「把守卫移到 `activeRequestIds.set` 之后」是 §15 的 killer 且「§14 仍绿」。**这是错的。** 起草者在真实 store 上跑了四种实现（临时探针，跑完即删，`git status` 已确认干净）：
+
+| 实现 | `send_request` 次数 | 落到 tab 上的响应 | `append_history` 次数 |
+|---|---|---|---|
+| 守卫在第一行（拟定实现） | 1 | `FIRST` | 1 |
+| 无守卫（今日 main） | 2 | `SECOND` | 1 |
+| **守卫移到 `set` 之后（rev3 的 killer）** | **0** | null | 0 |
+| **守卫早退但先改写追踪表（rev4 的 killer）** | **1** | null | 0 |
+
+第三行解释了 rev3 错在哪：`set` 之后 `has()` 恒为真，于是**每一次调用**都早退，后端一次也没被调到——§14 的「恰好一次」断言同样变红。那不是一个只塌 §15 的 fixture，而且它也不是任何人会写出来的实现。
+
+第四行是 rev4 采用的 killer，**一次单行改动**：
+
+```ts
+- if (activeRequestIds.has(tab.id)) { return }
++ if (activeRequestIds.has(tab.id)) { activeRequestIds.set(tab.id, crypto.randomUUID()); return }
+```
+
+它是一个**真实的实现者会犯的错**（「早退时顺手记一下最新的尝试」），并且实测 `send_request` 仍然恰好一次（§14 绿）、第一次的响应与历史双双消失（§15 红）。**单塌成立，且是实跑出来的，不是推断出来的。**
 
 ## 1. Context
 
@@ -246,7 +282,25 @@ export function reconcileUrlBarValue(
 
 ### 2.5 `src/components/request/UrlBar.vue`
 
-新增 prop `tabId`；`draft` + `draftTabId` 两个 ref，`watch([() => props.url, () => props.tabId])` 里调 `reconcileUrlBarValue`；`<input :value="draft">`；`detectedVariables` 改读 `draft`；`onKeydown` 增加 `if (props.isLoading) { return }`；`onPaste` 改为：
+新增两个 prop：`tabId` 与 **`urlRevision`**。**watch 的源必须三者齐全**——0.11 实测漏掉 revision 会让「URL 字符串不变、来源已变」这一类整个观测不到：
+
+```ts
+const draft = ref(props.url)
+const seen = ref({ tabId: props.tabId, revision: props.urlRevision })
+
+watch(
+  () => [props.url, props.tabId, props.urlRevision] as const,   // ← 三个源缺一不可
+  ([url, tabId, revision]) => {
+    draft.value = reconcileUrlBarValue(
+      { tabId: seen.value.tabId, revision: seen.value.revision, draft: draft.value },
+      { tabId, revision, url },
+    )
+    seen.value = { tabId, revision }
+  },
+)
+```
+
+`<input :value="draft">`；`detectedVariables` 改读 `draft`；`onKeydown` 增加 `if (props.isLoading) { return }`；`onPaste` 改为：
 
 ```ts
 const decision = interpretPastedText(text)
@@ -302,6 +356,8 @@ function updateTabFromUrlBar(id, updates)  // 唯一不递增的路径，仅供 
 
 任何新写入点走普通 `updateTab` 就自动拿到正确行为；**忘记的后果是「多采纳一次」（草稿被规范形式替换，纯外观），而不是「少采纳一次」（界面显示已不存在的旧串）。失败方向是安全的**——这正是 P8 说的、把缺陷做成难以表达，而不是靠测试去追。
 
+**方法切换不递增**：`updateMethod` 的 updates 里既没有 `url` 也没有 `params`，因此按上面的规则天然不触发递增——这正是想要的。方法切换不改变 URL，用户正在编辑的草稿理应原样留着；把它当成外部写入会无故清掉那份草稿。§10 已相应删去「方法切换」这一项。
+
 `urlRevision` 与 `importNotice` 一样是纯内存态，不进任何持久化负载。
 
 ### 2.10 其余改动点
@@ -327,6 +383,7 @@ function updateTabFromUrlBar(id, updates)  // 唯一不递增的路径，仅供 
 - **A15**：D05 的范围扩至 `src/stores/**`、`src/utils/**`、`src/i18n/**`。
 - **A19**：`src/types/index.ts` **加入该范围**，并把 `CurlImportWarningCode` / `CurlImportWarning` 移到 types 层，由 parser 与 `Tab` 共同导入，消除 types → utils 的逆向依赖。rev2 在这里有一个漏洞：它规定了 `Tab.importNotice` 与 branded `HistoryGroupId`，**两者都必然要改 `src/types/index.ts`**，而 A15 并未覆盖该文件。
 - **A20**：批准 `@vue/test-utils` + `happy-dom` 作为 devDependency，限定同 A11 / A13——**仅限该声明**。
+- **A22**：`README.md`、`README.zh-CN.md`、`src/components/request/AuthEditor.vue` 及对应的 locale key **加入 D05 范围**。理由是 §4 建立了一个刻意的显示/生效分叉（query API key 上线但不进地址栏），而项目硬规则要求决策必须同时落到 README 与 UI——否则用户无法区分「安全设计」与「功能失效」，下一轮扫描也可能把密钥重新拼回地址栏。
 - `src-tauri/**` 一个字不动。
 
 **仍未实证的一点**：起草者**无法在本工作树验证安装**——`node_modules` 为空，`vue` 解析到父仓库，`@vue/test-utils` / `happy-dom` / `jsdom` 三者 `require.resolve` 全部 MISSING。裁定解决的是**许可**，不是**可行性**；4.3 的 harness 自检仍是它的 fail-closed 前置。
@@ -351,23 +408,26 @@ function updateTabFromUrlBar(id, updates)  // 唯一不递增的路径，仅供 
 
 | 来源 | 位置（按符号） | 不变式 |
 |---|---|---|
-| D05 high | `EnvironmentPanel.vue` 的 `rows` | 15–19 |
-| D05 high | `buildUrlWithParams` + `UrlBar.detectedVariables` | 1–10 |
-| D05 med | `UrlBar.onKeydown` | 11–14 |
-| D05 med | `HistoryPanel` 的折叠状态 + `history-grouping.ts` | 20–22 |
-| D05 med | `tabs.openHistoryEntry` | 23–24 |
-| D05 med（从导入导出切片移入） | `RequestPanel.applyCurlImport` / `applyPastedCurl` | 25–27 |
-| D05 low | 同上（空 catch） | 28–32 |
-| D05 low | `DebugConsole.filterOptions` | 44–47 |
-| D05 low | `console.recordConsoleEntry` | 48–49 |
-| 交接 B1 | `UrlBar.onPaste` + 空 catch | 28–32 |
-| 交接 B2 | `parseCurl` 的 `warnings` 无渲染点 | 33–40 |
-| 交接 B3 | `collectPostmanExportWarnings` 无调用点 | 41–43 |
-| 交接（i18n，裁定 A16） | 6 个继承 key + 13 个新 key + `importCurlDescription` | 50–52 |
-| R1-I2 | `reconcileUrlBarValue` 的判据 | 9 |
-| R1-I3 | 三个 parser throw 点 + `storeAuthorizationValue` 的散文 detail | 30, 34 |
+| D05 high | `EnvironmentPanel.vue` 的 `rows` | 18–22 |
+| D05 high | `buildUrlWithParams` + `UrlBar` 的协调与提示 | 1–4, 7–13 |
+| D05 med | `UrlBar.onKeydown` | 14–17 |
+| D05 med | `HistoryPanel` 折叠状态 + `history-grouping.ts` | 23–25 |
+| D05 med | `tabs.openHistoryEntry` | 26–27 |
+| D05 med（从导入导出切片移入） | `RequestPanel` 的两条导入路径 | 28–30 |
+| D05 low | 同上（空 catch） | 31–35 |
+| D05 low | `DebugConsole.filterOptions` | 50–53 |
+| D05 low | `console.recordConsoleEntry` | 54–55 |
+| 交接 B1 | `UrlBar.onPaste` + 空 catch | 31–35 |
+| 交接 B2 | `parseCurl` 的 `warnings` 无渲染点 | 36–43 |
+| 交接 B3 | `collectPostmanExportWarnings` 无调用点 | 44–49 |
+| 交接（i18n，裁定 A16） | 6 继承 + 14 自有 key | 56–58 |
+| R1-I2 | `reconcileUrlBarValue` 的判据 | 11 |
+| R1-I3 | 三个 parser throw 点 + 散文 detail | 33, 37 |
+| R2-C1 | `UrlBar` 未接 `urlRevision` | 12 |
+| R2-C3（裁定 A22） | 两个 README + `AuthEditor.vue` | 5, 6 |
+| R2-I | 本地化断言过弱 | 56 |
 
-1–52 全部有来源、全部有验证条目，无孤儿。
+1–58 全部有来源、全部有验证条目，无孤儿。
 
 ## 4. Testing and validation
 
@@ -383,7 +443,11 @@ function updateTabFromUrlBar(id, updates)  // 唯一不递增的路径，仅供 
 
 选 `happy-dom` 而非 `jsdom`：更轻、启动更快。**不改 `vitest.config.ts` 的全局 `environment`**——组件测试文件各自用 `// @vitest-environment happy-dom` 文件头 docblock，现存 20 个文件的 `node` 环境零变化。所有组件测试一律 `shallowMount`（子组件全部 stub），避免把 CodeMirror 拉进 DOM 模拟环境。
 
-**硬性适用面（裁定 A20 的一部分，越界按缺陷处理；PRODUCT Non-goals 同文写明）**：组件测试只允许断言 (1) 发出的事件、(2) 传给子组件的 props、(3) `v-if`/`v-for` 的存在性与条数、(4) 对 store 或注入函数的调用。**禁止**断言焦点、选区、光标、布局、`document.activeElement`。owner 采纳该边界时的措辞是「rev1 那半论证成立，现在它是这条禁令的书面理由」——即禁令与许可来自同一条判断，不可只取其一。
+**硬性适用面（裁定 A20 的一部分，越界按缺陷处理；PRODUCT Non-goals 同文写明）**：组件测试只允许断言 (1) 发出的事件、(2) 传给子组件的 props、(3) `v-if`/`v-for` 的存在性与条数、(4) 对 store 或注入函数的调用。**禁止**断言焦点、选区、光标、布局、`document.activeElement`，**以及 DOM 文本内容**。
+
+> 第五类是 rev4 补的，因为 rev3 自己越了界：它把 §34 的承重断言写成「通知条内出现原因文本」——那是 DOM 文本断言。**我划的边界，我第一个越过去。** 与 P7 记录的那次（用一条正确的原则为一个错误的结论辩护）同源：边界写得对，不代表下笔时会想起它，所以现在把它列成第五类禁令而不是留在散文里。文案是否真的渲染成中文，归 4.5 的真机检查点。
+
+owner 采纳该边界时的措辞是「rev1 那半论证成立，现在它是这条禁令的书面理由」——即禁令与许可来自同一条判断，不可只取其一。
 
 **许可 ≠ 可行性**：A20 解决的是能不能装，不是装了能不能跑。起草者仍未实证（3.1）。4.3 的 harness 自检必须先通过，否则本节全部作废、回退源码 gate 并重报 owner。
 
@@ -392,74 +456,91 @@ function updateTabFromUrlBar(id, updates)  // 唯一不递增的路径，仅供 
 「可测性」四类：**纯函数** / **store**（既有 pinia 测试形态）/ **组件**（4.1 的受限挂载）/ **源码**（`?raw` 文本 gate）。
 变异检查一律最小可编译 patch；共用 killer 与非承重断言**如实标注**。
 
-| § | 测试文件 | 测试名 | 可测性 | 承重断言（只让它单独塌的那一条） | 最小可编译 patch |
+| § | 测试文件 | 可测性 | 状态 | 承重断言（只让它单独塌的那一条） | 最小可编译 patch |
 |---|---|---|---|---|---|
-| 1 | url-params | `keeps template spans verbatim (%s)`（5 行） | 纯函数 | 输出等于含花括号的期望串 | `if (isTemplateSpan(segment))` → `if (false)` |
-| 2 | url-params | `encodes params exactly as the backend does`（35 字符样本） | 纯函数 | 逐字节相等 | `encoded.toString().slice(2)` → `encodeURIComponent(segment)` → 空格与 `!~()'` 六行红，模板行仍绿 |
-| 3 | url-params | `ignores a whitespace-only key like the backend does` | 纯函数 | 输出不含该行 | `item.enabled && item.key.trim()` → `item.enabled && item.key` |
-| 4 | RequestPanel.spec | `never renders the query api key into the url bar` | 组件 | 传给 UrlBar 的 `url` prop 不含 apiKey 的值 | `RequestPanel.vue` 模板单行替换为把 apiKey 拼进 params 的版本：`:url="buildUrlWithParams(activeTab.url, [...activeTab.params, { id:'x', enabled:true, key: activeTab.auth.apiKey?.key ?? '', value: activeTab.auth.apiKey?.value ?? '', description:'' }])"` |
-| 5 | url-params | `lists template variables from path and query` | 纯函数 | 查询串变量出现在结果里 | `/\{\{\s*([^{}]+?)\s*\}\}/g` → `/^\{\{\s*([^{}]+?)\s*\}\}/g` → 查询行红、路径行绿 |
-| 6 | url-params | `renders exactly what was typed (%s)`（0.4 的 10 个目标） | 纯函数 | 末态显示串 === 目标串 | `return previous.draft` → `return incoming.url` |
-| 7 | url-params | `keeps a pasted plain url byte-identical` | 纯函数 | — | **与 §6 共用 killer，不独立可杀**。登记为 §6 在单次输入下的实例，**不计入独立统计** |
-| 8 | url-params | `adopts an external url change while a draft exists` | 纯函数 | Params 表改值后显示新值 | 删掉 `previous.revision !== incoming.revision` 整行 |
-| 9 | url-params | `adopts an external write that parses identically to the draft` | 纯函数 | 草稿 `%20` 被导入后的 `+` 取代 | 把 revision 判据换回 rev2 的 `sameParse(previous.draft, incoming.url) ? previous.draft : incoming.url`。**§8 在此 mutant 下仍绿**（Params 改值的解析结果不同）——0.9 实跑确认该对照 |
-| 10 | url-params | `never shows another tab's draft` | 纯函数 | 切 tab 后显示新 tab 的 url | 删掉 `previous.tabId !== incoming.tabId` 整行 |
-| 11 | request | `refuses a second send while one is in flight` | store | `send_request` 调用次数 === 1 | `if (activeRequestIds.has(tab.id)) { return }` 整行删除 |
-| 12 | request | `refuses before minting the new request id` | store | 在途请求的 response 落在 tab 上（`append_history` 恰好一次） | 把该守卫行**移到** `activeRequestIds.set(requestSnapshot.id, requestId)` **之后**（两行 diff）。**§11 在此 mutant 下仍绿**——第二次调用照样早退，被毁的是第一次的账 |
-| 13 | request | `allows a new send after the previous one settles` | store | 第二次 `send_request` 发生 | `finally` 里 `activeRequestIds.delete(tabId)` 整行删除 |
-| 14 | UrlBar.spec | `does not emit send on Enter while loading` | 组件 | `emitted().send` 为 undefined | `if (props.isLoading) { return }` 整行删除 |
-| 15 | env-rows | `keeps row identity across a %s edit`（key/value/secret）+ `commits every character of a key` | 纯函数 | 编辑后 id 不变 | `{ ...row, ...patch }` → `{ ...row, ...patch, id: crypto.randomUUID() }` |
-| 16 | env-rows | `removes only the targeted row`（含重名、含空行） | 纯函数 | 剩余行的 key 序列 | `rows.filter((row) => row.id !== id)` → `rows.filter((_row, index) => index !== 0)` |
-| 17 | env-rows | `keeps exactly one trailing blank row`（3 行） | 纯函数 | 「末行被清空后不新增」这一行 | `if (!last \|\| last.key \|\| last.value)` → `if (true)` |
-| 18 | env-rows | `reseeds when variables are replaced from outside` | 纯函数 | 返回 true | `shouldReseedEnvRows` 函数体 → `return false` |
-| 19 | env-rows + environments | `never lets a row id reach the persisted payload` | 纯函数 + store | `save_environment` 负载的变量对象无 `id` 键 | `.map(({ key, value, secret }) => ({ key, value, secret }))` → `.map((row) => row)` |
-| 20 | history-grouping | `gives distinct ids when display labels collide`（prefix/method/time 三行） | 纯函数 | 两个分组 id 不等 | `id: key` → `id: displayLabel` |
-| 21 | HistoryPanel.spec | `collapsing one group leaves its same-labelled sibling expanded` | 组件 | 第二个分组的条目仍被渲染 | `collapsedGroupIds.has(group.id)` → `collapsedGroupIds.has(group.displayLabel as HistoryGroupId)` |
-| 22 | source-gates | `binds the group v-for key to the id` | 源码（A21） | 模板中 `:key="group.id"` 存在 | `:key="group.id"` → `:key="group.displayLabel"`。**限制**：断的是源码文本，**不是** patch 行为（4.5-c 补人工） |
-| 23 | tabs-history | `never reuses a collection-bound tab` | store | **tab 数 +1**。`label`/`projectName`/`savedRequestPath`/`isDirty` 四条在同一 mutant 下一起红，**登记为佐证，不声称独立可杀** | 谓词中 `!candidate.projectName && !candidate.savedRequestPath &&` 删除 |
-| 24 | tabs-history | `still reuses an unbound empty tab with identical identity` | store | 复用发生（tab 数不变） | `serializeRequestIdentity(candidate) === serializeRequestIdentity(tab)` → `candidate.method === tab.method && candidate.url === tab.url` |
-| 25 | curl-import | `leaves no query string in tab.url after an import` | 纯函数 | `url` 不含 `?` | `url,` → `url: parsed.url,` |
-| 26 | curl-export | `emits an imported query param exactly once` | 纯函数 | 命令里 `q=cat` 出现 1 次 | `curl-export.ts`：`const { baseUrl, hash } = splitUrlParts(tab.url)` → `const baseUrl = tab.url, hash = ""` |
-| 27 | postman-export | `emits an imported query param exactly once in url.raw` | 纯函数 | `url.raw` 里 `q=cat` 出现 1 次 | `postman-export.ts` 的 `buildRawUrl`：`const { baseUrl, hash } = splitUrlParts(url)` → `const baseUrl = url, hash = ""`。**与 §26 是两个独立 killer** |
-| 28 | curl-import | `does not swallow a curl-looking paste that fails to parse`（2 行） | 纯函数 | `shouldPreventDefaultPaste` 为 false | `decision.action === "import"` → `true` |
-| 29 | curl-import | `reports why the paste was not imported` | 纯函数 | 携带的失败原因非空 | `{ action: "insert", reason: attempt.error }` → `{ action: "insert" }`（§28 仍绿） |
-| 30 | curl-import + locale-parity | `localizes every parse failure reason`（invalid-command / unsupported-method / no-url 三行，两个 locale 各断言解析结果 ≠ key 本身） | 纯函数 | 该 code 解析出的文案不是 key 字符串 | `CURL_ERROR_KEYS` 任一值 → `"curlImport.error.nope"` |
-| 31 | RequestPanel.spec | `renders the paste failure reason` | 组件 | 通知条内出现该原因文本 | 删掉模板中渲染 `importNotice.pasteFailure` 的那一行 |
-| 32 | curl-import | `still imports a parsable curl paste` | 纯函数 | `action === "import"` | `if (!trimmed \|\| !/^curl\s/i.test(trimmed)) { return { action: "insert" } }` → `return { action: "insert" }` |
-| 33 | curl-import + locale-parity | `maps every warning code to a resolvable localized key`（5 code） | 纯函数 | 该 code 的 key 在两个 locale 里都解析出非 key 本身的文案 | `CURL_WARNING_KEYS` 任一值 → `"curlImport.warning.nope"`。**完备性另有结构性保证**：`Record<CurlImportWarningCode, string>` 使漏掉一个 code 编译不过 |
-| 34 | curl-parser + locale-parity | `never passes prose through a warning detail` | 纯函数 | 两种 Authorization 情形产出**两个不同 code** | 把两个 push 点改回单一 code + 散文 detail：`{ code: "authorization-separator-not-preserved", detail: "" }` → `{ code: "authorization-line-breaks-not-preserved", detail: "separator whitespace" }` → 「两个 code 不同」断言红 |
-| 35 | RequestPanel.spec | `renders one line per parser warning` | 组件 | 渲染行数 === warning 数 | `v-for="line in noticeLines"` → `v-for="line in noticeLines.slice(0, 1)"` |
-| 36 | curl-import | `replaces the notice on the next import` | 纯函数 | 第二次（无 warning）导入后 `importNotice` 为 undefined | `importNotice: noticeFor(parsed.warnings),` → `...(parsed.warnings.length ? { importNotice: noticeFor(parsed.warnings) } : {}),` |
-| 37 | RequestPanel.spec | `clears the notice when dismissed` | 组件 | `updateTab` 被以 `{ importNotice: undefined }` 调用 | ✕ 按钮的 `@click` 整行删除 |
-| 38 | request | `sends normally while an import notice is present` | store | `send_request` 被调用 | 在 `sendRequest` 守卫之后插入一行 `if (tab.importNotice) { throw new Error("blocked") }` |
-| 39 | request | `never persists the import notice to history` | store | `append_history` 负载无该键 | 在 `buildHistoryEntry` 返回对象加一行 `importNotice: tab.importNotice,` |
-| 40 | saved-request | `never persists the import notice to a saved request` | 纯函数 | `buildSavedRequest` 结果无该键 | 在 `buildSavedRequest` 返回对象加一行 `importNotice: tab.importNotice as never,`。**与 §39 是两个独立 killer** |
-| 41 | CollectionPanel.spec | `collects export warnings and hands them to feedback` | 组件 | `collectPostmanExportWarnings` 的 spy 被调用，且其返回值到达 `setFeedback` | `exportCurrentProject` 里调用 `collectPostmanExportWarnings(requests)` 的那一行删除 |
-| 42 | collection-feedback | `reports plain success when there are no warnings` | 纯函数 | tone === `"success"` 且无次行 | `exportFeedbackFor` 的 `tone: warnings.length > 0 ? "warning" : "success"` → `tone: "warning"` |
-| 43 | collection-feedback | `still reports success when warnings exist` | 纯函数 | 主行仍是 `export.success` | `primary: "export.success"` → `primary: ""`（§42 仍绿） |
-| 44 | console-filters | `offers a filter for every console level` | 纯函数 | 选项覆盖全部 level | `...CONSOLE_LEVELS` → `...CONSOLE_LEVELS.filter((level) => level !== "info")` |
-| 45 | console-filters + locale-parity | `uses an i18n key for every filter label` | 纯函数 | 每个 labelKey 在两个 locale 里存在 | ``labelKey: `console.level.${level}` `` → `labelKey: level` |
-| 46 | DebugConsole.spec | `renders one button per filter option` | 组件 | 按钮数 === 选项数 | 模板中过滤按钮的 `v-for` 整行删除 |
-| 47 | source-gates | `keeps hard-coded english out of the localized components` | 源码（A21） | 目标字面量不出现在源码里 | `BodyEditor.vue` 的 `{{ t("body.type") }}` → `Type`。**限制**：证明「字面量不在那里」，**不是**「翻译真的被渲染了」（4.5-e 补人工） |
-| 48 | console | `does not rebind the caller's active pinia` | store | `getActivePinia()` 身份不变（**该用例只断言这一句**） | `useConsoleStore(getActivePinia() ?? pinia)` → `useConsoleStore(pinia)`。**已实跑**（0.5） |
-| 49 | console | `leaves the module singleton untouched` | store | 模块单例条目数 === 0（**该用例前一句在此 mutant 下仍通过，故单塌成立**） | 同 §48 一行。**共用 mutant，但各有单塌用例**——已实跑（0.5） |
-| 50 | locale-parity | `defines every inherited key with its placeholder`（6 key） | 纯函数 | 该 key 的文案含约定占位符 | 从 `zh-CN.ts` 的 `curlImport.warning.dataDiscarded` 删掉 `{detail}`（§52 仍绿） |
-| 51 | locale-parity | `describes the flags the parser actually supports` | 纯函数 | 文案含 `--data-urlencode` | `importCurlDescription` 改回原文 |
-| 52 | locale-parity | `zh-CN and en expose the same key set`（既有） | 纯函数 | 键集相等 | 从 `en.ts` 删掉任一新键 |
+| 1 | url-params | 纯函数 | DESIGNED | 输出等于含花括号的期望串 | `if (isTemplateSpan(segment))` → `if (false)` |
+| 2 | url-params | 纯函数 | DESIGNED | 逐字节相等（35 字符样本） | `encoded.toString().slice(2)` → `encodeURIComponent(segment)` |
+| 3 | url-params | 纯函数 | DESIGNED | 输出不含纯空白 key 那一行 | `item.enabled && item.key.trim()` → `item.enabled && item.key` |
+| 4 | RequestPanel.spec | 组件 | DESIGNED | 传给 UrlBar 的 `url` prop 不含 apiKey 的值 | `RequestPanel.vue` 模板单行改成把 apiKey 拼进 params 的版本 |
+| 5 | source-gates | 源码（A21） | DESIGNED | 两个 README 都含该声明句 | 从 `README.md` 删掉该句 |
+| 6 | AuthEditor.spec | 组件 | DESIGNED | `addTo === "query"` 时注入的 `t` 被以 `auth.queryKeyHidden` 调用 | 该说明的 `v-if="addTo === 'query'"` 整行删除 |
+| 7 | url-params | 纯函数 | DESIGNED | 查询串变量出现在结果里 | `/\{\{…\}\}/g` → `/^\{\{…\}\}/g`（查询行红、路径行绿） |
+| 8 | url-params | 纯函数 | DESIGNED | 末态显示串 === 目标串（10 个目标） | `return previous.draft` → `return incoming.url` |
+| 9 | url-params | 纯函数 | 冗余 | — | **与 §8 共用 killer，不独立可杀**，登记为 §8 在单次输入下的实例 |
+| 10 | url-params | 纯函数 | DESIGNED | Params 表改值后显示新值 | 删掉 `previous.revision !== incoming.revision` 整行 |
+| 11 | url-params | 纯函数 | **VERIFIED**（0.9） | 草稿 `%20` 被导入后的 `+` 取代 | 判据换回 `sameParse(...) ? previous.draft : incoming.url`。**§10 在此 mutant 下仍绿**——实跑确认 |
+| 12 | url-params-reactivity（**无 DOM**） + RequestPanel.spec | reactivity / 组件 | **VERIFIED**（0.11，reactivity 半边） | (a) revision-only 变化时协调器执行次数 === 1；(b) RequestPanel 传给 UrlBar 的 `url-revision` prop 存在 | (a) watch 源 `[props.url, props.tabId, props.urlRevision]` → `[props.url, props.tabId]`，实测执行次数由 1 变 0；(b) 模板里 `:url-revision="activeTab.urlRevision"` 整行删除。**两个用例各自单塌** |
+| 13 | url-params | 纯函数 | DESIGNED | 切 tab 后显示新 tab 的 url | 删掉 `previous.tabId !== incoming.tabId` 整行 |
+| 14 | request | store | **VERIFIED**（0.12） | `send_request` 次数 === 1（**该用例只断言这一项**） | 守卫整行删除 → 实测 2 次 |
+| 15 | request | store | **VERIFIED**（0.12） | 在途请求的响应落到 tab 上 + `append_history` 恰好一次（**该用例不断言调用次数**） | `{ return }` → `{ activeRequestIds.set(tab.id, crypto.randomUUID()); return }` → 实测调用次数仍为 1（§14 绿）、响应与历史双双消失 |
+| 16 | request | store | DESIGNED | 第二次 `send_request` 发生 | `finally` 里 `activeRequestIds.delete(tabId)` 整行删除 |
+| 17 | UrlBar.spec | 组件 | DESIGNED | `emitted().send` 为 undefined | `if (props.isLoading) { return }` 整行删除 |
+| 18 | env-rows | 纯函数 | DESIGNED | 编辑后 id 不变（key/value/secret 三行） | `{ ...row, ...patch }` → `{ ...row, ...patch, id: crypto.randomUUID() }` |
+| 19 | env-rows | 纯函数 | DESIGNED | 剩余行的 key 序列 | `rows.filter((row) => row.id !== id)` → `rows.filter((_row, index) => index !== 0)` |
+| 20 | env-rows | 纯函数 | DESIGNED | 「末行被清空后不新增」这一行 | `if (!last \|\| last.key \|\| last.value)` → `if (true)` |
+| 21 | env-rows | 纯函数 | DESIGNED | 返回 true | `shouldReseedEnvRows` 函数体 → `return false` |
+| 22 | env-rows + environments | 纯函数 + store | DESIGNED | `save_environment` 负载的变量对象无 `id` 键 | `.map(({ key, value, secret }) => ({ key, value, secret }))` → `.map((row) => row)` |
+| 23 | history-grouping | 纯函数 | DESIGNED | 两个分组 id 不等 | `id: key` → `id: displayLabel` |
+| 24 | HistoryPanel.spec | 组件 | DESIGNED | 第二个分组的条目 `v-if` 仍为真 | `collapsedGroupIds.has(group.id)` → `…has(group.displayLabel as HistoryGroupId)` |
+| 25 | source-gates | 源码（A21） | DESIGNED | 模板中 `:key="group.id"` 存在 | `:key="group.id"` → `:key="group.displayLabel"`。**限制**：断源码文本，非 patch 行为（4.5-c 补人工） |
+| 26 | tabs-history | store | DESIGNED | **tab 数 +1**（其余四项登记为佐证，不声称独立可杀） | 谓词中 `!candidate.projectName && !candidate.savedRequestPath &&` 删除 |
+| 27 | tabs-history | store | DESIGNED | 复用发生（tab 数不变） | 完整身份比较 → `candidate.method === tab.method && candidate.url === tab.url` |
+| 28 | curl-import | 纯函数 | DESIGNED | `url` 不含 `?` | `url,` → `url: parsed.url,` |
+| 29 | curl-export | 纯函数 | DESIGNED | 命令里 `q=cat` 出现 1 次 | `const { baseUrl, hash } = splitUrlParts(tab.url)` → `const baseUrl = tab.url, hash = ""` |
+| 30 | postman-export | 纯函数 | DESIGNED | `url.raw` 里 `q=cat` 出现 1 次 | `buildRawUrl` 内同形改动。**与 §29 是两个独立 killer** |
+| 31 | curl-import | 纯函数 | DESIGNED | `shouldPreventDefaultPaste` 为 false | `decision.action === "import"` → `true` |
+| 32 | curl-import | 纯函数 | DESIGNED | 携带的失败原因非空 | `{ action: "insert", reason: attempt.error }` → `{ action: "insert" }` |
+| 33 | locale-matrix | 纯函数 | DESIGNED | 三个 code 各自解析出的文案与 §56 矩阵逐字相等 | `CURL_ERROR_KEYS` 任一值 → `"curlImport.error.nope"` |
+| 34 | RequestPanel.spec | 组件 | DESIGNED | (a) 注入的 `t` 被以 `curlImport.pasteFailed` 调用；(b) 失败行 `v-if` 为真且条数 === 1。**A20 四类之内，不断言 DOM 文本** | 渲染 `importNotice.pasteFailure` 的那一行整行删除 |
+| 35 | curl-import | 纯函数 | DESIGNED | `action === "import"` | 首行条件判断整行删除，恒返回 `{ action: "insert" }` |
+| 36 | curl-import + locale-matrix | 纯函数 | DESIGNED | 5 个 code 各自映射到的 key 解析出的文案与矩阵逐字相等 | `CURL_WARNING_KEYS` 任一值 → `"curlImport.warning.nope"`。**完备性另有结构性保证**：`Record<CurlImportWarningCode, string>` 漏一个 code 编译不过 |
+| 37 | curl-parser | 纯函数 | DESIGNED | 两种 Authorization 情形产出的 warning 数组**逐字段等于** `[{ code: "authorization-line-breaks-not-preserved", detail: "" }, { code: "authorization-separator-not-preserved", detail: "" }]` | 任一 push 点改回 `detail: "line breaks"` → `detail` 等值断言红。**rev3 只断言「两个 code 不同」，改散文 detail 时照样绿——那条断言杀不掉 §37 存在的理由** |
+| 38 | RequestPanel.spec | 组件 | DESIGNED | 告警行 `v-for` 渲染条数 === warning 数 | `v-for="line in noticeLines"` → `v-for="line in noticeLines.slice(0, 1)"` |
+| 39 | curl-import | 纯函数 | DESIGNED | 第二次（无 warning）导入后 `importNotice` 为 undefined | `importNotice: noticeFor(...)` → 条件展开 `...(warnings.length ? { importNotice: … } : {})` |
+| 40 | RequestPanel.spec | 组件 | DESIGNED | `updateTab` 被以 `{ importNotice: undefined }` 调用 | ✕ 按钮的 `@click` 整行删除 |
+| 41 | request | store | DESIGNED | `send_request` 被调用 | 守卫之后插入一行 `if (tab.importNotice) { throw new Error("blocked") }` |
+| 42 | request | store | DESIGNED | `append_history` 负载无该键 | `buildHistoryEntry` 返回对象加一行 `importNotice: tab.importNotice,` |
+| 43 | saved-request | 纯函数 | DESIGNED | `buildSavedRequest` 结果无该键 | 返回对象加一行 `importNotice: tab.importNotice as never,`。**与 §42 是两个独立 killer** |
+| 44 | CollectionPanel.spec | 组件 | DESIGNED | `collectPostmanExportWarnings` 的 spy 被调用，且其返回值到达 `setFeedback` | 调用 `collectPostmanExportWarnings(requests)` 的那一行删除 |
+| 45 | collection-feedback | 纯函数 | DESIGNED | 无告警时 `detail` 为 undefined（**该用例只断言这一项**） | `detail: warnings.length ? countLine(warnings) : undefined` → `detail: countLine(warnings)` |
+| 46 | collection-feedback | 纯函数 | DESIGNED | 无告警时 `tone === "success"`（**只断言这一项**） | `tone: warnings.length > 0 ? "warning" : "success"` → `tone: "warning"` |
+| 47 | collection-feedback | 纯函数 | DESIGNED | 有告警时 `primary === "export.success"`（**只断言这一项**） | `primary: "export.success"` → `primary: "import.error"` |
+| 48 | collection-feedback | 纯函数 | DESIGNED | 有告警时 `tone === "warning"`（**只断言这一项**） | `tone: warnings.length > 0 ? "warning" : "success"` → `tone: "success"` |
+| 49 | collection-feedback | 纯函数 | DESIGNED | 次行插值的数量 === 告警条数（**只断言这一项**，fixture 用 3 条） | `{ count: warnings.length }` → `{ count: 1 }` |
+| 50 | console-filters | 纯函数 | DESIGNED | 选项覆盖全部 level | `...CONSOLE_LEVELS` → `...CONSOLE_LEVELS.filter((l) => l !== "info")` |
+| 51 | console-filters + locale-matrix | 纯函数 | DESIGNED | 每个 labelKey 解析出的文案与矩阵逐字相等 | ``labelKey: `console.level.${level}` `` → `labelKey: level` |
+| 52 | DebugConsole.spec | 组件 | DESIGNED | 过滤按钮 `v-for` 条数 === 选项数 | 该 `v-for` 整行删除 |
+| 53 | source-gates | 源码（A21） | DESIGNED | 目标字面量不出现在源码里 | `BodyEditor.vue` 的 `{{ t("body.type") }}` → `Type`。**限制**：证明字面量不在，非「翻译真的被渲染」（4.5-e 补人工） |
+| 54 | console | store | **VERIFIED**（0.5） | `getActivePinia()` 身份不变（**该用例只断言这一句**） | `useConsoleStore(getActivePinia() ?? pinia)` → `useConsoleStore(pinia)` |
+| 55 | console | store | **VERIFIED**（0.5） | 模块单例条目数 === 0（**该用例前一句在此 mutant 下仍通过**） | 同 §54 一行；共用 mutant，**各有单塌用例** |
+| 56 | locale-matrix | 纯函数 | DESIGNED | 20 个 key（14 自有 + 6 继承）× 2 语言的文案与 PRODUCT 表**逐字相等** | 两条各自单塌：(a) 把 `zh-CN.ts` 的 `curlImport.error.noUrl` 换成其 en 文案 → 该行红（旧式 `t(key) !== key` 断言在此 mutant 下**仍绿**）；(b) 把继承的 `curlImport.warning.cookieFile` 改成占位符仍在但语义错的句子 → 该行红（旧式「占位符存在」断言**仍绿**） |
+| 57 | locale-matrix | 纯函数 | DESIGNED | 文案含 `--data-urlencode` | `importCurlDescription` 改回原文 |
+| 58 | locale-parity | 纯函数 | DESIGNED | 键集相等 | 从 `en.ts` 删掉任一新键 |
 
-### 4.3 harness 自检与 fail-closed 执行协议（P12）
+### 4.3 harness 自检与 fail-closed 执行协议（P12；rev3 的自检本身是 fail-open）
 
-**在跑任何真实变异之前**，先证明度量装置本身能报红：
+**rev3 的自检写错了方向，这里更正。** rev3 说：写一条必然失败的组件断言，看到 `Tests … failed` 且失败条目名对得上，就算 harness 可用。评审实跑指出——临时用例在**断言之前**就抛出（`mount failed before assertion`），Vitest 输出**同样**是 `Tests 1 failed`、失败条目名**同样**是那个用例名。**于是 `@vue/test-utils` / `happy-dom` 整个装不起来时，这个自检照样判「通过」。**
 
-1. **组件 harness 自检**：写一个必然失败的组件断言（例如断言 `shallowMount(UrlBar)` 渲染出 999 个按钮），运行，**必须**看到 `Tests … failed` 且失败条目里有它。看不到 ⇒ happy-dom / test-utils 没装好 ⇒ **4.1 整节作废，回退源码 gate 并重报 owner**。
-2. **纯函数 harness 自检**：把 `splitTemplateSpans` 改成 `return []`，确认相关用例转红。
+P12 的原话是：判据必须**正向匹配「确实执行了」的证据**。rev3 匹配的是「出现了失败」——而失败有两种来源，其中一种恰恰意味着什么都没跑。**这和 D02 那个把编译失败读成「变异存活」的台账是同一形状**，只是我把它写进了那条本该防住它的规则里。
+
+**rev4 的两阶段自检：**
+
+**阶段 1（证明挂载真的发生了）**：写一条**获准四类之内的正确断言**（例如 `shallowMount(UrlBar, { props })` 后断言 `emitted()` 为空对象、或某个子组件 stub 存在），运行，**必须为绿**。绿意味着 import、setup、mount 三步全部走通——**这是「确实执行了」的正向证据**，失败信息给不了它。
+
+**阶段 2（证明红灯能被观测到）**：把**同一条**断言故意改错（期望值改成不可能的值），运行，**必须为红**，并且失败类型必须是 **assertion mismatch**（Vitest 报 `AssertionError` / expected-vs-received 差异），**不是** import error、setup error 或 mount error。
+
+**任一阶段不满足 ⇒ `INCONCLUSIVE` ⇒ 4.1 整节作废、回退源码 gate 并重报 owner。** 阶段 1 绿而阶段 2 红，两者合起来才证明「挂载成功且断言可观测」；单独任何一个都不够。
+
+**纯函数 harness 自检**同理两阶段：先让 `splitTemplateSpans` 的现有用例为绿，再改成 `return []` 确认转红且失败类型是 assertion mismatch。
+
+**§12 的 reactivity 用例不依赖 DOM**（0.11 就是在现有 `environment: "node"` 下跑通的），因此它**不受本节结论影响**——即使组件 harness 整体作废，§12 的 (a) 半边仍然成立。这一点单独记下，避免把「组件测试没跑起来」误读成「revision 接线没有任何 gate」。
 
 真实变异台账的判定规则：
 
-- **只有在输出里 positively 匹配到 vitest 的汇总行**（`Test Files …` 与 `Tests …`，且解析出的 `passed + failed > 0`）时，本次运行才产生结论。匹配不到 ⇒ **`INCONCLUSIVE`**，既不记「杀死」也不记「存活」。
+- 只有在输出里 positively 匹配到 vitest 汇总行（`Test Files …` 与 `Tests …`，且解析出的 `passed + failed > 0`）时，本次运行才产生结论。匹配不到 ⇒ **`INCONCLUSIVE`**。
 - 解析出的 failed 计数与列出的失败用例名数量不一致 ⇒ **`INCONCLUSIVE`**。
-- **组件测试专属**：挂载抛异常导致的失败是 `ERROR`，不是「杀死」。必须区分「断言被违反」与「组件根本没挂起来」——后者对该不变式记 `INCONCLUSIVE`。
-- 变异后若 `vue-tsc` 编译不过，该 patch 不是合法 killer（P3），改写 patch，**不得**记为「杀死」。
+- 失败类型不是 assertion mismatch（import / setup / mount / transform error）⇒ **`INCONCLUSIVE`**，**不得**记为「杀死」。
+- 变异后若 `vue-tsc` 编译不过，该 patch 不是合法 killer（P3），改写 patch，不得记为「杀死」。
 
 ### 4.4 实现者必须先跑掉的两件事
 
@@ -471,49 +552,43 @@ function updateTabFromUrlBar(id, updates)  // 唯一不递增的路径，仅供 
 
 只保留自动化**结构上**覆盖不到的部分：
 
-- **a（§15 的焦点面）**：环境面板空白行连续键入 `baseUrl` 不点别处——键名必须完整、光标不丢；已有变量退格一次焦点仍在。
-- **b（§14 的真机面）**：慢接口上按住回车 3 秒，终端侧只有 1 次请求。
-- **c（§22 的行为面）**：两个同文案分组，折叠一个另一个不动（源码 gate 只证明了绑定，没证明 patch 行为）。
-- **d（§31/§35/§37 的视觉面）**：粘贴带 `-b cookies.txt` 的 curl，通知条出现、切走切回仍在、✕ 后消失。
-- **e（§47 的渲染面）**：中文界面下逐一确认控制台四个过滤按钮、cURL 示例、form-data 的 Type/Text/File 均为中文。
-- **f（§1–§10 的真实输入）**：逐字符手打 `https://api.test/a?x=1` 必须原样出现；粘贴 `…?api_key={{apiKey}}` 后地址栏显示花括号且出现「包含变量：apiKey」。
+- **a（§18 的焦点面）**：环境面板空白行连续键入 `baseUrl` 不点别处——键名必须完整、光标不丢；已有变量退格一次焦点仍在。
+- **b（§17 的真机面）**：慢接口上按住回车 3 秒，终端侧只有 1 次请求。
+- **c（§25 的行为面）**：两个同文案分组，折叠一个另一个不动（源码 gate 只证明了绑定，没证明 patch 行为）。
+- **d（§34/§38/§40 的视觉面）**：粘贴带 `-b cookies.txt` 的 curl，通知条出现、切走切回仍在、✕ 后消失。
+- **e（§53 的渲染面）**：中文界面下逐一确认控制台四个过滤按钮、cURL 示例、form-data 的 Type/Text/File 均为中文。
+- **f（§1–§13 的真实输入）**：逐字符手打 `https://api.test/a?x=1` 必须原样出现；粘贴 `…?api_key={{apiKey}}` 后地址栏显示花括号且出现「包含变量：apiKey」。
 - **g**：通知条与告警条出现时，1024×768 下不换行不溢出。
 
-### 4.6 分层统计与自查（P10；rev1 在此报错，rev2 已更正，rev3 重算）
+### 4.6 覆盖台账（三态；rev4 起**不再从表格解析统计**）
 
-**rev1 的分层是错的**，逐条留痕：
+这一格连错三轮，每次错在不同层次，全部留痕：
 
-| rev1 的说法 | 实际 |
+| 轮次 | 错法 |
 |---|---|
-| 「表 40 行」 | 41 行（40 条 + 一个子编号） |
-| 「34 条有可编译 killer」 | 38 条 |
-| 「两条属结构性保证」 | 其中一条其实是 MANUAL，分类错误 |
-| 「没有一个 killer 落在 `.vue` 里」 | 与当时的字面量 gate **直接矛盾** |
-| 两条不变式「多条断言一起红」 | 正是 P9 禁止的形态 |
+| rev1 | 手数数错（40 说成 41、34 说成 38），并声称「没有 killer 落在 `.vue` 里」，与自己表里的字面量 gate 直接矛盾 |
+| rev2 | 仍手数，把 30 写成 31、把一条漏在列表外 |
+| rev3 | 改用脚本解析表格，**数字对了，判据错了**——把「这一格填了 patch 文本」当成「P9 单塌已成立」。脚本治好了手数，没治好**用错判据** |
 
-**一个错误的分层会给出「所有条目均已可靠覆盖」的错误结论——这正是 P10 要防的，只是错在度量端而不是结论端。**
+**rev4 的判据**：一条不变式只有在**实跑过「变异 ⇒ 该用例转红、且相邻用例不红」的对照**之后，才计入「已证明」。没跑过的，无论 patch 写得多具体，一律记 `DESIGNED`——**这是 P12 在我自己的台账上的应用：缺少证据的默认结论不能是良性结论。**
 
-rev3 的度量**由脚本直接从上表逐行解析得出**，不手数（rev2 手数时把 30 写成 31、把 §19 漏在列表外，脚本重数才抓到；这次直接以脚本为准）：
-
-| 类别 | 条数 | 编号 |
+| 状态 | 条数 | 编号 |
 |---|---|---|
-| 有独立可编译 killer | **51** | 1–6、8–52 |
-| 无独立 killer，登记为冗余 | **1** | §7（与 §6 共用，已标注） |
-| ——其中 纯函数 | 33 | 1,2,3,5,6,7,8,9,10,15,16,17,18,19,20,25,26,27,28,29,30,32,33,34,36,40,42,43,44,45,50,51,52 |
-| ——其中 store | 10 | 11,12,13,19,23,24,38,39,48,49 |
-| ——其中 组件 | 8 | 4,14,21,31,35,37,41,46 |
-| ——其中 源码 gate（A21 限定） | 2 | 22,47 |
-| 另有类型系统附加保护（非 killer） | 2 | §33 的 `Record` 完备性、§21 的 branded `Set` |
+| **VERIFIED**（本轮实跑过对照） | **6** | 11、12(a)、14、15、54、55 |
+| **DESIGNED**（有最小可编译 patch，未实跑） | 51 | 其余全部 |
+| **冗余**（明确不独立可杀） | 1 | §9 |
 
-（33 + 10 + 8 + 2 = 53；**§19 同时用纯函数与 store 两层，两栏各计一次**，去重后恰为 52。四栏已逐编号列出，可直接复核。）
+VERIFIED 六条的证据出处：§11 见 0.9；§12 的 reactivity 半边见 0.11；§14 / §15 见 0.12 的四行矩阵；§54 / §55 见 0.5。
 
-结论及其适用范围（**与度量分开写**）：
+**结论及其适用范围（与度量分开写）**：
 
-- 52 条里 51 条有可编译 killer，**其中 8 条打在组件上、2 条打在 `.vue` 源码文本上**。
-- **仍未被自动化证明的部分**：WebKit 的焦点/选区行为（§15 的真机面）、重复 `:key` 导致的错误 patch 行为（§22 的行为面）、翻译文案的实际渲染（§47 的渲染面）、1024×768 的排版。这四项在 4.5 有对应检查点，**不计入「已被测试证明」**。
-- **§7、§23 的四条附属断言、§49 用例里的第一句**是已登记的非承重项，任何汇总不得把它们算作独立证据。
-- 组件层那 8 条的有效性**全部以 4.3-1 的 harness 自检通过为前提**；自检未通过之前，它们一条都不成立。
+- **「58 条中 57 条有 killer」是一句关于文档的陈述，不是关于覆盖的陈述。** 真正被实验证明过单塌的只有 6 条。规格阶段能做到的上限就是这个数——其余 51 条的生产代码尚不存在，**跑不了对照，也就不该声称已证明**。
+- 实现阶段的交付要求：**每一条 DESIGNED 必须转成 VERIFIED**，按 4.3 的协议记录，`INCONCLUSIVE` 不得计入。实现者的自检报告须给出三态分布，而不是「N 个变异全红」这类只有分子的数字。
+- §12 的两个用例中，(a) 已 VERIFIED 且**不依赖组件 harness**；(b) 依赖组件 harness，随 4.3 的结论生效或作废。
+- 组件层与源码 gate 那几条的有效性**全部以 4.3 两阶段自检通过为前提**。
 - §2 的成立**以 4.4-a 的后端编码实测为前提**（0.7 仍是推断）。
+- **仍未被任何自动化覆盖**：WebKit 焦点/选区行为（§18 真机面）、重复 `:key` 的错误 patch 行为（§25 行为面）、翻译文案的实际渲染（§34 / §53 渲染面）、1024×768 排版。四项在 4.5 有检查点，不计入任何覆盖统计。
+- **非承重项**（不得计作独立证据）：§9；§26 除「tab 数 +1」外的四项；§55 用例里的第一句。
 
 ### 4.7 对交接清单的偏离登记
 
@@ -530,12 +605,12 @@ rev3 的度量**由脚本直接从上表逐行解析得出**，不手数（rev2 
 | 0.7 的推断若为假 | 4.4-a 是硬前置，跑在写代码之前 |
 | 组件测试工具链装不起来 | 4.3-1 的 harness 自检 fail-closed；失败即回退源码 gate 并重报 owner |
 | 组件测试越界去断言焦点 | 裁定 A20 把适用面写进许可本身；PRODUCT Non-goals 与 4.1 同文，越界按缺陷处理 |
-| 草稿缓冲引入新的显示/状态分叉 | §8 / §9 锁「外部变化必须被采纳」（含语义相同的那一类），§6 锁「打字期间不被改写」，互为边界 |
+| 草稿缓冲引入新的显示/状态分叉 | §10–§12 锁「外部变化必须被采纳」（含语义相同、以及字符串完全不变的两类），§8 锁「打字期间不被改写」，互为边界 |
 | **新增 `urlRevision` 的写入点被漏改** | 2.9 的「默认递增 + 单一豁免路径」：漏改的后果是**多采纳一次**（草稿被规范形式替换，纯外观），不是**少采纳一次**（界面停在已不存在的旧串上）。**失败方向是安全的** |
-| `Tab` 又多两个内存态字段（`importNotice` / `urlRevision`） | §39 / §40 两个独立 killer 分别锁历史与已保存请求 |
-| branded `HistoryGroupId` 挡不住 `:key` | 已如实写明（2.8），§22 源码 gate + 4.5-c 人工检查点 |
+| `Tab` 又多两个内存态字段（`importNotice` / `urlRevision`） | §42 / §43 两个独立 killer 分别锁历史与已保存请求 |
+| branded `HistoryGroupId` 挡不住 `:key` | 已如实写明（2.8），§25 源码 gate + 4.5-c 人工检查点 |
 
-**回滚**：四个互不依赖的单元——URL 栏、环境行、导入告警、导出告警。i18n 键增补跟着各自单元走，回滚时须同步删键，否则 §52 会红。
+**回滚**：四个互不依赖的单元——URL 栏、环境行、导入告警、导出告警。i18n 键增补跟着各自单元走，回滚时须同步删键，否则 §56 / §58 会红。
 
 ## 6. 受控裁定申请（不进不变式）
 
