@@ -4,6 +4,8 @@ export interface KeyValuePair {
   key: string
   value: string
   description: string
+  /** In-memory only: the value was redacted in history and needs re-entering. */
+  redacted?: boolean
 }
 
 export type FormDataValueType = "text" | "file"
@@ -114,6 +116,8 @@ export interface Tab {
   responseError?: string | null
   scriptResult?: ScriptResult | null
   isLoading?: boolean
+  /** In-memory only: the body was redacted in history and needs re-entering. */
+  bodyRedacted?: boolean
 }
 
 export interface SettingsState {
