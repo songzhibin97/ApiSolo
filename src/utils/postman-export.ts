@@ -1,4 +1,69 @@
-import type { CollectionNode, FormDataItem, KeyValuePair, SavedRequest } from "../types"
+import type {
+  CollectionNode,
+  FormDataItem,
+  KeyValuePair,
+  RequestBody,
+  SavedRequest,
+} from "../types"
+import { splitUrlParts } from "./url-query"
+
+export interface PostmanExportWarning {
+  code: "file-content-not-exportable"
+  requestName: string
+  fileName: string
+}
+
+/**
+ * An upload whose bytes live inside ApiSolo has no path Postman could
+ * resolve. `filePath` is empty everywhere in this app (uploads are inlined as
+ * base64 by design), so the presence of the content field -- not its
+ * truthiness -- is what separates "we hold the bytes" from "we only ever had
+ * a name". A zero-byte file has an empty string here and must be treated
+ * exactly like any other picked file.
+ */
+function hasInlinedFileContent(item: FormDataItem) {
+  return item.valueType === "file" && item.fileContent !== undefined
+}
+
+function hasInlinedBinaryContent(body: RequestBody) {
+  return body.type === "binary" && body.binaryContent !== undefined
+}
+
+function unexportableFileNote(fileName: string) {
+  return `[ApiSolo] The content of "${fileName}" is stored inside ApiSolo and cannot be exported; select the file again in Postman.`
+}
+
+/**
+ * Lists the uploads that cannot be written into the collection, so the UI can
+ * tell the user before they hand the file to someone else.
+ */
+export function collectPostmanExportWarnings(
+  requests: SavedRequest[],
+): PostmanExportWarning[] {
+  const warnings: PostmanExportWarning[] = []
+
+  for (const request of requests) {
+    if (hasInlinedBinaryContent(request.body)) {
+      warnings.push({
+        code: "file-content-not-exportable",
+        requestName: request.name,
+        fileName: request.body.binaryPath,
+      })
+    }
+
+    for (const item of request.body.formData) {
+      if (hasInlinedFileContent(item)) {
+        warnings.push({
+          code: "file-content-not-exportable",
+          requestName: request.name,
+          fileName: item.fileName ?? "",
+        })
+      }
+    }
+  }
+
+  return warnings
+}
 
 interface PostmanCollection {
   info: {
@@ -18,6 +83,7 @@ interface PostmanItem {
       raw: string
       query?: Array<{ key: string; value: string; disabled?: boolean; description?: string }>
     }
+    description?: string
     body?: {
       mode: string
       raw?: string
@@ -101,8 +167,15 @@ function buildRequestItem(request: SavedRequest): PostmanItem {
       },
       auth: buildAuth(request),
       body: buildBody(request),
+      description: hasInlinedBinaryContent(request.body)
+        ? unexportableFileNote(request.body.binaryPath)
+        : undefined,
     },
     event: buildEvents(request),
+  }
+
+  if (!item.request?.description) {
+    delete item.request?.description
   }
 
   if (!item.request?.auth) {
@@ -129,7 +202,11 @@ function buildBody(request: SavedRequest) {
     return {
       mode: "file",
       file: {
-        src: request.body.binaryPath || undefined,
+        // Never fabricate a path Postman cannot resolve. mode:"file" still
+        // carries the semantics; the missing src is explained on the request.
+        src: hasInlinedBinaryContent(request.body)
+          ? undefined
+          : request.body.binaryPath || undefined,
       },
     }
   }
@@ -234,18 +311,23 @@ function toPostmanPairs(items: KeyValuePair[]) {
 function toPostmanFormData(items: FormDataItem[]) {
   return items
     .filter((item) => item.key || item.value || item.fileName)
-    .map((item) => ({
-      key: item.key,
-      value: item.valueType === "file" ? undefined : item.value,
-      type: item.valueType === "file" ? ("file" as const) : ("text" as const),
-      src:
-        item.valueType === "file"
-          ? item.filePath || item.fileName || undefined
-          : undefined,
-      disabled: item.enabled ? undefined : true,
-      description: item.description || undefined,
-      contentType: item.valueType === "file" ? item.contentType || undefined : undefined,
-    }))
+    .map((item) => {
+      const inlined = hasInlinedFileContent(item)
+      const note = inlined ? unexportableFileNote(item.fileName ?? "") : ""
+
+      return {
+        key: item.key,
+        value: item.valueType === "file" ? undefined : item.value,
+        type: item.valueType === "file" ? ("file" as const) : ("text" as const),
+        src:
+          item.valueType === "file" && !inlined
+            ? item.filePath || item.fileName || undefined
+            : undefined,
+        disabled: item.enabled ? undefined : true,
+        description: [note, item.description].filter(Boolean).join(" ") || undefined,
+        contentType: item.valueType === "file" ? item.contentType || undefined : undefined,
+      }
+    })
 }
 
 function parseFormContent(content: string) {
@@ -259,7 +341,15 @@ function parseFormContent(content: string) {
   })
 }
 
+/**
+ * Params are the only source of the query string, so a query left over in a
+ * saved request's url (what a cURL import stores) is not appended twice. The
+ * fragment stays last: the previous `url.includes("?")` concatenation
+ * produced `…/a#frag?k=v`, which is not a valid URL. Values stay unencoded so
+ * Postman's own {{variables}} survive.
+ */
 function buildRawUrl(url: string, params: KeyValuePair[], auth: SavedRequest["auth"]) {
+  const { baseUrl, hash } = splitUrlParts(url)
   const queryItems = params
     .filter((item) => item.enabled && item.key)
     .map((item) => `${item.key}=${item.value}`)
@@ -269,9 +359,8 @@ function buildRawUrl(url: string, params: KeyValuePair[], auth: SavedRequest["au
   }
 
   if (!queryItems.length) {
-    return url
+    return `${baseUrl}${hash}`
   }
 
-  const separator = url.includes("?") ? "&" : "?"
-  return `${url}${separator}${queryItems.join("&")}`
+  return `${baseUrl}?${queryItems.join("&")}${hash}`
 }
