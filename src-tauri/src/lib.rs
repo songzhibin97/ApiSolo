@@ -235,13 +235,6 @@ where
     None
 }
 
-fn connect_first_reachable(addrs: &[SocketAddr], total_budget: Duration) -> Option<u64> {
-    connect_first_reachable_with(addrs, total_budget, |addr, budget| {
-        std::net::TcpStream::connect_timeout(addr, budget).map(drop)
-    })
-    .map(|(_, elapsed)| elapsed)
-}
-
 /// Bound the whole probe - DNS resolution included - by `budget`. Every failure
 /// mode collapses to "not measured"; the probe never decides whether the real
 /// request runs.
@@ -258,23 +251,50 @@ where
 
 /// The fallible half of the probe. Runs entirely on the blocking pool because
 /// both `to_socket_addrs` and `connect_timeout` are synchronous.
-fn probe_connection(host: String, port: u16) -> Result<(u64, u64), String> {
+///
+/// `connect` is injectable so that the budget actually handed to each address
+/// can be observed. That matters more than it looks: an earlier version took no
+/// budget at all here and the address loop used the constant, which meant the
+/// caller's budget was silently dropped and the fair-share guarantee only held
+/// when the caller's budget happened to equal the constant.
+fn probe_connection_with<C>(
+    host: String,
+    port: u16,
+    budget: Duration,
+    connect: C,
+) -> Result<(u64, u64), String>
+where
+    C: FnMut(&SocketAddr, Duration) -> std::io::Result<()>,
+{
     let addr = format!("{host}:{port}");
-    let dns_started_at = Instant::now();
+    let started_at = Instant::now();
     let addrs = addr
         .to_socket_addrs()
         .map(|iter| iter.collect::<Vec<_>>())
         .map_err(|error| format!("DNS resolve failed: {error}"))?;
-    let dns_lookup = dns_started_at.elapsed().as_millis() as u64;
+    let dns_elapsed = started_at.elapsed();
+    let dns_lookup = dns_elapsed.as_millis() as u64;
 
     if addrs.is_empty() {
         return Err("DNS resolve failed: no addresses found".to_string());
     }
 
+    // Whatever DNS spent comes out of the same budget; the address loop only
+    // gets what is left, and splits that fairly across the addresses.
+    let remaining = budget.saturating_sub(dns_elapsed);
+
     // DNS really was measured, so report it even when no address answers;
     // the connect leg stays 0 because it was never successfully measured.
-    let tcp_connect = connect_first_reachable(&addrs, CONNECTION_PROBE_MAX).unwrap_or(0);
+    let tcp_connect = connect_first_reachable_with(&addrs, remaining, connect)
+        .map(|(_, elapsed)| elapsed)
+        .unwrap_or(0);
     Ok((dns_lookup, tcp_connect))
+}
+
+fn probe_connection(host: String, port: u16, budget: Duration) -> Result<(u64, u64), String> {
+    probe_connection_with(host, port, budget, |addr, budget| {
+        std::net::TcpStream::connect_timeout(addr, budget).map(drop)
+    })
 }
 
 /// Public entry point. Deliberately infallible: there is no error channel for a
@@ -286,7 +306,7 @@ async fn measure_connection_timings(url: &Url, budget: Duration) -> (u64, u64) {
     };
     let host = host.to_string();
 
-    let handle = tokio::task::spawn_blocking(move || probe_connection(host, port));
+    let handle = tokio::task::spawn_blocking(move || probe_connection(host, port, budget));
     let probe = async move {
         match handle.await {
             Ok(result) => result,
@@ -7811,6 +7831,43 @@ mod tests {
         // A blackholed first address may only spend its own share.
         assert_eq!(seen[0].1, Duration::from_millis(2500), "{seen:?}");
         assert_eq!(seen.len(), 2, "second address never tried: {seen:?}");
+    }
+
+    #[test]
+    fn test_probe_connection_hands_the_callers_budget_to_the_addresses() {
+        // The bug this pins: `probe_connection` used to take no budget at all
+        // and the address loop used CONNECTION_PROBE_MAX, so the caller's
+        // budget died between the timeout wrapper and the loop. The fair-share
+        // guarantee then only held when the caller happened to pass 5s, and a
+        // request with 2s left would give its first address 2.5s - the outer
+        // timeout fires and the second address is never tried at all.
+        //
+        // localhost resolves to at least one address on every supported
+        // platform; assert against the count actually resolved so this cannot
+        // silently pass on a single-stack machine.
+        let mut seen: Vec<Duration> = vec![];
+        let budget = Duration::from_secs(2);
+        let outcome = probe_connection_with("localhost".to_string(), 9, budget, |_, given| {
+            seen.push(given);
+            Err(std::io::Error::other("refused"))
+        });
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(!seen.is_empty(), "no address was tried");
+        // Each address gets at most its fair share of the caller's budget, and
+        // in particular never the CONNECTION_PROBE_MAX constant.
+        let fair_share = budget / seen.len() as u32;
+        assert!(
+            seen[0] <= fair_share,
+            "first address got {:?}, more than its {:?} share of the caller's {:?}",
+            seen[0],
+            fair_share,
+            budget
+        );
+        assert!(
+            seen[0] < CONNECTION_PROBE_MAX,
+            "first address got the constant ({:?}) instead of the caller's budget",
+            seen[0]
+        );
     }
 
     #[test]
