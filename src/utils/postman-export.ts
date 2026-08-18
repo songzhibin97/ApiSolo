@@ -16,17 +16,29 @@ export interface PostmanExportWarning {
 /**
  * An upload whose bytes live inside ApiSolo has no path Postman could
  * resolve. `filePath` is empty everywhere in this app (uploads are inlined as
- * base64 by design), so the presence of the content field -- not its
- * truthiness -- is what separates "we hold the bytes" from "we only ever had
- * a name". A zero-byte file has an empty string here and must be treated
- * exactly like any other picked file.
+ * base64 by design), so whether we hold the bytes is decided by the content
+ * field being a string -- not by its truthiness, and not by an `!== undefined`
+ * check.
+ *
+ * Three distinct states reach here, and only the first means "we hold bytes":
+ *
+ *   ""         a zero-byte file the user picked; readFileAsBase64 returns an
+ *              empty string, so truthiness would wrongly say "no content"
+ *   null       Rust blanked it. sanitize_saved_request_for_persistence sets
+ *              file_content/binary_content to None on every read
+ *              (lib.rs:1439 and :1453), and neither Option<String> carries
+ *              skip_serializing_if -- the only field in that file that does is
+ *              EnvVariable.vault_key -- so it serializes as JSON null, not as
+ *              an absent key. `!== undefined` is therefore always true for
+ *              anything loaded from disk.
+ *   undefined  an import placeholder that never had content
  */
 function hasInlinedFileContent(item: FormDataItem) {
-  return item.valueType === "file" && item.fileContent !== undefined
+  return item.valueType === "file" && typeof item.fileContent === "string"
 }
 
 function hasInlinedBinaryContent(body: RequestBody) {
-  return body.type === "binary" && body.binaryContent !== undefined
+  return body.type === "binary" && typeof body.binaryContent === "string"
 }
 
 function unexportableFileNote(fileName: string) {
