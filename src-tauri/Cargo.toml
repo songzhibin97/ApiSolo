@@ -29,7 +29,7 @@ axum = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "socks"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 uuid = { version = "1", features = ["v4"] }
@@ -40,6 +40,9 @@ base64 = "0.22"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
+flate2 = "1"
+brotli-decompressor = "5"
+encoding_rs = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
@@ -53,6 +56,7 @@ keyring = { version = "3.6.3", default-features = false, features = ["linux-nati
 [dev-dependencies]
 tempfile = "3"
 wiremock = "0.5"
+tokio = { version = "1", features = ["test-util"] }
 
 [[example]]
 name = "dev_server"
