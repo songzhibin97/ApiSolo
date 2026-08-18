@@ -2262,6 +2262,35 @@ fn write_secret_metadata(file_path: &Path, variables: &[EnvVariable]) -> Result<
         .map_err(|error| format!("Failed to save environment secret metadata: {error}"))
 }
 
+/// Renames a file we could not parse, keeping its bytes byte-for-byte. The
+/// alternative — carrying on and overwriting it — destroys the only record of
+/// which vault entries the environment owned.
+fn quarantine_unreadable_file(path: &Path) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("Cannot quarantine {}: no parent directory", path.display()))?;
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("Cannot quarantine {}: invalid file name", path.display()))?;
+
+    let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let target = parent.join(format!("{stem}.corrupt-{timestamp}.json"));
+    fs::rename(path, &target)
+        .map_err(|error| format!("Failed to quarantine unreadable file: {error}"))?;
+    Ok(target)
+}
+
+fn read_previous_secret_metadata(path: &Path) -> Result<Vec<EnvVariable>, String> {
+    match read_env_variables(path, true) {
+        Ok(variables) => Ok(variables),
+        Err(_) => {
+            quarantine_unreadable_file(path)?;
+            Ok(Vec::new())
+        }
+    }
+}
+
 fn merge_environment_variables(
     mut base: Vec<EnvVariable>,
     overlay: Vec<EnvVariable>,
@@ -2910,8 +2939,12 @@ fn load_environment(project: String, name: String) -> Result<Environment, String
     })
 }
 
+/// `create` is the caller's statement of intent: true means "this name has
+/// never been saved before". Guessing it here is what let a typo silently
+/// overwrite an existing environment. Absent means the old behaviour, so a
+/// rollback of the frontend cannot break this.
 #[tauri::command]
-fn save_environment(project: String, env: Environment) -> Result<(), String> {
+fn save_environment(project: String, env: Environment, create: Option<bool>) -> Result<(), String> {
     let resolved = resolve_project(&project)?;
     let env_dir = project_environments_dir(&resolved.dir);
     fs::create_dir_all(&env_dir)
@@ -2925,6 +2958,23 @@ fn save_environment(project: String, env: Environment) -> Result<(), String> {
     let normal_path = environment_file_path(&resolved.dir, name, false)?;
     let secrets_path = environment_file_path(&resolved.dir, name, true)?;
 
+    // First statement that touches disk state, deliberately. STAGING and
+    // staging normalise to one file, and creating the second used to overwrite
+    // the first and orphan its secrets. The guard sits ahead of every read,
+    // rename and write so a rejection leaves the directory byte-identical -
+    // including not quarantining a metadata file that happens to be corrupt.
+    if create.unwrap_or(false) && (normal_path.exists() || secrets_path.exists()) {
+        let existing = normal_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.strip_suffix(".env"))
+            .unwrap_or(name)
+            .to_string();
+        return Err(format!("Environment already exists: {existing}"));
+    }
+
+    let previous = read_previous_secret_metadata(&secrets_path)?;
+
     let mut normal_variables = Vec::new();
     let mut secret_variables = Vec::new();
 
@@ -2934,11 +2984,10 @@ fn save_environment(project: String, env: Environment) -> Result<(), String> {
         }
 
         if variable.secret {
-            let vault_key = if variable.vault_key.trim().is_empty() {
-                vault_key_for(&resolved.dir, name, &variable.key)
-            } else {
-                variable.vault_key
-            };
+            // Always recomputed. The frontend never round-trips a vault key,
+            // and trusting one it did send would reintroduce the three-way
+            // disagreement over which spelling addresses a secret.
+            let vault_key = vault_key_for(&resolved.dir, name, &variable.key);
 
             if variable.value.is_empty() {
                 delete_secret_value(&vault_key)?;
@@ -2962,33 +3011,88 @@ fn save_environment(project: String, env: Environment) -> Result<(), String> {
         }
     }
 
+    // Keys this environment used to own and no longer lists: a deleted secret
+    // row, a renamed one, or one demoted to a plain variable. Their values
+    // stayed in the vault forever, invisible and unreachable from the UI.
+    let mut removed: Vec<String> = Vec::new();
+    for variable in &previous {
+        let recorded = variable.vault_key.trim();
+        if recorded.is_empty() {
+            continue;
+        }
+        if secret_variables
+            .iter()
+            .any(|kept| kept.vault_key == recorded)
+        {
+            continue;
+        }
+        if !removed.contains(&recorded.to_string()) {
+            removed.push(recorded.to_string());
+        }
+    }
+
+    if !removed.is_empty() {
+        let index_before = index_referenced_vault_keys()?;
+        record_vault_key_collisions(&removed, &index_before)?;
+        enqueue_pending_prune(&removed)?;
+    }
+
     write_atomic(&normal_path, pretty_json(&normal_variables)?.as_bytes())
         .map_err(|error| format!("Failed to save environment: {error}"))?;
+    // The pointer flips here; only now are the removed keys truly unreferenced.
     write_secret_metadata(&secrets_path, &secret_variables)?;
+
+    retry_pending_prune(&removed);
     touch_project(&resolved.dir)
 }
 
 #[tauri::command]
 fn delete_environment(project: String, name: String) -> Result<(), String> {
     let resolved = resolve_project(&project)?;
+
+    // Ahead of the "does not exist" early return on purpose. A previous call
+    // may have removed the files and then failed to finish cleanup; this is the
+    // one entry point a user will trigger again, so if it bailed out early the
+    // queue would never find another taker.
+    retry_pending_prune(&read_pending_prune()?);
+
     let normal_path = environment_file_path(&resolved.dir, &name, false)?;
     let secrets_path = environment_file_path(&resolved.dir, &name, true)?;
     let normal_exists = normal_path.exists();
     let secrets_exists = secrets_path.exists();
+
+    let mut candidates: Vec<String> = Vec::new();
+    if secrets_exists {
+        for variable in read_env_variables(&secrets_path, true).unwrap_or_default() {
+            let recorded = variable.vault_key.trim();
+            let owned = if recorded.is_empty() {
+                vault_key_for(&resolved.dir, &name, &variable.key)
+            } else {
+                recorded.to_string()
+            };
+            if !candidates.contains(&owned) {
+                candidates.push(owned);
+            }
+            for candidate in legacy_vault_key_candidates(&resolved.dir, &name, &variable) {
+                if !candidates.contains(&candidate) {
+                    candidates.push(candidate);
+                }
+            }
+        }
+    }
+
+    // Queue before deleting the files, not after. The old order deleted vault
+    // entries first, so a crash in the middle left the environment on disk with
+    // its secrets already gone.
+    if !candidates.is_empty() {
+        enqueue_pending_prune(&candidates)?;
+    }
 
     if normal_exists {
         fs::remove_file(&normal_path)
             .map_err(|error| format!("Failed to delete environment: {error}"))?;
     }
     if secrets_exists {
-        for variable in read_env_variables(&secrets_path, true)? {
-            let vault_key = if variable.vault_key.trim().is_empty() {
-                vault_key_for(&resolved.dir, &name, &variable.key)
-            } else {
-                variable.vault_key
-            };
-            delete_secret_value(&vault_key)?;
-        }
         fs::remove_file(&secrets_path)
             .map_err(|error| format!("Failed to delete environment secrets: {error}"))?;
     }
@@ -2996,6 +3100,9 @@ fn delete_environment(project: String, name: String) -> Result<(), String> {
         return Err("Environment does not exist".to_string());
     }
 
+    // Prune only now: an entry another environment still names is kept, which
+    // is what stops deleting 测试 from taking 生产's token with it.
+    retry_pending_prune(&candidates);
     touch_project(&resolved.dir)
 }
 
@@ -4228,6 +4335,8 @@ struct EnvironmentNameArgs {
 struct SaveEnvironmentArgs {
     project: String,
     env: Environment,
+    #[serde(default)]
+    create: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -4385,7 +4494,7 @@ async fn api_load_environment(Json(args): Json<EnvironmentNameArgs>) -> impl Int
 }
 
 async fn api_save_environment(Json(args): Json<SaveEnvironmentArgs>) -> impl IntoResponse {
-    api_unit(save_environment(args.project, args.env))
+    api_unit(save_environment(args.project, args.env, args.create))
 }
 
 async fn api_delete_environment(Json(args): Json<EnvironmentNameArgs>) -> impl IntoResponse {
@@ -5374,6 +5483,7 @@ mod tests {
                     sample_env_variable("apiKey", "secret-key-123", true),
                 ],
             },
+            None,
         )
         .unwrap();
 
@@ -5984,6 +6094,7 @@ mod tests {
                         },
                     ],
                 },
+                None,
             )
             .unwrap();
 
@@ -9501,6 +9612,7 @@ mod tests {
                 name: "staging".to_string(),
                 variables: vec![sample_env_variable("baseUrl", "http://localhost", false)],
             },
+            None,
         )
         .unwrap();
 
@@ -10490,5 +10602,311 @@ mod tests {
 
         acknowledge_secret_key_collision(shared).unwrap();
         assert!(get_secret_key_collisions().unwrap().is_empty());
+    }
+
+    // ---------------------------------------------------------------- D03 §四
+    // Creating, saving and deleting environments.
+
+    fn d03_env_dir_names(home: &Path, project_slug: &str) -> Vec<String> {
+        d03_dir_file_names(
+            &home
+                .join("ApiSolo/projects")
+                .join(project_slug)
+                .join("environments"),
+        )
+    }
+
+    fn d03_env(name: &str, variables: Vec<EnvVariable>) -> Environment {
+        Environment {
+            name: name.to_string(),
+            variables,
+        }
+    }
+
+    #[test]
+    fn test_save_environment_rejects_conflicting_slug() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Slug".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        save_environment(
+            "Slug".to_string(),
+            d03_env("staging", vec![sample_env_variable("baseUrl", "http://a", false)]),
+            Some(true),
+        )
+        .unwrap();
+
+        for conflicting in ["STAGING", "Staging"] {
+            let error = save_environment(
+                "Slug".to_string(),
+                d03_env(conflicting, vec![sample_env_variable("baseUrl", "http://b", false)]),
+                Some(true),
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("staging"),
+                "the error must name the environment it collides with: {error}"
+            );
+        }
+
+        // The original is untouched.
+        let variables = load_environment("Slug".to_string(), "staging".to_string())
+            .unwrap()
+            .variables;
+        assert_eq!(variables[0].value, "http://a");
+    }
+
+    #[test]
+    fn test_conflicting_slug_rejection_touches_no_disk_state() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Slug".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        save_environment(
+            "Slug".to_string(),
+            d03_env("staging", vec![sample_env_variable("token", "secret", true)]),
+            Some(true),
+        )
+        .unwrap();
+
+        // Corrupt the metadata deliberately: rejecting must not "helpfully"
+        // quarantine it on the way out, which would leave a renamed backup
+        // behind and make the rejection visible on disk.
+        let secrets_path = d03_env_file(temp_home.path(), "slug", "staging", true);
+        let normal_path = d03_env_file(temp_home.path(), "slug", "staging", false);
+        std::fs::write(&secrets_path, "{ not json").unwrap();
+
+        let before_secrets = std::fs::read(&secrets_path).unwrap();
+        let before_normal = std::fs::read(&normal_path).unwrap();
+        let before_names = d03_env_dir_names(temp_home.path(), "slug");
+
+        assert!(save_environment(
+            "Slug".to_string(),
+            d03_env("STAGING", vec![sample_env_variable("token", "other", true)]),
+            Some(true),
+        )
+        .is_err());
+
+        assert_eq!(std::fs::read(&secrets_path).unwrap(), before_secrets);
+        assert_eq!(std::fs::read(&normal_path).unwrap(), before_normal);
+        assert_eq!(
+            d03_env_dir_names(temp_home.path(), "slug"),
+            before_names,
+            "the rejected save left a new file behind"
+        );
+    }
+
+    #[test]
+    fn test_save_environment_updates_existing_environment() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Slug".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        save_environment(
+            "Slug".to_string(),
+            d03_env("staging", vec![sample_env_variable("baseUrl", "http://a", false)]),
+            Some(true),
+        )
+        .unwrap();
+
+        // create=Some(false) and create=None are both updates and must pass
+        // straight through the guard.
+        for (label, create) in [("explicit-false", Some(false)), ("absent", None)] {
+            save_environment(
+                "Slug".to_string(),
+                d03_env(
+                    "staging",
+                    vec![sample_env_variable("baseUrl", &format!("http://{label}"), false)],
+                ),
+                create,
+            )
+            .unwrap_or_else(|error| panic!("{label}: update was rejected: {error}"));
+
+            let variables = load_environment("Slug".to_string(), "staging".to_string())
+                .unwrap()
+                .variables;
+            assert_eq!(variables[0].value, format!("http://{label}"));
+        }
+    }
+
+    #[test]
+    fn test_save_environment_removes_vault_value_for_deleted_secret() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Del".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        save_environment(
+            "Del".to_string(),
+            d03_env(
+                "dev",
+                vec![
+                    sample_env_variable("keep", "keep-value", true),
+                    sample_env_variable("drop", "drop-value", true),
+                ],
+            ),
+            Some(true),
+        )
+        .unwrap();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/del");
+        let dropped = vault_key_for(&project_dir, "dev", "drop");
+        let kept = vault_key_for(&project_dir, "dev", "keep");
+        assert_eq!(load_secret_value(&dropped).unwrap(), "drop-value");
+
+        save_environment(
+            "Del".to_string(),
+            d03_env("dev", vec![sample_env_variable("keep", "keep-value", true)]),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_secret_value(&dropped).unwrap(),
+            "",
+            "the removed secret's value is still in the backend"
+        );
+        assert_eq!(load_secret_value(&kept).unwrap(), "keep-value");
+    }
+
+    #[test]
+    fn test_save_environment_removes_vault_value_for_renamed_or_demoted_secret() {
+        for (label, replacement) in [
+            ("renamed", sample_env_variable("tokenV2", "token-value", true)),
+            ("demoted", sample_env_variable("token", "token-value", false)),
+        ] {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            create_project("Ren".to_string(), String::new()).unwrap();
+            configure_local_secret_storage_for_test();
+
+            save_environment(
+                "Ren".to_string(),
+                d03_env("dev", vec![sample_env_variable("token", "token-value", true)]),
+                Some(true),
+            )
+            .unwrap();
+
+            let project_dir = temp_home.path().join("ApiSolo/projects/ren");
+            let original = vault_key_for(&project_dir, "dev", "token");
+            assert_eq!(load_secret_value(&original).unwrap(), "token-value");
+
+            save_environment("Ren".to_string(), d03_env("dev", vec![replacement]), None).unwrap();
+
+            assert_eq!(
+                load_secret_value(&original).unwrap(),
+                "",
+                "{label}: the old vault entry outlived the variable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_save_environment_quarantines_unreadable_secret_metadata() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Quar".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        let secrets_path = d03_env_file(temp_home.path(), "quar", "dev", true);
+        std::fs::create_dir_all(secrets_path.parent().unwrap()).unwrap();
+        let original = br#"[{"key":"token","value":"","secret":true,"vault_key":"#.to_vec();
+        std::fs::write(&secrets_path, &original).unwrap();
+
+        // Update path: no `create` flag, so the guard does not fire.
+        save_environment(
+            "Quar".to_string(),
+            d03_env("dev", vec![sample_env_variable("token", "fresh", true)]),
+            None,
+        )
+        .unwrap();
+
+        let quarantined: Vec<String> = d03_env_dir_names(temp_home.path(), "quar")
+            .into_iter()
+            .filter(|name| name.contains(".corrupt-"))
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "expected exactly one quarantined file, saw {quarantined:?}"
+        );
+        assert!(quarantined[0].starts_with("dev.env.secrets.corrupt-"));
+        assert_eq!(
+            std::fs::read(
+                temp_home
+                    .path()
+                    .join("ApiSolo/projects/quar/environments")
+                    .join(&quarantined[0])
+            )
+            .unwrap(),
+            original,
+            "the quarantined file's bytes were modified"
+        );
+    }
+
+    #[test]
+    fn test_load_environment_fails_loudly_on_unreadable_environment_file() {
+        for secrets in [false, true] {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            create_project("Loud".to_string(), String::new()).unwrap();
+            configure_local_secret_storage_for_test();
+
+            save_environment(
+                "Loud".to_string(),
+                d03_env("dev", vec![sample_env_variable("baseUrl", "http://a", false)]),
+                Some(true),
+            )
+            .unwrap();
+
+            let path = d03_env_file(temp_home.path(), "loud", "dev", secrets);
+            std::fs::write(&path, "{ not json").unwrap();
+
+            // Rendering an unreadable environment as empty is the lie that
+            // makes the next save wipe it.
+            assert!(
+                load_environment("Loud".to_string(), "dev".to_string()).is_err(),
+                "secrets={secrets}: an unreadable environment loaded as empty"
+            );
+        }
+    }
+
+    #[test]
+    fn test_delete_environment_keeps_secrets_another_environment_still_uses() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Legacy".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        // Un-migrated collided pair: both name the same old key.
+        let project_dir = temp_home.path().join("ApiSolo/projects/legacy");
+        let shared = legacy_vault_key_for(&project_dir, "生产", "token");
+        save_secret_value(&shared, "SURVIVOR").unwrap();
+        for stem in ["生产", "测试"] {
+            d03_write_recorded_metadata(
+                &d03_env_file(temp_home.path(), "legacy", stem, true),
+                &[("token", &shared)],
+            );
+        }
+
+        delete_environment("Legacy".to_string(), "测试".to_string()).unwrap();
+
+        assert_eq!(
+            load_secret_value(&shared).unwrap(),
+            "SURVIVOR",
+            "deleting 测试 took 生产's token with it"
+        );
+        assert_eq!(d03_env_value("Legacy", "生产", "token"), "SURVIVOR");
     }
 }
