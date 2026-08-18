@@ -231,3 +231,43 @@ harness 已加 P14 守卫：拒绝运行 patch 为空、锚点不唯一、或写
 | **重分类为缺陷** | **1**（`WIRE_PROBE_CONST`） |
 
 测试数：main 基线 81 → 本切片 142。
+
+---
+
+## 收尾清单 —— 必须实跑，回填真实名单，不打勾
+
+这张清单的存在理由：本轮我在**同一轮里两次**踩了同一个陷阱——
+`KAPIKEY` 因为「用例里只有一行同名 header，收敛 1→1 不可观察」而存活；
+补强 api-key 那条断言时，我又写了一个只有一行 `Authorization` 的用例，**再次存活**。
+中间我已经把这个形态写进了提交信息。**「记住教训」这个机制拦不住它**，
+能拦住的只有收尾时的机械动作。
+
+规则：每一条声称「单塌」的断言，收尾时回填**它实际杀死的用例名单**。
+
+- 名单里出现**第二个名字** ⇒ 不是单塌，该断言没有被单独证明
+- 名单**为空** ⇒ 没跑，或补丁是空操作（P14）
+- **只允许回填名单，不允许打勾**——勾可以在动作之前打，名单不行
+
+### 本轮回填（来源：`/tmp/d02_verify.py` 实跑输出）
+
+| 声称单塌的断言 | 施加的变异 | 实际杀死的用例名单 | 判定 |
+|---|---|---|---|
+| §33 空 JSON 按无 body 处理 | 空内容改为参与解析 | `test_json_body_that_is_only_whitespace_sends_no_body` | 单塌 ✓ |
+| §11 原始字节与长度保留 | `Undecodable` 分支返回空 `Vec` | `test_undecodable_encoding_preserves_the_original_bytes_and_length` | 单塌 ✓ |
+| §13 错误带底层原因 | 解码错误丢掉 `{error}` | `test_corrupt_stream_error_carries_the_underlying_cause` | 单塌 ✓ |
+| §16 用户的 Accept-Encoding 保留 | 剥掉该头 | `test_user_supplied_accept_encoding_is_sent_unchanged` | 单塌 ✓ |
+| §17 生产路径传 Content-Type | 调用点改传空串 | `test_declared_charset_is_honoured_through_the_request_path` | 单塌 ✓ |
+| §28 binary/none 不加 Content-Type | binary 分支加该头 | `test_binary_and_none_bodies_add_no_content_type` | 单塌 ✓ |
+| §29 basic 参与 Authorization 收敛 | 守卫去掉 `basic` | `test_basic_auth_replaces_a_manual_authorization_header` | 单塌 ✓ |
+| §30 api-key 不参与收敛 | 守卫加上 `api-key` | 第一次：**（空）** ／ 修正用例后：`test_api_key_mode_leaves_a_manual_authorization_header_alone` | **第一次失败**，见下 |
+| §38/§41 地址循环用调用方预算 | 循环改回常量（已发布缺陷） | `test_probe_connection_hands_the_callers_budget_to_the_addresses` | 单塌 ✓ |
+
+**第八行是这张清单当场抓到的东西。** 名单为空意味着那条补强断言当时并没有承重；
+原因是用例只放了一行手写 `Authorization`，keep-last 收敛 1→1 不可观察。
+改成两行后名单才出现。若没有「回填名单」这个动作，它会以「已补强」的姿态混过去——
+和它要修的那个 `KAPIKEY` 缺陷一模一样。
+
+### 下次收尾还要跑的两条
+
+- 合并到 main 之后确认 `exportPostmanCollection treats a Rust-blanked file field as having no in-memory content` 这条前端回归测试**确实存在**（它随 PR #15 进入 main，本分支从更早的 `c9221d3` 切出，因此当前树内没有它）。回填的是**测试总数**，不是勾。
+- 变异 harness 每次开跑前，先用一个**已知必红**的 mutant 验证 harness 自身，回填它杀死的用例名。本轮用的是 `KNUL`。
