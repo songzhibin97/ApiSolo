@@ -191,6 +191,19 @@
 | A12 | D03 的 I6（history 健康度） | **采纳起草者的偏离**：新增 `get_history_health`，不改 `load_history` 的签名 | owner 原倾向改签名。起草者指出按钮禁用条件在 `HistoryPanel.vue:287`，D05 无论如何都要改——改签名换来一次边界违规，用户却依然点不动清空。理由成立 |
 | A10 | `HistoryEntry` 的 schema 追加 | D02 的 `responseBodyKind` 归 **D03**；D07b 的 `note`/`starred` 归 **D07** | 三者都是 `#[serde(default)]` 追加字段，磁盘格式向后兼容。**已知缺口**：D02 合并到 D03 合并之间，从历史重放二进制响应会把 marker 当普通文本显示，需记录 |
 
+| A13 | D03 的文件范围例外 | **批准**：可在 `src-tauri/Cargo.toml` 增加 `syn` 作为 dev-dependency 并更新 `Cargo.lock`，**仅限该声明** | 同 A11 的限定。`syn` 本就作为传递依赖存在于锁中，实际只 +1 行 |
+| A14 | checker 约束反过来要求钥匙串路径背上全局锁 | **驳回，改缩小 checker 目标** | 起草者判为「无害（逐 key 串行）」，评审实查推翻：`LOCAL_VAULT_TX` 是**全局锁**、串行化所有 key 的钥匙串读写、盖住 macOS 同步系统调用与**授权弹窗**、mutex 中毒会让无关的钥匙串路径失败。**这是产品让步不是测试设施**，正是 P7 记录的那次事故的镜像。解法：抽出三个天然 guard-first 的 helper，三个外层 dispatcher 移出 `TARGETS`。代价（外层不再静态覆盖）已入账 |
+| A15 | D05 的文件范围例外 | **批准**：D05 可改 `src/components/**` 之外的 `src/stores/**`、`src/utils/**`、`src/i18n/**` | backlog 原将 D05 限定在 `src/components/**`，但它自己的两个缺陷在 `src/stores/**`，且三条 D06 交接全部需要 `src/utils/**` 与 `src/i18n/**`。同 A11：边界是 owner 划错的 |
+| A16 | D06 的 i18n key 归属与数量 | **改判归 D05；数量由 6 更正为 7** | A2 原裁定归 D06，但 **D06 合并时一个都没落地**（其 merge commit 未触碰任何 `src/i18n/**`），D01 也没有。既然 D05 无论如何都要动 i18n 且承载全部三条交接，由它一并落地。数量更正：backlog 的「6 个」只数了 `curlImport.*`，漏了 `export.warning.fileContentNotExportable` |
+| A17 | `deleteEntry` 死代码的归属 | **归 D07a**，不归 D05 | D01 的 non-goals 把「历史单条删除 UI」推给「D05 / D07」，而 D05 的表里从未列入。D07a（从历史保存到集合）本来就要改 `HistoryPanel` 的行结构，一并接上更自然 |
+| A18 | D04 与 D05 在 `src/stores/tabs.ts` 上冲突 | **D05 先，D04 后** | 两者写同一文件的不同函数，必须串行。D05 承载 D06 的发布阻断依赖，优先级更高 |
+
+### 已发布缺陷（main 上，D06 合并后发现）
+
+| 位置 | 严重度 | 问题 |
+|---|---|---|
+| `postman-export.ts:25` `:29` | high | **谓词 `fileContent !== undefined` 恒为真**。Rust 每次读取保存的请求都会 `item.file_content = None`（`lib.rs:1453`），而 `Option<String>` **没有 `skip_serializing_if`**（全文件唯一一个在 `EnvVariable.vault_key` 上），故序列化成 JSON `null`，而 `null !== undefined` 恒真。<br>**后果**：导出的 collection 对每个文件行写入虚假说明「内容存在 ApiSolo 里、无法导出」（内容从来不在那里），**并整个丢掉 `src`**，文件名在 Postman 里不可恢复——比 D06 在 R1 修掉的「伪造路径」更糟，伪造路径至少留下文件名。<br>**为什么四轮规格评审 + 一轮代码复审全部漏掉**：D06 的 fixture 用过 `"aGVsbG8="` / `""` / `undefined`，**`null` 用过 0 次**。前端类型声明是 `fileContent?: string`，于是所有人照着**自己这一侧的类型声明**推 fixture 形状，而不是照着**线上真实的序列化结果**。两层各自都对，**它们之间的类型契约没有任何测试覆盖**。<br>**出处：D05 规格阶段，由建模真实 IPC 形状发现** |
+
 ### spec 阶段新发现（尚未归入任何切片）
 
 - `src/types/index.ts:205` 声明 `vaultKey?: string`，Rust 序列化为 `vault_key`——**两侧都从不填充的死字段**。由 D03 顺带清理或单列一项。
