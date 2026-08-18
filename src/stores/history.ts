@@ -1,9 +1,11 @@
 import { computed, ref } from "vue"
 import { defineStore } from "pinia"
 
+import i18n from "../i18n"
 import type { HistoryEntry, HistoryGroupMode } from "../types"
 import { recordConsoleEntry } from "./console"
 import { invoke } from "../utils/invoke"
+import { sanitizeHistoryEntry } from "../utils/redaction"
 import {
   filterEntries,
   groupByMethod,
@@ -36,7 +38,28 @@ export const useHistoryStore = defineStore("history", () => {
   })
 
   async function loadHistory() {
-    entries.value = sortEntries(await invoke<HistoryEntry[]>("load_history"))
+    // A read failure propagates: the panel shows it and nothing is written back.
+    const raw = await invoke<HistoryEntry[]>("load_history")
+    const sanitized = raw.map(sanitizeHistoryEntry)
+    const changed = sanitized.filter((entry, index) => JSON.stringify(entry) !== JSON.stringify(raw[index]))
+
+    // Assign first so the panel is showing clean data even if the write-back fails.
+    entries.value = sortEntries(sanitized)
+
+    if (changed.length === 0) {
+      return
+    }
+
+    try {
+      await invoke("update_history_entries", { entries: changed })
+      recordConsoleEntry(
+        "info",
+        i18n.global.t("history.legacySanitized", { count: changed.length }),
+        "app",
+      )
+    } catch (error) {
+      recordConsoleEntry("error", `[app] History sanitize write-back failed: ${error}`, "app")
+    }
   }
 
   function appendEntry(entry: HistoryEntry) {
