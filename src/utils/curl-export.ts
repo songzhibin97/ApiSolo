@@ -1,4 +1,5 @@
 import type { FormDataItem, KeyValuePair, Tab } from "../types"
+import { encodeQueryComponentPreservingTemplates, splitUrlParts } from "./url-query"
 
 export function exportCurl(tab: Tab) {
   const parts = ["curl"]
@@ -39,27 +40,37 @@ function enabledPairs(items: KeyValuePair[]) {
   return items.filter((item) => item.enabled && item.key.trim())
 }
 
+/**
+ * The params table is the single source of the query string, exactly as the
+ * URL bar renders it, so a query string left over in `tab.url` (which a cURL
+ * import leaves behind) is not emitted a second time. The base is passed
+ * through untouched: no `new URL` round trip, so templates, protocol-less
+ * hosts and the user's own casing all survive.
+ */
 function buildUrl(tab: Tab) {
-  const fallbackBase = "http://localhost"
-  const url = new URL(tab.url || fallbackBase, fallbackBase)
-
-  for (const pair of enabledPairs(tab.params)) {
-    url.searchParams.append(pair.key, pair.value)
-  }
+  const { baseUrl, hash } = splitUrlParts(tab.url)
+  const pairs = enabledPairs(tab.params).map(({ key, value }) => ({ key, value }))
 
   if (tab.auth.type === "api-key" && tab.auth.apiKey?.addTo === "query" && tab.auth.apiKey.key) {
-    url.searchParams.set(tab.auth.apiKey.key, tab.auth.apiKey.value ?? "")
+    // Replace rather than append, matching the previous searchParams.set().
+    const key = tab.auth.apiKey.key
+    const entry = { key, value: tab.auth.apiKey.value ?? "" }
+    const existing = pairs.findIndex((pair) => pair.key === key)
+    if (existing === -1) {
+      pairs.push(entry)
+    } else {
+      pairs[existing] = entry
+    }
   }
 
-  if (!tab.url) {
-    return url.pathname + url.search
-  }
+  const query = pairs
+    .map(
+      (pair) =>
+        `${encodeQueryComponentPreservingTemplates(pair.key)}=${encodeQueryComponentPreservingTemplates(pair.value)}`,
+    )
+    .join("&")
 
-  if (!hasProtocol(tab.url)) {
-    return `${url.pathname}${url.search}${url.hash}`
-  }
-
-  return url.toString()
+  return `${baseUrl}${query ? `?${query}` : ""}${hash}`
 }
 
 function buildBodyArgs(tab: Tab): Array<[string, string]> {
@@ -91,8 +102,4 @@ function formatFormDataValue(item: FormDataItem) {
 
 function shellEscape(value: string) {
   return `'${value.replace(/'/g, `'\"'\"'`)}'`
-}
-
-function hasProtocol(value: string) {
-  return /^[a-z][a-z0-9+.-]*:\/\//i.test(value)
 }
