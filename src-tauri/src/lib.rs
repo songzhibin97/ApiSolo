@@ -7603,6 +7603,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_api_key_header_replaces_a_manual_row_of_the_same_name() {
+        // The existing e2e for api-key auth supplies no header row of its own,
+        // so insert and append produce the identical single value and the
+        // mutation ledger found `insert -> append` surviving. Only a manual row
+        // with the same name can tell the two apart.
+        let server = d02_serve(b"ok", &[]).await;
+        let mut args = d02_args("GET", server.uri());
+        args.headers = vec![d02_header("X-Custom-Auth", "manual-stale-value")];
+        args.auth = AuthInput {
+            auth_type: "api-key".to_string(),
+            basic: None,
+            bearer: None,
+            api_key: Some(ApiKeyAuth {
+                key: "X-Custom-Auth".to_string(),
+                value: "my-secret-key".to_string(),
+                add_to: "header".to_string(),
+            }),
+        };
+        send_request(args).await.unwrap();
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            d02_header_values(&received[0], "x-custom-auth"),
+            vec!["my-secret-key".to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn test_json_body_is_sent_verbatim() {
         let server = d02_serve(b"ok", &[]).await;
         // Indented, non-alphabetical, duplicate key, oversized integer: every
