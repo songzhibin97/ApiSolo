@@ -800,6 +800,113 @@ fn io_checkpoint(tag: &'static str) {
     }
 }
 
+/// Test-only rendezvous keyed by name, used by the lock tests to park a thread
+/// inside a critical section — *after* the guard is taken and *before* the
+/// first read — so the test thread can prove the lock was already held when the
+/// snapshot was about to be read. Compiles away entirely outside `cfg(test)`:
+/// an empty `#[inline(always)]` function emits no instructions, so this is a
+/// test fixture rather than a concession in the shipped product.
+#[cfg(not(test))]
+#[inline(always)]
+fn checkpoint(_name: &'static str) {}
+
+#[cfg(test)]
+fn checkpoint(name: &'static str) {
+    tests::checkpoints::hit(name)
+}
+
+#[cfg(test)]
+fn atomic_temp_paths() -> &'static StdMutex<Vec<PathBuf>> {
+    static PATHS: OnceLock<StdMutex<Vec<PathBuf>>> = OnceLock::new();
+    PATHS.get_or_init(|| StdMutex::new(Vec::new()))
+}
+
+/// Records every temporary file `write_atomic` actually created. Asserting on
+/// the final file cannot show how many temp files existed — one file can only
+/// ever show one name — so the concurrency test reads this log instead.
+#[cfg(test)]
+fn record_atomic_temp_path(path: &Path) {
+    atomic_temp_paths()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(path.to_path_buf());
+}
+
+/// Writes `contents` to `path` by filling a uniquely named temporary file in
+/// the same directory and renaming it over the target. A reader therefore sees
+/// either the complete old contents or the complete new ones, never the
+/// truncation window that `fs::write` leaves open.
+///
+/// The temp name carries a uuid deliberately. A deterministic name lets two
+/// concurrent writers open the *same* inode and interleave their bytes, which
+/// is how an earlier draft produced `BBBBAAAA` in a target file. The cost of
+/// uniqueness is that a crash leaves the temp file behind instead of having it
+/// reused by the next write; those leftovers are inert (no scanner recognises
+/// them) and documented as user-removable.
+///
+/// Not promised: power-cut durability. The parent-directory sync below is best
+/// effort, so after a power cut the old contents may come back — but the file
+/// is never left corrupt.
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("Failed to write {}: no parent directory", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("Failed to write {}: invalid file name", path.display()))?;
+
+    // Leading dot + `.tmp` extension keeps these out of the collection tree
+    // (which filters on `extension == "json"`) and the environment list (which
+    // filters on `.env.json` / `.env.secrets.json` suffixes).
+    let temp_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            return Err(format!(
+                "Failed to create temporary file for {}: {error}",
+                path.display()
+            ))
+        }
+    };
+
+    #[cfg(test)]
+    record_atomic_temp_path(&temp_path);
+    checkpoint("atomic_temp_created");
+
+    let mut write_result = file.write_all(contents);
+    if write_result.is_ok() {
+        write_result = file.sync_all();
+    }
+    drop(file);
+
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!(
+            "Failed to write temporary file for {}: {error}",
+            path.display()
+        ));
+    }
+
+    if let Err(error) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("Failed to replace {}: {error}", path.display()));
+    }
+
+    if let Ok(dir) = fs::File::open(parent) {
+        if let Err(error) = dir.sync_all() {
+            eprintln!("Failed to sync directory {}: {error}", parent.display());
+        }
+    }
+
+    Ok(())
+}
+
 fn read_history_entries() -> Result<Vec<HistoryEntry>, String> {
     io_checkpoint("read");
     let history_path = history_file_path()?;
@@ -825,17 +932,16 @@ fn read_history_entries() -> Result<Vec<HistoryEntry>, String> {
 fn write_history_entries(entries: &[HistoryEntry]) -> Result<(), String> {
     io_checkpoint("write");
     let history_path = history_file_path()?;
-    let mut file = fs::File::create(&history_path)
-        .map_err(|error| format!("Failed to write history file: {error}"))?;
 
+    let mut buffer = Vec::new();
     for entry in entries {
         let line = serde_json::to_string(entry)
             .map_err(|error| format!("Failed to serialize history entry: {error}"))?;
-        writeln!(file, "{line}")
-            .map_err(|error| format!("Failed to write history entry: {error}"))?;
+        buffer.extend_from_slice(line.as_bytes());
+        buffer.push(b'\n');
     }
 
-    Ok(())
+    write_atomic(&history_path, &buffer)
 }
 
 fn validate_relative_path(raw: &str) -> Result<PathBuf, String> {
@@ -916,8 +1022,11 @@ fn read_project_meta(project_dir: &Path) -> Result<ProjectMeta, String> {
 }
 
 fn write_project_meta(project_dir: &Path, meta: &ProjectMeta) -> Result<(), String> {
-    fs::write(project_dir.join(PROJECT_META_FILE), pretty_json(meta)?)
-        .map_err(|error| format!("Failed to write project metadata: {error}"))
+    write_atomic(
+        &project_dir.join(PROJECT_META_FILE),
+        pretty_json(meta)?.as_bytes(),
+    )
+    .map_err(|error| format!("Failed to write project metadata: {error}"))
 }
 
 fn list_resolved_projects() -> Result<Vec<ResolvedProject>, String> {
@@ -1082,7 +1191,7 @@ fn read_secret_storage_config() -> Result<Option<SecretStorageConfig>, String> {
 
 fn write_secret_storage_config(config: &SecretStorageConfig) -> Result<(), String> {
     let path = secret_storage_config_path()?;
-    fs::write(&path, pretty_json(config)?)
+    write_atomic(&path, pretty_json(config)?.as_bytes())
         .map_err(|error| format!("Failed to save secret storage config: {error}"))
 }
 
@@ -1232,8 +1341,11 @@ fn write_local_secret_map(
         ciphertext: encode_base64(&ciphertext),
     };
 
-    fs::write(local_secret_vault_path()?, pretty_json(&vault_file)?)
-        .map_err(|error| format!("Failed to save local secret vault: {error}"))
+    write_atomic(
+        &local_secret_vault_path()?,
+        pretty_json(&vault_file)?.as_bytes(),
+    )
+    .map_err(|error| format!("Failed to save local secret vault: {error}"))
 }
 
 fn unlock_local_secret_storage(master_password: &str) -> Result<(), String> {
@@ -1443,7 +1555,7 @@ fn write_secret_metadata(file_path: &Path, variables: &[EnvVariable]) -> Result<
         })
         .collect::<Vec<_>>();
 
-    fs::write(file_path, pretty_json(&metadata)?)
+    write_atomic(file_path, pretty_json(&metadata)?.as_bytes())
         .map_err(|error| format!("Failed to save environment secret metadata: {error}"))
 }
 
@@ -1846,7 +1958,7 @@ fn save_request(
 
     let request = sanitize_saved_request_for_persistence(request);
 
-    fs::write(&file_path, pretty_json(&request)?)
+    write_atomic(&file_path, pretty_json(&request)?.as_bytes())
         .map_err(|error| format!("Failed to save request: {error}"))?;
 
     if let Some(existing_file_path) = existing_file_path {
@@ -1960,7 +2072,7 @@ fn rename_request(project: String, path: String, new_name: String) -> Result<(),
             .map_err(|error| format!("Failed to rename request file: {error}"))?;
     }
 
-    fs::write(&target_file, pretty_json(&request)?)
+    write_atomic(&target_file, pretty_json(&request)?.as_bytes())
         .map_err(|error| format!("Failed to update request name: {error}"))?;
 
     touch_project(&resolved.dir)
@@ -2004,7 +2116,7 @@ fn move_request(project: String, from_path: String, to_collection: String) -> Re
 
     let contents =
         fs::read(&source_file).map_err(|error| format!("Failed to read request file: {error}"))?;
-    fs::write(&target_file, contents)
+    write_atomic(&target_file, &contents)
         .map_err(|error| format!("Failed to write moved request: {error}"))?;
     fs::remove_file(&source_file)
         .map_err(|error| format!("Failed to remove original request file: {error}"))?;
@@ -2135,7 +2247,7 @@ fn save_environment(project: String, env: Environment) -> Result<(), String> {
         }
     }
 
-    fs::write(&normal_path, pretty_json(&normal_variables)?)
+    write_atomic(&normal_path, pretty_json(&normal_variables)?.as_bytes())
         .map_err(|error| format!("Failed to save environment: {error}"))?;
     write_secret_metadata(&secrets_path, &secret_variables)?;
     touch_project(&resolved.dir)
@@ -3719,6 +3831,214 @@ mod tests {
         env_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Named, one-shot rendezvous points for the concurrency tests.
+    ///
+    /// A test installs a gate under one name; the code under test parks there
+    /// once; the test thread probes whatever it needs while the child is
+    /// pinned. `hit` removes the gate *before* it blocks, so a second arrival
+    /// at the same name passes straight through — a correct implementation
+    /// that writes twice must not deadlock against a test that releases once.
+    pub(super) mod checkpoints {
+        use std::collections::HashMap;
+        use std::sync::mpsc::{channel, Receiver, Sender};
+        use std::sync::{Mutex, OnceLock};
+
+        pub(crate) enum Event {
+            Arrived,
+            Returned(Result<(), String>),
+        }
+
+        struct Gate {
+            arrival: Sender<Event>,
+            release: Receiver<()>,
+        }
+
+        fn registry() -> &'static Mutex<HashMap<&'static str, Gate>> {
+            static REGISTRY: OnceLock<Mutex<HashMap<&'static str, Gate>>> = OnceLock::new();
+            REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+        }
+
+        pub(crate) fn hit(name: &'static str) {
+            // Take the gate out under the registry lock and release that lock
+            // before blocking, otherwise the test thread could not reach the
+            // registry to clean up.
+            let gate = {
+                registry()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(name)
+            };
+
+            if let Some(gate) = gate {
+                let _ = gate.arrival.send(Event::Arrived);
+                let _ = gate.release.recv();
+            }
+        }
+
+        pub(crate) fn install(name: &'static str, arrival: Sender<Event>) -> Sender<()> {
+            let (release_tx, release_rx) = channel();
+            registry()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(
+                    name,
+                    Gate {
+                        arrival,
+                        release: release_rx,
+                    },
+                );
+            release_tx
+        }
+
+        pub(crate) fn clear() {
+            registry()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+        }
+    }
+
+    /// How long the test thread waits for a child to reach its checkpoint.
+    /// A timeout means one thing only: the command never got there. It is
+    /// never evidence about the lock.
+    const NAMED_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Releases and joins the parked child no matter how the test thread
+    /// leaves the probe window. Without it a failing probe would panic while a
+    /// child still holds a production lock, stranding every later test.
+    struct NamedCheckpointCleanup {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        child: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl NamedCheckpointCleanup {
+        fn release_and_join(&mut self) -> bool {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            match self.child.take() {
+                Some(child) => child.join().is_ok(),
+                None => false,
+            }
+        }
+    }
+
+    impl Drop for NamedCheckpointCleanup {
+        fn drop(&mut self) {
+            self.release_and_join();
+            checkpoints::clear();
+        }
+    }
+
+    struct ParkedRun<T> {
+        probe: Option<T>,
+        child_ok: bool,
+        returned: Vec<Result<(), String>>,
+    }
+
+    /// Runs `body` on a child thread, waits for it to park at `name`, runs
+    /// `probe` on the test thread while it is pinned, then releases and joins.
+    /// Asserts nothing: the caller inspects the returned facts *after* cleanup
+    /// has already run.
+    fn with_thread_parked_at<T>(
+        name: &'static str,
+        body: impl FnOnce() -> Result<(), String> + Send + 'static,
+        probe: impl FnOnce() -> T,
+    ) -> ParkedRun<T> {
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<checkpoints::Event>();
+        let release = checkpoints::install(name, event_tx.clone());
+
+        let child = std::thread::spawn(move || {
+            let result = body();
+            let _ = event_tx.send(checkpoints::Event::Returned(result));
+        });
+
+        let mut cleanup = NamedCheckpointCleanup {
+            release: Some(release),
+            child: Some(child),
+        };
+
+        let mut returned = Vec::new();
+        let arrived = match event_rx.recv_timeout(NAMED_CHECKPOINT_TIMEOUT) {
+            Ok(checkpoints::Event::Arrived) => true,
+            Ok(checkpoints::Event::Returned(result)) => {
+                returned.push(result);
+                false
+            }
+            Err(_) => false,
+        };
+
+        // No assertion may run in this window — cleanup has to happen first.
+        let probe = if arrived { Some(probe()) } else { None };
+
+        let child_ok = cleanup.release_and_join();
+        drop(cleanup);
+
+        for event in event_rx.try_iter() {
+            if let checkpoints::Event::Returned(result) = event {
+                returned.push(result);
+            }
+        }
+
+        ParkedRun {
+            probe,
+            child_ok,
+            returned,
+        }
+    }
+
+    struct NamedLockProbe {
+        verdict: LockVerdict,
+        child_ok: bool,
+        returned: Vec<Result<(), String>>,
+    }
+
+    fn probe_lock_at_checkpoint(
+        name: &'static str,
+        lock: &'static StdMutex<()>,
+        body: impl FnOnce() -> Result<(), String> + Send + 'static,
+    ) -> NamedLockProbe {
+        let run = with_thread_parked_at(name, body, || match lock.try_lock() {
+            Err(std::sync::TryLockError::WouldBlock) => LockVerdict::LockHeld,
+            Ok(guard) => {
+                drop(guard);
+                LockVerdict::LockFree
+            }
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                // A poisoned result still carries an acquired guard. Dropping
+                // it keeps the lock usable for the rest of the file. It must
+                // not be folded into LockHeld, which would misreport the lock.
+                drop(error.into_inner());
+                LockVerdict::HarnessError
+            }
+        });
+
+        // Without this, one panicking child turns every later `try_lock` into
+        // `Poisoned` and the whole file reports infrastructure failure.
+        lock.clear_poison();
+
+        NamedLockProbe {
+            verdict: run.probe.unwrap_or(LockVerdict::NeverReachedIo),
+            child_ok: run.child_ok,
+            returned: run.returned,
+        }
+    }
+
+    /// The four facts of the checkpoint protocol, reported together. Checking
+    /// the verdict alone lets "held the lock, reached the checkpoint, then
+    /// panicked" pass as success; checking them apart makes a crashed child
+    /// read as a misplaced lock.
+    fn assert_named_lock_probe(label: &str, probe: &NamedLockProbe, expected: LockVerdict) {
+        let returned_ok = probe.returned.len() == 1 && probe.returned[0].is_ok();
+        assert!(
+            probe.verdict == expected && probe.child_ok && returned_ok,
+            "{label}: verdict={:?} (expected {expected:?}), child_ok={}, returned={:?}",
+            probe.verdict,
+            probe.child_ok,
+            probe.returned
+        );
     }
 
     struct HomeGuard {
@@ -8278,4 +8598,207 @@ mod tests {
         );
     }
 
+
+    // ---------------------------------------------------------------- D03 §六
+    // How files get written: atomic replacement, concurrent writers, no
+    // leftovers, and leftovers that are never mistaken for user data.
+
+    fn d03_reset_atomic_temp_log() {
+        atomic_temp_paths()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    fn d03_recorded_atomic_temp_paths() -> Vec<PathBuf> {
+        atomic_temp_paths()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn d03_dir_file_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn test_concurrent_writers_both_succeed_and_never_interleave() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        d03_reset_atomic_temp_log();
+
+        let dir = temp_home.path().to_path_buf();
+        let target = dir.join("contended.json");
+        let child_target = target.clone();
+        let probe_target = target.clone();
+
+        // (a) The child is pinned between `create_new` and `rename`, so its
+        // temp file provably exists while the test thread runs a whole
+        // `write_atomic` of its own. With a deterministic temp name the second
+        // `create_new` would hit EEXIST — that is what makes this deterministic
+        // rather than a race the mutant might win.
+        let run = with_thread_parked_at(
+            "atomic_temp_created",
+            move || write_atomic(&child_target, &[b'A'; 4096]),
+            move || write_atomic(&probe_target, &[b'B'; 4096]),
+        );
+
+        let probe = run
+            .probe
+            .expect("child never reached the temp-file checkpoint");
+        assert!(probe.is_ok(), "test-thread writer failed: {probe:?}");
+        assert!(run.child_ok, "child thread panicked");
+        assert_eq!(
+            run.returned.len(),
+            1,
+            "expected exactly one return event, got {:?}",
+            run.returned
+        );
+        assert!(
+            run.returned[0].is_ok(),
+            "child writer failed: {:?}",
+            run.returned[0]
+        );
+
+        let contents = std::fs::read(&target).unwrap();
+        assert_eq!(contents.len(), 4096, "target is not one complete write");
+        let all_a = contents.iter().all(|byte| *byte == b'A');
+        let all_b = contents.iter().all(|byte| *byte == b'B');
+        assert!(
+            all_a || all_b,
+            "target interleaved two writers: {} A bytes, {} B bytes",
+            contents.iter().filter(|byte| **byte == b'A').count(),
+            contents.iter().filter(|byte| **byte == b'B').count()
+        );
+
+        let temps = d03_recorded_atomic_temp_paths();
+        assert_eq!(temps.len(), 2, "expected two temp files, got {temps:?}");
+        assert_ne!(
+            temps[0], temps[1],
+            "both writers used the same temp path: {temps:?}"
+        );
+
+        // (b) The same property without threads: a leftover file sitting on the
+        // deterministic name must not be able to fail a fresh write.
+        let residue = dir.join(".contended.json.tmp");
+        std::fs::write(&residue, b"leftover from a crash").unwrap();
+        write_atomic(&target, b"fresh").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"fresh");
+    }
+
+    #[test]
+    fn test_write_atomic_leaves_no_temp_file() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        let dir = temp_home.path().join("atomic");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("state.json");
+
+        write_atomic(&target, b"first").unwrap();
+        write_atomic(&target, b"second").unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"second");
+        assert_eq!(
+            d03_dir_file_names(&dir),
+            vec!["state.json".to_string()],
+            "a temp file survived the write"
+        );
+    }
+
+    #[test]
+    fn test_temp_files_are_invisible_to_collection_tree_and_environment_list() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        create_project("Temp Vis".to_string(), String::new()).unwrap();
+        save_request(
+            "Temp Vis".to_string(),
+            String::new(),
+            sample_saved_request("Get Users", "GET", "http://example.com/users"),
+            None,
+        )
+        .unwrap();
+        save_environment(
+            "Temp Vis".to_string(),
+            Environment {
+                name: "staging".to_string(),
+                variables: vec![sample_env_variable("baseUrl", "http://localhost", false)],
+            },
+        )
+        .unwrap();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/temp-vis");
+        let collections_dir = project_dir.join("collections");
+        let environments_dir = project_dir.join("environments");
+
+        // Park a real `write_atomic` between `create_new` and `rename` so a
+        // genuine in-flight temp file is on disk while the listings run. This
+        // is the crash-leftover shape, produced by production code rather than
+        // hand-rolled in the test.
+        let request_target = collections_dir.join("get-users.request.json");
+        let collections_probe_dir = collections_dir.clone();
+        let run = with_thread_parked_at(
+            "atomic_temp_created",
+            move || write_atomic(&request_target, b"{}"),
+            move || {
+                let tree = get_collection_tree("Temp Vis".to_string()).unwrap();
+                let names: Vec<String> = tree.iter().map(|node| node.name.clone()).collect();
+                let on_disk = d03_dir_file_names(&collections_probe_dir);
+                (names, on_disk)
+            },
+        );
+
+        let (tree_names, collection_files) = run
+            .probe
+            .expect("child never reached the temp-file checkpoint");
+        assert!(run.child_ok && run.returned.len() == 1 && run.returned[0].is_ok());
+        // Fixture self-check: the temp file really was on disk while we looked,
+        // otherwise "not listed" would be vacuously true.
+        assert_eq!(
+            collection_files.len(),
+            2,
+            "expected the target plus one in-flight temp file, saw {collection_files:?}"
+        );
+        assert_eq!(
+            tree_names,
+            vec!["Get Users".to_string()],
+            "an in-flight temp file showed up in the collection tree"
+        );
+
+        let env_target = environments_dir.join("staging.env.json");
+        let environments_probe_dir = environments_dir.clone();
+        let run = with_thread_parked_at(
+            "atomic_temp_created",
+            move || write_atomic(&env_target, b"[]"),
+            move || {
+                let names = list_environments("Temp Vis".to_string()).unwrap();
+                let on_disk = d03_dir_file_names(&environments_probe_dir);
+                (names, on_disk)
+            },
+        );
+
+        let (env_names, env_files) = run
+            .probe
+            .expect("child never reached the temp-file checkpoint");
+        assert!(run.child_ok && run.returned.len() == 1 && run.returned[0].is_ok());
+        assert_eq!(
+            env_files.len(),
+            3,
+            "expected two env files plus one in-flight temp file, saw {env_files:?}"
+        );
+        assert_eq!(
+            env_names,
+            vec!["staging".to_string()],
+            "an in-flight temp file showed up in the environment list"
+        );
+    }
 }
