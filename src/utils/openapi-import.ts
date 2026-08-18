@@ -260,7 +260,37 @@ function parseRequestBody(requestBody: OpenApiOperation["requestBody"] | undefin
   return base
 }
 
-function generateSchemaExample(schema: OpenApiSchema | undefined, spec: OpenApiSpec): unknown {
+const MAX_SCHEMA_DEPTH = 20
+
+/**
+ * `seenRefs` has to be threaded through this function, not just through
+ * resolveSchemaRef: every structural keyword below re-enters ref resolution,
+ * and a set created per resolveSchemaRef call only ever guards a bare
+ * $ref -> $ref chain. A schema referring to itself through `properties` --
+ * the ordinary shape of a tree or parent/child model -- would otherwise
+ * recurse until the stack gives out and take the whole document with it.
+ *
+ * The depth cap is the backstop for cycles that carry no $ref at all: JSON
+ * and YAML both go through the YAML parser, and YAML anchors can produce a
+ * genuinely cyclic object graph that no ref set can see.
+ */
+function generateSchemaExample(
+  schema: OpenApiSchema | undefined,
+  spec: OpenApiSpec,
+  seenRefs: ReadonlySet<string> = new Set(),
+  depth = 0,
+): unknown {
+  if (depth > MAX_SCHEMA_DEPTH) {
+    return null
+  }
+
+  const ref = schema?.$ref?.trim()
+  if (ref && seenRefs.has(ref)) {
+    return null
+  }
+
+  const nextSeen = ref ? new Set([...seenRefs, ref]) : seenRefs
+
   const resolvedSchema = resolveSchemaRef(schema, spec)
   if (!resolvedSchema) {
     return ""
@@ -284,25 +314,31 @@ function generateSchemaExample(schema: OpenApiSchema | undefined, spec: OpenApiS
   }
 
   if (schema.oneOf?.length) {
-    return generateSchemaExample(schema.oneOf[0], spec)
+    return generateSchemaExample(schema.oneOf[0], spec, nextSeen, depth + 1)
   }
 
   if (schema.anyOf?.length) {
-    return generateSchemaExample(schema.anyOf[0], spec)
+    return generateSchemaExample(schema.anyOf[0], spec, nextSeen, depth + 1)
   }
 
   if (schema.allOf?.length) {
-    return Object.assign({}, ...schema.allOf.map((item) => generateSchemaExample(item, spec)))
+    return Object.assign(
+      {},
+      ...schema.allOf.map((item) => generateSchemaExample(item, spec, nextSeen, depth + 1)),
+    )
   }
 
   if (schema.type === "object" || schema.properties) {
     return Object.fromEntries(
-      Object.entries(schema.properties ?? {}).map(([key, value]) => [key, generateSchemaExample(value, spec)]),
+      Object.entries(schema.properties ?? {}).map(([key, value]) => [
+        key,
+        generateSchemaExample(value, spec, nextSeen, depth + 1),
+      ]),
     )
   }
 
   if (schema.type === "array") {
-    return [generateSchemaExample(schema.items, spec)]
+    return [generateSchemaExample(schema.items, spec, nextSeen, depth + 1)]
   }
 
   if (schema.type === "integer" || schema.type === "number") {
