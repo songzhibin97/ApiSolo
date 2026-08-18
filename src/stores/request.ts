@@ -545,4 +545,3 @@ function redactAuth(auth: Tab["auth"]) {
 
   return { type: "none" as const }
 }
-
