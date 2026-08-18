@@ -204,6 +204,7 @@
 | A11 | D02 的文件范围例外 | **批准**：D02 可改 `src-tauri/Cargo.toml` 与 `src-tauri/Cargo.lock`，**仅限依赖声明** | owner 原先把 D02 边界写成「只有 `lib.rs` 的 HTTP 段」，漏考虑了加 crate 必然要动这两个文件。`Cargo.lock` 是已跟踪文件，漏提交会破坏可复现的离线构建——而离线构建正是本项目 Rust 测试的前提。不得借该例外改动其他 Cargo 配置 |
 | A12 | D03 的 I6（history 健康度） | **采纳起草者的偏离**：新增 `get_history_health`，不改 `load_history` 的签名 | owner 原倾向改签名。起草者指出按钮禁用条件在 `HistoryPanel.vue:287`，D05 无论如何都要改——改签名换来一次边界违规，用户却依然点不动清空。理由成立 |
 | A10 | `HistoryEntry` 的 schema 追加 | D02 的 `responseBodyKind` 归 **D03**；D07b 的 `note`/`starred` 归 **D07** | 三者都是 `#[serde(default)]` 追加字段，磁盘格式向后兼容。**已知缺口**：D02 合并到 D03 合并之间，从历史重放二进制响应会把 marker 当普通文本显示，需记录 |
+| **A33** | **A10 的 `responseBodyKind` 改判** | **归 D07b，不归 D03** | **A10 把它派给 D03，而 D03 的规格冻结时一个字都没写进去**——裁定在 backlog、规格里没有。这不是「只传了许可」（A20 那次），是**完全没传到**。D03 实现者据实顶回：其冻结规格 43 条无一条涉及此字段，`grep responseBodyKind` 全树 0 命中。<br>改归 D07b 的理由：它本就在给同一个结构体追加 `note`/`starred`、同样用 `#[serde(default)]`，是唯一规格覆盖 `HistoryEntry` schema 的切片。<br>**缺口现已在 main 上活着**（owner 实测）：`HttpResponse` 带 `bodyKind`（`lib.rs:7292` 有断言），`HistoryEntry` **0 命中**。故从历史重放时前端拿不到机器可读信号，只能匹配占位符字符串——而 D02 的代码注释明写那是「糟糕得多的契约」。需写入 README 已知问题。 |
 
 | A13 | D03 的文件范围例外 | **批准**：可在 `src-tauri/Cargo.toml` 增加 `syn` 作为 dev-dependency 并更新 `Cargo.lock`，**仅限该声明** | 同 A11 的限定。`syn` 本就作为传递依赖存在于锁中，实际只 +1 行 |
 | A14 | checker 约束反过来要求钥匙串路径背上全局锁 | **驳回，改缩小 checker 目标** | 起草者判为「无害（逐 key 串行）」，评审实查推翻：`LOCAL_VAULT_TX` 是**全局锁**、串行化所有 key 的钥匙串读写、盖住 macOS 同步系统调用与**授权弹窗**、mutex 中毒会让无关的钥匙串路径失败。**这是产品让步不是测试设施**，正是 P7 记录的那次事故的镜像。解法：抽出三个天然 guard-first 的 helper，三个外层 dispatcher 移出 `TARGETS`。代价（外层不再静态覆盖）已入账 |
