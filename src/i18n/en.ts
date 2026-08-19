@@ -18,6 +18,8 @@ export default {
     noActiveProject: "No active project selected.",
     noActiveEnvironment: "No active environment selected.",
     environmentNameRequired: "Environment name is required.",
+    environmentAlreadyExists:
+      "An environment with that name already exists. Choose another name, or select it from the list.",
     binaryBodyUnsupported: "Binary request body is not supported yet.",
     fileSelectionRequired: "Select the file again before sending this upload.",
     redactionSentinelOnWire:

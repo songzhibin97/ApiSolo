@@ -36,6 +36,11 @@ export const useEnvironmentsStore = defineStore("environments", () => {
   watch(
     () => projectsStore.activeProject,
     async () => {
+      // Draft names belong to the project they were typed in. Carrying them
+      // across makes a same-named environment in the next project load as
+      // empty, which is the second way a real environment used to get
+      // overwritten by a table the user believed was blank.
+      pendingEnvironmentNames.clear()
       await loadEnvironments()
     },
     { immediate: true },
@@ -91,6 +96,11 @@ export const useEnvironmentsStore = defineStore("environments", () => {
     }
 
     const envName = activeEnv.value
+    // The only source of truth for "this name has never been saved". Rust
+    // needs the caller's intent to tell a first save from an update; guessing
+    // from the file's existence is what it does without this flag, and that
+    // guess is what lets a save land on someone else's environment.
+    const isDraft = pendingEnvironmentNames.has(envName)
 
     try {
       await invoke("save_environment", {
@@ -99,6 +109,7 @@ export const useEnvironmentsStore = defineStore("environments", () => {
           name: envName,
           variables: variables.value,
         },
+        create: isDraft,
       })
 
       pendingEnvironmentNames.delete(envName)
@@ -147,11 +158,18 @@ export const useEnvironmentsStore = defineStore("environments", () => {
       throw new Error(i18n.global.t("errors.environmentNameRequired"))
     }
 
-    if (!environments.value.includes(normalized)) {
-      environments.value = [...environments.value, normalized].sort((left, right) =>
-        left.localeCompare(right),
-      )
+    // Ahead of the list edit, the draft mark and the blanking below, all of
+    // which are what made this destructive: the table went empty, the user
+    // read that as a new environment, and saving it wrote over the existing
+    // one. Rust rejects the same collision, but only it knows how a name
+    // normalises, so this check is the cheap exact-match half, not the ruling.
+    if (environments.value.includes(normalized)) {
+      throw new Error(i18n.global.t("errors.environmentAlreadyExists"))
     }
+
+    environments.value = [...environments.value, normalized].sort((left, right) =>
+      left.localeCompare(right),
+    )
 
     pendingEnvironmentNames.add(normalized)
     activeEnv.value = normalized
