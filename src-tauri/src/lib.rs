@@ -11901,18 +11901,6 @@ mod tests {
                         }
                         return;
                     }
-                    Some(called) if called == "drop" => {
-                        for argument in &call.args {
-                            if let Expr::Path(path) = argument {
-                                if path.path.is_ident(self.guard) {
-                                    self.problems.push(format!(
-                                        "the guard {} is released before the function ends",
-                                        self.guard
-                                    ));
-                                }
-                            }
-                        }
-                    }
                     _ => {}
                 }
                 syn::visit::visit_expr_call(self, call);
@@ -11924,6 +11912,20 @@ mod tests {
                         self.problems.push(format!(
                             "{} appears somewhere other than a direct named call",
                             segment.ident
+                        ));
+                    }
+                    // Naming the guard again is the only way to end its life
+                    // early, so the rule is that it is never named again -
+                    // rather than a list of the ways one could do it. An
+                    // earlier version looked for a call to `drop`, which said
+                    // nothing at all about `std::mem::drop(guard)` or about
+                    // `let _ = guard;`. Enumerating spellings loses here for
+                    // the same reason it lost in front of the guard.
+                    if segment.ident == self.guard {
+                        self.problems.push(format!(
+                            "the guard {} is named again after it is bound, so it may be \
+                             released before the function ends",
+                            self.guard
                         ));
                     }
                 }
@@ -12039,6 +12041,35 @@ mod tests {
                 snapshot
             }"#,
             "released before the function ends",
+        ),
+        (
+            "the guard dropped through a fully qualified path",
+            r#"fn read_pending_prune() -> u8 {
+                let guard = lock_vault_maintenance_tx();
+                std::mem::drop(guard);
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "released before the function ends",
+        ),
+        (
+            "the guard dropped by binding it to a wildcard",
+            r#"fn read_pending_prune() -> u8 {
+                let guard = lock_vault_maintenance_tx();
+                let _ = guard;
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "released before the function ends",
+        ),
+        (
+            "the guard never bound at all, so it dies on the spot",
+            r#"fn read_pending_prune() -> u8 {
+                let _ = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "unsupported wrapper around the guard",
         ),
         (
             "the accessor handed around as a value",
