@@ -11510,6 +11510,95 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------- cross-slice (D01+D03)
+    // Named so nobody has to guess: this one spans two slices and is not one of
+    // the 43 invariants. It exists because the two defects compound. A user
+    // whose history had one torn line could never reach the legacy-credential
+    // sanitiser at all - the read failed outright, the panel came up empty, and
+    // the clear button was greyed out because the list was empty. The
+    // credentials this user most wanted scrubbed were the ones the scrub could
+    // not see.
+    //
+    // Where the halves live: skipping and quarantining is Rust, the redaction
+    // itself is the frontend history store, and Rust is deliberately a pipe for
+    // history content. So this proves reachability and the write-back contract;
+    // that the sanitiser blanks a given field is the store's own tests' job,
+    // and the redaction step below is a stand-in for it, not a copy of it.
+    #[test]
+    fn test_cross_slice_d01_scrub_runs_after_d03_read_resilience() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        let clean = sample_history_entry("clean", "2026-03-27T10:00:00Z");
+        let mut legacy = sample_history_entry("legacy", "2026-03-27T10:05:00Z");
+        legacy.request_headers = vec![KeyValuePair {
+            enabled: true,
+            key: "Authorization".to_string(),
+            value: "Bearer super-secret-token".to_string(),
+            description: String::new(),
+        }];
+
+        // A line an earlier crash cut in half, sitting between two good rows.
+        let torn = "{\"id\":\"torn\",\"method\":\"GET\",\"url\":\"http://exa";
+        let history_path = history_file_path().unwrap();
+        std::fs::create_dir_all(history_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &history_path,
+            format!(
+                "{}\n{torn}\n{}\n",
+                serde_json::to_string(&clean).unwrap(),
+                serde_json::to_string(&legacy).unwrap()
+            ),
+        )
+        .unwrap();
+
+        // D03's half: the torn line costs only itself, so both good rows arrive.
+        let loaded = load_history().unwrap();
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["legacy", "clean"],
+            "a torn line still cost the whole read"
+        );
+
+        // The credential arrives verbatim. That is the contract the sanitiser
+        // depends on: if Rust altered it here there would be two redaction
+        // implementations disagreeing about what counts as sensitive.
+        let delivered = loaded.iter().find(|entry| entry.id == "legacy").unwrap();
+        assert_eq!(
+            delivered.request_headers[0].value, "Bearer super-secret-token",
+            "the legacy credential did not reach the caller intact"
+        );
+
+        // D01's half, driven the way the store drives it: sanitise what came
+        // back, then write back only the rows that changed.
+        let mut scrubbed = delivered.clone();
+        scrubbed.request_headers[0].value = "[redacted]".to_string();
+        update_history_entries(vec![scrubbed]).unwrap();
+
+        // The rewrite must not swallow the torn line. Its bytes can hold a
+        // credential of their own, so they go to quarantine unchanged rather
+        // than disappearing with the file that was replaced.
+        let quarantined =
+            std::fs::read_to_string(history_quarantine_path().unwrap()).unwrap();
+        assert_eq!(
+            quarantined,
+            format!("{torn}\n"),
+            "the torn line was not preserved byte for byte"
+        );
+
+        let after = load_history().unwrap();
+        assert_eq!(after.len(), 2);
+        let stored = after.iter().find(|entry| entry.id == "legacy").unwrap();
+        assert_eq!(
+            stored.request_headers[0].value, "[redacted]",
+            "the scrubbed row did not survive the write-back"
+        );
+    }
+
     // ----------------------------------------- D03 §2.11 (lock structure)
     // A syntax check, deliberately not a behaviour check. The dynamic probes
     // prove a lock is alive at a checkpoint, but only for functions that have
