@@ -125,7 +125,9 @@ function updateMethod(method: HttpMethod) {
 
 function updateUrl(url: string) {
   const syncedState = syncParamsFromUrl(url, activeTab.value.params);
-  tabsStore.updateTab(activeTab.value.id, {
+  // The URL bar's own echo — the one write that must not bump urlRevision,
+  // otherwise every keystroke would replace the text being typed.
+  tabsStore.updateTabFromUrlBar(activeTab.value.id, {
     url: syncedState.url,
     params: syncedState.params,
     isDirty: true,
@@ -339,6 +341,8 @@ onUnmounted(() => {
     <UrlBar
       :method="activeTab.method"
       :url="buildUrlWithParams(activeTab.url, activeTab.params)"
+      :tab-id="activeTab.id"
+      :url-revision="activeTab.urlRevision"
       :is-loading="isLoading"
       @update:method="updateMethod"
       @update:url="updateUrl"

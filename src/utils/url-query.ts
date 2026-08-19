@@ -1,3 +1,15 @@
+/**
+ * URL string surgery, plus the encoder for anything we hand to an *external*
+ * tool (a `curl` command line, a Postman collection). Its correctness target is
+ * **reproducing what the user typed**: `%20` stays `%20`, nothing is normalized
+ * through `new URL`, and `{{…}}` template spans survive verbatim.
+ *
+ * Its sibling `url-params.ts` owns the URL bar ↔ params ↔ wire loop, whose
+ * correctness target is a different one: matching the bytes *this app itself*
+ * puts on the wire (form-urlencoded, space as `+`). The two encoders are not
+ * duplicates — they serve two different consumers. What is genuinely shared is
+ * the template-span split below, not the encoding.
+ */
 export interface UrlParts {
   baseUrl: string
   query: string
@@ -28,18 +40,33 @@ export function splitUrlParts(rawUrl: string): UrlParts {
 }
 
 /**
+ * Split a string into alternating plain and `{{…}}` template segments. The
+ * regex is built per call rather than hoisted: a shared literal with a `g` flag
+ * carries `lastIndex` between callers, which has already produced one
+ * position-dependent test in this repo.
+ *
+ * This is the one primitive both encoders share.
+ */
+export function splitTemplateSpans(value: string): string[] {
+  return value.split(/(\{\{[^{}]*\}\})/)
+}
+
+export function isTemplateSpan(segment: string): boolean {
+  return segment.startsWith("{{") && segment.endsWith("}}")
+}
+
+/**
  * Percent-encode a query component while leaving `{{…}}` template spans
  * alone. `encodeURIComponent` would turn `{{apiToken}}` into
  * `%7B%7BapiToken%7D%7D`, which is a literal path segment rather than a
  * variable reference.
+ *
+ * Encodes a space as `%20`, which is what a `curl` command line and a Postman
+ * `url.raw` need. The URL bar needs `+` instead — that is
+ * `encodeFormComponentPreservingTemplates` in `url-params.ts`.
  */
 export function encodeQueryComponentPreservingTemplates(value: string): string {
-  return value
-    .split(/(\{\{[^{}]*\}\})/)
-    .map((segment) =>
-      segment.startsWith("{{") && segment.endsWith("}}")
-        ? segment
-        : encodeURIComponent(segment),
-    )
+  return splitTemplateSpans(value)
+    .map((segment) => (isTemplateSpan(segment) ? segment : encodeURIComponent(segment)))
     .join("")
 }

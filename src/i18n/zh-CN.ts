@@ -118,6 +118,8 @@ export default {
     addTo: "添加到",
     header: "Header",
     query: "Query",
+    queryKeyHidden:
+      "API key 会在发送时追加到查询串；为避免密钥出现在地址栏，URL 栏不显示它。",
     description: {
       none: "该请求不使用认证",
       basic: "用户名和密码，以 Base64 编码发送在 Authorization 头中",

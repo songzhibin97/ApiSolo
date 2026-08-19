@@ -118,6 +118,12 @@ export interface Tab {
   isLoading?: boolean
   /** In-memory only: the body was redacted in history and needs re-entering. */
   bodyRedacted?: boolean
+  /**
+   * In-memory only: bumped by every write to `url` or `params` that did not
+   * come from the URL bar itself. The URL bar uses it to tell its own echo
+   * apart from an outside change; it is never persisted.
+   */
+  urlRevision: number
 }
 
 export interface SettingsState {
