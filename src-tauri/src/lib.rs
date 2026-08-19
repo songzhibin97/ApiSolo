@@ -11242,4 +11242,271 @@ mod tests {
             assert!(d03_pending_prune().is_empty());
         }
     }
+
+    // ------------------------------------------------ D03 §六 (every writer)
+    // Each of the nine production writers, driven through its own command with
+    // its target directory read-only. Testing write_atomic alone proves nothing
+    // about whether a given call site actually uses it.
+    //
+    // Why a read-only directory: it stops `create_new` from making a temp file,
+    // but it does NOT stop `fs::write` from opening an existing file and
+    // truncating it. So a call site reverted to fs::write shows up as a changed
+    // target, which is exactly the damage this invariant is about.
+
+    fn d03_with_readonly_dir<T>(dir: &Path, body: impl FnOnce() -> T) -> T {
+        let restore = std::fs::metadata(dir).unwrap().permissions();
+        let mut readonly = restore.clone();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut readonly, 0o555);
+        std::fs::set_permissions(dir, readonly).unwrap();
+        let outcome = body();
+        std::fs::set_permissions(dir, restore).unwrap();
+        outcome
+    }
+
+    #[test]
+    fn test_every_production_writer_leaves_target_intact_on_failure() {
+        for writer in [
+            "write_history_entries",
+            "write_project_meta",
+            "write_secret_storage_config",
+            "write_local_secret_map",
+            "write_secret_metadata",
+            "save_request",
+            "rename_request",
+            "move_request",
+            "save_environment_normal_file",
+        ] {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            d03_reset_system_vault();
+
+            let scratch = temp_home.path().join("ApiSolo/scratch");
+            let project_dir = temp_home.path().join("ApiSolo/projects/writers");
+            let collections = project_dir.join("collections");
+            let environments = project_dir.join("environments");
+
+            // Every case needs the target to already exist with known bytes;
+            // otherwise `fs::write` would fail too and the mutant would hide
+            // behind the same error.
+            let (target, dir, action): (PathBuf, PathBuf, Box<dyn Fn() -> Result<(), String>>) =
+                match writer {
+                    "write_history_entries" => {
+                        append_history(sample_history_entry("A", "2026-03-27T10:00:00Z")).unwrap();
+                        (
+                            history_file_path().unwrap(),
+                            scratch.clone(),
+                            Box::new(|| {
+                                append_history(sample_history_entry("B", "2026-03-27T10:01:00Z"))
+                            }),
+                        )
+                    }
+                    "write_project_meta" => {
+                        create_project("Writers".to_string(), String::new()).unwrap();
+                        save_request(
+                            "Writers".to_string(),
+                            String::new(),
+                            sample_saved_request("Req", "GET", "http://example.com/"),
+                            None,
+                        )
+                        .unwrap();
+                        (
+                            project_dir.join(PROJECT_META_FILE),
+                            project_dir.clone(),
+                            Box::new(|| {
+                                // Ends in touch_project; collections/ is still
+                                // writable, so only the meta write can fail.
+                                save_request(
+                                    "Writers".to_string(),
+                                    String::new(),
+                                    sample_saved_request("Req", "POST", "http://example.com/"),
+                                    Some("req.request.json".to_string()),
+                                )
+                            }),
+                        )
+                    }
+                    "write_secret_storage_config" => {
+                        configure_secret_storage("system-keychain".to_string(), None).unwrap();
+                        (
+                            secret_storage_config_path().unwrap(),
+                            scratch.clone(),
+                            Box::new(|| {
+                                configure_secret_storage("system-keychain".to_string(), None)
+                                    .map(|_| ())
+                            }),
+                        )
+                    }
+                    "write_local_secret_map" => {
+                        configure_local_secret_storage_for_test();
+                        save_secret_value("K1", "v1").unwrap();
+                        (
+                            local_secret_vault_path().unwrap(),
+                            scratch.clone(),
+                            Box::new(|| save_secret_value("K2", "v2")),
+                        )
+                    }
+                    "write_secret_metadata" => {
+                        create_project("Writers".to_string(), String::new()).unwrap();
+                        configure_local_secret_storage_for_test();
+                        let legacy = legacy_vault_key_for(&project_dir, "My Env", "token");
+                        save_secret_value(&legacy, "LEGACY").unwrap();
+                        let path = d03_env_file(temp_home.path(), "writers", "my-env", true);
+                        d03_write_recorded_metadata(&path, &[("token", &legacy)]);
+                        (
+                            path,
+                            environments.clone(),
+                            // A pending migration reaches write_secret_metadata
+                            // without writing the plain .env.json first.
+                            Box::new(|| {
+                                load_environment("Writers".to_string(), "My Env".to_string())
+                                    .map(|_| ())
+                            }),
+                        )
+                    }
+                    "save_request" => {
+                        create_project("Writers".to_string(), String::new()).unwrap();
+                        save_request(
+                            "Writers".to_string(),
+                            String::new(),
+                            sample_saved_request("Req", "GET", "http://example.com/"),
+                            None,
+                        )
+                        .unwrap();
+                        (
+                            collections.join("req.request.json"),
+                            collections.clone(),
+                            Box::new(|| {
+                                save_request(
+                                    "Writers".to_string(),
+                                    String::new(),
+                                    sample_saved_request("Req", "POST", "http://example.com/"),
+                                    Some("req.request.json".to_string()),
+                                )
+                            }),
+                        )
+                    }
+                    "rename_request" => {
+                        create_project("Writers".to_string(), String::new()).unwrap();
+                        save_request(
+                            "Writers".to_string(),
+                            String::new(),
+                            sample_saved_request("Req", "GET", "http://example.com/"),
+                            None,
+                        )
+                        .unwrap();
+                        (
+                            collections.join("req.request.json"),
+                            collections.clone(),
+                            // Same slug, so no fs::rename happens and the
+                            // rewrite is the only thing that can fail.
+                            Box::new(|| {
+                                rename_request(
+                                    "Writers".to_string(),
+                                    "req.request.json".to_string(),
+                                    "REQ".to_string(),
+                                )
+                            }),
+                        )
+                    }
+                    "move_request" => {
+                        create_project("Writers".to_string(), String::new()).unwrap();
+                        create_collection(
+                            "Writers".to_string(),
+                            "archive".to_string(),
+                            String::new(),
+                        )
+                        .unwrap();
+                        save_request(
+                            "Writers".to_string(),
+                            String::new(),
+                            sample_saved_request("Req", "GET", "http://example.com/"),
+                            None,
+                        )
+                        .unwrap();
+                        (
+                            collections.join("req.request.json"),
+                            collections.join("archive"),
+                            Box::new(|| {
+                                move_request(
+                                    "Writers".to_string(),
+                                    "req.request.json".to_string(),
+                                    "archive".to_string(),
+                                )
+                            }),
+                        )
+                    }
+                    _ => {
+                        create_project("Writers".to_string(), String::new()).unwrap();
+                        configure_local_secret_storage_for_test();
+                        save_environment(
+                            "Writers".to_string(),
+                            d03_env(
+                                "dev",
+                                vec![sample_env_variable("baseUrl", "http://a", false)],
+                            ),
+                            Some(true),
+                        )
+                        .unwrap();
+                        (
+                            d03_env_file(temp_home.path(), "writers", "dev", false),
+                            environments.clone(),
+                            Box::new(|| {
+                                save_environment(
+                                    "Writers".to_string(),
+                                    d03_env(
+                                        "dev",
+                                        vec![sample_env_variable("baseUrl", "http://b", false)],
+                                    ),
+                                    None,
+                                )
+                            }),
+                        )
+                    }
+                };
+
+            let before = std::fs::read(&target).unwrap_or_else(|error| {
+                panic!("{writer}: fixture target {} missing: {error}", target.display())
+            });
+
+            let outcome = d03_with_readonly_dir(&dir, action);
+
+            assert!(
+                outcome.is_err(),
+                "{writer}: the command reported success although its directory was read-only"
+            );
+            assert_eq!(
+                std::fs::read(&target).unwrap(),
+                before,
+                "{writer}: the target was modified by a write that failed"
+            );
+
+            // move_request is the one call site the read-only probe cannot
+            // speak about. Its destination is guaranteed not to exist — the
+            // command rejects an occupied target before it writes anything —
+            // so there is no old content for a truncating write to destroy,
+            // and `fs::write` fails on a read-only directory for exactly the
+            // same reason `create_new` does. Measured, not assumed: reverting
+            // this call site to `fs::write` left all 183 tests green, while
+            // the other eight sites each turned this test red.
+            //
+            // What stays observable is whether the destination goes through
+            // write_atomic at all, so run the move for real and look for the
+            // temp file it must have left in the destination directory.
+            if writer == "move_request" {
+                d03_reset_atomic_temp_log();
+                move_request(
+                    "Writers".to_string(),
+                    "req.request.json".to_string(),
+                    "archive".to_string(),
+                )
+                .unwrap();
+                let temps = d03_recorded_atomic_temp_paths();
+                assert!(
+                    temps.iter().any(|temp| temp.parent() == Some(dir.as_path())),
+                    "move_request wrote its destination without write_atomic; \
+                     temp files recorded: {temps:?}"
+                );
+            }
+        }
+    }
 }
