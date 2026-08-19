@@ -11509,4 +11509,584 @@ mod tests {
             }
         }
     }
+
+    // ----------------------------------------- D03 §2.11 (lock structure)
+    // A syntax check, deliberately not a behaviour check. The dynamic probes
+    // prove a lock is alive at a checkpoint, but only for functions that have
+    // one: they cannot see a function that forgot its checkpoint, and they
+    // cannot see a guard taken inside an inner block that ends before the read.
+    // This reads lib.rs back and answers the other half - in each function the
+    // lock rules cover, is the guard the first thing that happens?
+    //
+    // Three text-based versions of this check came before it and all three
+    // passed on code that was wrong: counting braces per line, then lexical
+    // masking, then masking plus self-checks. Every failure was the same shape,
+    // approximating a syntax question. Parsing removes the question instead of
+    // producing one more instance of it.
+    mod lock_structure {
+        use syn::visit::Visit;
+        use syn::{Expr, File, ItemFn, Pat, PathArguments, Stmt};
+
+        pub struct Target {
+            pub function: &'static str,
+            pub accessor: &'static str,
+            pub read: &'static str,
+            /// Declared per function, never a blanket allowance. A macro is
+            /// rejected rather than expanded, so every name listed here marks a
+            /// place this check stops looking.
+            pub allowed_macros: &'static [&'static str],
+        }
+
+        /// The list is part of what gets reviewed. Deleting a row silently
+        /// removes the guarantee for that function, and no machine can notice
+        /// that - which is why the test asserts the row count as well.
+        pub const TARGETS: &[Target] = &[
+            Target {
+                function: "save_local_secret_value",
+                accessor: "lock_local_vault_tx",
+                read: "load_local_secret_map",
+                allowed_macros: &[],
+            },
+            Target {
+                function: "delete_local_secret_value",
+                accessor: "lock_local_vault_tx",
+                read: "load_local_secret_map",
+                allowed_macros: &[],
+            },
+            Target {
+                function: "unlock_local_secret_vault_locked",
+                accessor: "lock_local_vault_tx",
+                read: "read_local_secret_vault_file",
+                // The session-key error path formats a message. Listed rather
+                // than waved through: the token stream is still swept for the
+                // two names below, so a read cannot hide inside it.
+                allowed_macros: &["format"],
+            },
+            Target {
+                function: "record_vault_key_collisions",
+                accessor: "lock_vault_maintenance_tx",
+                read: "read_maintenance_snapshot",
+                allowed_macros: &[],
+            },
+            Target {
+                function: "acknowledge_secret_key_collision",
+                accessor: "lock_vault_maintenance_tx",
+                read: "read_maintenance_snapshot",
+                allowed_macros: &[],
+            },
+            Target {
+                function: "enqueue_pending_prune",
+                accessor: "lock_vault_maintenance_tx",
+                read: "read_maintenance_snapshot",
+                allowed_macros: &[],
+            },
+            Target {
+                function: "read_pending_prune",
+                accessor: "lock_vault_maintenance_tx",
+                read: "read_maintenance_snapshot",
+                allowed_macros: &[],
+            },
+            Target {
+                function: "resolve_pending_prune",
+                accessor: "lock_vault_maintenance_tx",
+                read: "read_maintenance_snapshot",
+                allowed_macros: &[],
+            },
+        ];
+
+        /// Anything unreadable fails rather than passes. A non-inline module or
+        /// an item-level `include!` would hide code from the parse, and a check
+        /// that stays quiet about code it never saw is worse than no check.
+        pub fn unanalysable(file: &File) -> Vec<String> {
+            let mut problems = Vec::new();
+            for item in &file.items {
+                match item {
+                    syn::Item::Mod(item) if item.content.is_none() => problems.push(format!(
+                        "module {} is not inline, so its contents are not analysable",
+                        item.ident
+                    )),
+                    syn::Item::Macro(item) if item.mac.path.is_ident("include") => problems
+                        .push("an item-level include! hides code from this check".to_string()),
+                    _ => {}
+                }
+            }
+            problems
+        }
+
+        pub fn check(file: &File, target: &Target) -> Vec<String> {
+            let definitions: Vec<&ItemFn> = file
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    syn::Item::Fn(function) if function.sig.ident == target.function => {
+                        Some(function)
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            if definitions.is_empty() {
+                return vec![format!("{}: not found at the crate root", target.function)];
+            }
+
+            // Every #[cfg] variant is judged on its own. syn does not evaluate
+            // conditional compilation and sees both, so a bad variant sitting
+            // next to a good one must not be covered by it.
+            definitions
+                .into_iter()
+                .flat_map(|definition| check_one(definition, target))
+                .collect()
+        }
+
+        fn check_one(function: &ItemFn, target: &Target) -> Vec<String> {
+            let name = target.function;
+
+            // The guard is statement 0 and nothing may precede it: no call, no
+            // method call, no macro, no block, no `use`. That is the whole
+            // design. With nothing before the guard there is nowhere to put an
+            // unlocked read, so the bypass shapes do not each have to be
+            // recognised - and recognising shapes has no fixed point, since the
+            // set of equivalent ways to spell one in Rust is unbounded.
+            let Some(Stmt::Local(local)) = function.block.stmts.first() else {
+                return vec![format!("{name}: guard is not the first statement")];
+            };
+            let Some(init) = &local.init else {
+                return vec![format!("{name}: guard is not the first statement")];
+            };
+            if init.diverge.is_some() {
+                return vec![format!("{name}: unsupported wrapper around the guard")];
+            }
+            if let Some(complaint) = classify_guard_init(&init.expr, target.accessor) {
+                return vec![format!("{name}: {complaint}")];
+            }
+
+            let Pat::Ident(binding) = &local.pat else {
+                return vec![format!("{name}: unsupported wrapper around the guard")];
+            };
+            if binding.subpat.is_some() {
+                return vec![format!("{name}: unsupported wrapper around the guard")];
+            }
+            let guard = binding.ident.to_string();
+
+            let mut scan = BodyScan {
+                accessor: target.accessor,
+                read: target.read,
+                guard: &guard,
+                allowed_macros: target.allowed_macros,
+                reads: 0,
+                problems: Vec::new(),
+            };
+            for statement in function.block.stmts.iter().skip(1) {
+                scan.visit_stmt(statement);
+            }
+            // The guard statement itself is re-examined for everything except
+            // its own accessor call, which was just accepted above.
+            for argument in guard_init_arguments(&init.expr) {
+                scan.visit_expr(argument);
+            }
+
+            let mut problems: Vec<String> = scan
+                .problems
+                .into_iter()
+                .map(|problem| format!("{name}: {problem}"))
+                .collect();
+            if scan.reads == 0 {
+                problems.push(format!(
+                    "{name}: never calls {}, so this check proves nothing here",
+                    target.read
+                ));
+            }
+            problems
+        }
+
+        /// `None` means accepted. The three complaints stay distinct because
+        /// they send a reader to different places: a foreign statement sitting
+        /// in front of the guard, a lock taken on some other mutex that wears
+        /// the right name, and a wrapper that moves when the guard is released.
+        fn classify_guard_init(expr: &Expr, accessor: &str) -> Option<&'static str> {
+            if let Expr::Call(call) = expr {
+                if call.args.is_empty() {
+                    if let Some(called) = plain_call_name(call) {
+                        if called == accessor {
+                            return None;
+                        }
+                    }
+                }
+                // Names the accessor in its last segment but fails the
+                // full-form comparison, so it locks something else.
+                if last_segment_is(&call.func, accessor) {
+                    return Some("accessor mismatch");
+                }
+            }
+            if mentions(expr, accessor) {
+                return Some("unsupported wrapper around the guard");
+            }
+            Some("guard is not the first statement")
+        }
+
+        fn last_segment_is(expr: &Expr, name: &str) -> bool {
+            match expr {
+                Expr::Path(path) => path
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|segment| segment.ident == name),
+                _ => false,
+            }
+        }
+
+        fn mentions(expr: &Expr, name: &str) -> bool {
+            struct Probe<'a> {
+                name: &'a str,
+                found: bool,
+            }
+            impl<'ast, 'a> Visit<'ast> for Probe<'a> {
+                fn visit_path(&mut self, path: &'ast syn::Path) {
+                    if path.segments.iter().any(|segment| segment.ident == self.name) {
+                        self.found = true;
+                    }
+                    syn::visit::visit_path(self, path);
+                }
+            }
+
+            let mut probe = Probe { name, found: false };
+            probe.visit_expr(expr);
+            probe.found
+        }
+
+        fn guard_init_arguments(expr: &Expr) -> Vec<&Expr> {
+            match expr {
+                Expr::Call(call) => call.args.iter().collect(),
+                _ => Vec::new(),
+            }
+        }
+
+        /// Full-form comparison: no qualified self, no leading `::`, exactly one
+        /// segment, no generic arguments. Matching on the last segment would
+        /// accept `unrelated::lock_vault_maintenance_tx()` and destroy the claim
+        /// that the guard locks the mutex this row names.
+        fn plain_call_name(call: &syn::ExprCall) -> Option<String> {
+            let Expr::Path(path) = &*call.func else {
+                return None;
+            };
+            if path.qself.is_some() || path.path.leading_colon.is_some() {
+                return None;
+            }
+            if path.path.segments.len() != 1 {
+                return None;
+            }
+            let segment = &path.path.segments[0];
+            if !matches!(segment.arguments, PathArguments::None) {
+                return None;
+            }
+            Some(segment.ident.to_string())
+        }
+
+        struct BodyScan<'a> {
+            accessor: &'a str,
+            read: &'a str,
+            guard: &'a str,
+            allowed_macros: &'a [&'static str],
+            reads: usize,
+            problems: Vec<String>,
+        }
+
+        impl<'a> BodyScan<'a> {
+            fn watched(&self, ident: &syn::Ident) -> bool {
+                ident == self.accessor || ident == self.read
+            }
+        }
+
+        impl<'ast, 'a> Visit<'ast> for BodyScan<'a> {
+            fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+                match plain_call_name(call) {
+                    Some(called) if called == self.read || called == self.accessor => {
+                        if called == self.read {
+                            self.reads += 1;
+                        }
+                        // Accepted as a direct named call, so the callee path is
+                        // not walked. Every remaining mention of these two names
+                        // is therefore something other than a direct call.
+                        for argument in &call.args {
+                            self.visit_expr(argument);
+                        }
+                        return;
+                    }
+                    Some(called) if called == "drop" => {
+                        for argument in &call.args {
+                            if let Expr::Path(path) = argument {
+                                if path.path.is_ident(self.guard) {
+                                    self.problems.push(format!(
+                                        "the guard {} is released before the function ends",
+                                        self.guard
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                syn::visit::visit_expr_call(self, call);
+            }
+
+            fn visit_path(&mut self, path: &'ast syn::Path) {
+                for segment in &path.segments {
+                    if self.watched(&segment.ident) {
+                        self.problems.push(format!(
+                            "{} appears somewhere other than a direct named call",
+                            segment.ident
+                        ));
+                    }
+                }
+                syn::visit::visit_path(self, path);
+            }
+
+            fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+                let called = mac
+                    .path
+                    .segments
+                    .last()
+                    .map(|segment| segment.ident.to_string())
+                    .unwrap_or_default();
+                if !self.allowed_macros.contains(&called.as_str()) {
+                    self.problems
+                        .push(format!("macro {called}! is not on this function's allow list"));
+                    return;
+                }
+                // Being on the list means the check does not expand it, not that
+                // it goes unread: a read hidden in the token stream would
+                // otherwise walk straight through.
+                let rendered = mac.tokens.to_string();
+                for word in rendered.split(|character: char| !character.is_alphanumeric() && character != '_') {
+                    if word == self.accessor || word == self.read {
+                        self.problems.push(format!(
+                            "{word} appears inside the allowed macro {called}!"
+                        ));
+                    }
+                }
+            }
+
+            fn visit_stmt(&mut self, stmt: &'ast Stmt) {
+                if let Stmt::Item(_) = stmt {
+                    self.problems.push(
+                        "an item declared inside the body is not analysable here".to_string(),
+                    );
+                    return;
+                }
+                syn::visit::visit_stmt(self, stmt);
+            }
+        }
+    }
+
+    /// Fixtures the checker must reject, each paired with the phrase it has to
+    /// say. Silence is this check's evidence, so it has to be shown to speak
+    /// before the silence counts for anything - and the last row is the
+    /// positive control, because a checker that rejects everything would pass
+    /// all the rows above while proving nothing.
+    const LOCK_STRUCTURE_FIXTURES: &[(&str, &str, &str)] = &[
+        (
+            "a read reached through a helper before the guard",
+            r#"fn read_pending_prune() -> u8 {
+                let stale = peek();
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "guard is not the first statement",
+        ),
+        (
+            "a macro standing before the guard",
+            r#"fn read_pending_prune() -> u8 {
+                println!("about to lock");
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "guard is not the first statement",
+        ),
+        (
+            "the guard taken inside a block that ends before the read",
+            r#"fn read_pending_prune() -> u8 {
+                { let _guard = lock_vault_maintenance_tx(); }
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "guard is not the first statement",
+        ),
+        (
+            "an aliasing use before the guard",
+            r#"fn read_pending_prune() -> u8 {
+                use other::lock as lock_vault_maintenance_tx;
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "guard is not the first statement",
+        ),
+        (
+            "a same-named accessor from somewhere else",
+            r#"fn read_pending_prune() -> u8 {
+                let _guard = unrelated::lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "accessor mismatch",
+        ),
+        (
+            "the guard wrapped so its lifetime is no longer the function",
+            r#"fn read_pending_prune() -> u8 {
+                let _guard = Box::new(lock_vault_maintenance_tx());
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "unsupported wrapper around the guard",
+        ),
+        (
+            "the guard dropped before the read",
+            r#"fn read_pending_prune() -> u8 {
+                let guard = lock_vault_maintenance_tx();
+                drop(guard);
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "released before the function ends",
+        ),
+        (
+            "the accessor handed around as a value",
+            r#"fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                let deferred = lock_vault_maintenance_tx;
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "appears somewhere other than a direct named call",
+        ),
+        (
+            "a read hidden inside an allowed macro",
+            r#"fn unlock_local_secret_vault_locked() -> u8 {
+                let _guard = lock_local_vault_tx();
+                let vault = read_local_secret_vault_file();
+                let _ = format!("{}", read_local_secret_vault_file());
+                vault
+            }"#,
+            "appears inside the allowed macro",
+        ),
+        (
+            "a macro nobody declared",
+            r#"fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                assert!(snapshot > 0);
+                snapshot
+            }"#,
+            "is not on this function's allow list",
+        ),
+        (
+            "a function that no longer reads anything",
+            r#"fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                0
+            }"#,
+            "never calls read_maintenance_snapshot",
+        ),
+        (
+            "a bad cfg variant standing beside a good one",
+            r#"#[cfg(test)]
+            fn read_pending_prune() -> u8 {
+                let snapshot = read_maintenance_snapshot();
+                let _guard = lock_vault_maintenance_tx();
+                snapshot
+            }
+            #[cfg(not(test))]
+            fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "guard is not the first statement",
+        ),
+        (
+            "the shape the rules actually ask for",
+            r#"fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "",
+        ),
+    ];
+
+    #[test]
+    fn test_every_lock_protected_function_takes_its_guard_first() {
+        // Self-test before the real run. A harness whose quiet output is the
+        // evidence has to be shown to say something on input already known to
+        // be bad; otherwise "no problems" and "never looked" are the same
+        // sentence.
+        let probe = &lock_structure::TARGETS[6];
+        assert_eq!(probe.function, "read_pending_prune");
+        let macro_probe = &lock_structure::TARGETS[2];
+        assert_eq!(macro_probe.function, "unlock_local_secret_vault_locked");
+
+        for (label, source, expected) in LOCK_STRUCTURE_FIXTURES {
+            let file = syn::parse_file(source).unwrap_or_else(|error| {
+                panic!("fixture {label} does not parse: {error}");
+            });
+            let target = if source.contains("unlock_local_secret_vault_locked") {
+                macro_probe
+            } else {
+                probe
+            };
+            let problems = lock_structure::check(&file, target);
+
+            if expected.is_empty() {
+                assert!(
+                    problems.is_empty(),
+                    "fixture {label} should have been accepted, got {problems:?}"
+                );
+            } else {
+                assert!(
+                    problems.iter().any(|problem| problem.contains(expected)),
+                    "fixture {label} should have been rejected with {expected:?}, got {problems:?}"
+                );
+            }
+        }
+
+        // Now the file that ships.
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs")).unwrap();
+        let file = syn::parse_file(&source).expect("lib.rs does not parse");
+
+        assert!(
+            lock_structure::unanalysable(&file).is_empty(),
+            "lib.rs contains code this check cannot read: {:?}",
+            lock_structure::unanalysable(&file)
+        );
+
+        // The row count is asserted because the list is the check's own weak
+        // point: removing a row removes a guarantee and nothing else changes.
+        assert_eq!(lock_structure::TARGETS.len(), 8);
+
+        let mut problems = Vec::new();
+        for target in lock_structure::TARGETS {
+            problems.extend(lock_structure::check(&file, target));
+        }
+        assert!(problems.is_empty(), "{problems:#?}");
+
+        // The three outer dispatchers stay out of TARGETS on purpose. They open
+        // with a backend match, so requiring a guard first would mean holding a
+        // global vault lock across every keychain call - a real behaviour
+        // change to satisfy a checker, which is the trade this project refuses.
+        for outer in [
+            "save_secret_value",
+            "delete_secret_value",
+            "unlock_local_secret_storage",
+        ] {
+            assert!(
+                !lock_structure::TARGETS
+                    .iter()
+                    .any(|target| target.function == outer),
+                "{outer} is covered by the outer-dispatcher exclusion and must not be a target"
+            );
+        }
+    }
 }
