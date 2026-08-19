@@ -649,12 +649,13 @@ fn data_dir() -> Result<PathBuf, String> {
     fs::create_dir_all(&scratch_dir)
         .map_err(|error| format!("Failed to create scratch directory: {error}"))?;
 
-    let history_path = scratch_dir.join("history.jsonl");
-    if !history_path.exists() {
-        fs::write(&history_path, "")
-            .map_err(|error| format!("Failed to create history file: {error}"))?;
-    }
-
+    // The history file is deliberately not pre-created. It used to be, guarded
+    // by an exists() check, and that pairing was both a lost-update window and
+    // the one write in the data directory that did not go through write_atomic:
+    // a second caller could find the file missing, get descheduled while the
+    // first appended real entries, and then truncate them with an empty write.
+    // Nothing needs the file to exist - the reader treats "not there" as "no
+    // history", and the first append creates it atomically.
     Ok(root)
 }
 
@@ -958,8 +959,16 @@ fn quarantine_history_lines(lines: &[Vec<u8>]) -> Result<(), String> {
 fn read_history_entries() -> Result<HistoryFile, String> {
     io_checkpoint("read");
     let history_path = history_file_path()?;
-    let file = fs::File::open(&history_path)
-        .map_err(|error| format!("Failed to open history file: {error}"))?;
+    let file = match fs::File::open(&history_path) {
+        Ok(file) => file,
+        // No file is not an error, it is an empty history. Reporting it as a
+        // failure is what forced the data directory to pre-create the file,
+        // and that pre-creation was itself a truncating write.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HistoryFile::default())
+        }
+        Err(error) => return Err(format!("Failed to open history file: {error}")),
+    };
     let mut reader = BufReader::new(file);
     let mut history = HistoryFile::default();
 
@@ -1815,6 +1824,46 @@ fn read_maintenance_snapshot() -> Result<MaintenanceSnapshot, String> {
         .map_err(|error| format!("Failed to parse vault maintenance file: {error}"))
 }
 
+/// Fails the collision record on demand, and nothing else.
+///
+/// The obvious injection - make the scratch directory unwritable - cannot test
+/// what it looks like it tests here. Recording the collision and queueing the
+/// cleanup write the *same* maintenance file, so an unwritable directory fails
+/// both, and a version that drops the record's error simply fails one line
+/// later with the same outcome: same error, same untouched vault, same
+/// unflipped pointer. Nothing distinguishes them. The spec wrote that warning
+/// down for a different test and then used the unwritable directory here
+/// anyway.
+#[cfg(not(test))]
+#[inline(always)]
+fn injected_collision_record_failure() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn collision_record_failure() -> &'static StdMutex<bool> {
+    static FAILURE: OnceLock<StdMutex<bool>> = OnceLock::new();
+    FAILURE.get_or_init(|| StdMutex::new(false))
+}
+
+#[cfg(test)]
+fn set_collision_record_failure(enabled: bool) {
+    *collision_record_failure()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = enabled;
+}
+
+#[cfg(test)]
+fn injected_collision_record_failure() -> Result<(), String> {
+    if *collision_record_failure()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    {
+        return Err("Failed to record vault key collisions: injected".to_string());
+    }
+    Ok(())
+}
+
 fn write_maintenance_snapshot(snapshot: &MaintenanceSnapshot) -> Result<(), String> {
     write_atomic(
         &vault_maintenance_path()?,
@@ -1842,6 +1891,7 @@ fn record_vault_key_collisions(
 ) -> Result<(), String> {
     let _guard = lock_vault_maintenance_tx();
     checkpoint("maintenance_enter");
+    injected_collision_record_failure()?;
     let mut snapshot = read_maintenance_snapshot()?;
 
     let mut changed = false;
@@ -2055,6 +2105,15 @@ fn prune_orphan_vault_keys(
     candidates: &[String],
     index: &VaultKeyIndex,
 ) -> Result<Vec<String>, String> {
+    // Kept deliberately, and it is not dead code even though nothing reaches
+    // it today. The only caller checks index.complete before it dispatches
+    // here, so this branch is unreachable through that path - measured, not
+    // assumed: flipping this condition alone changes no observable behaviour
+    // and survives the whole suite. What the outer check cannot do is bind a
+    // caller that does not exist yet, and the cost of getting this wrong is
+    // deleting a live credential because one unrelated file happened to be
+    // unreadable. Deleting this line only looks safe while there is exactly
+    // one caller.
     if !index.complete {
         return Ok(Vec::new());
     }
@@ -2275,10 +2334,45 @@ fn quarantine_unreadable_file(path: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("Cannot quarantine {}: invalid file name", path.display()))?;
 
     let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let target = parent.join(format!("{stem}.corrupt-{timestamp}.json"));
-    fs::rename(path, &target)
-        .map_err(|error| format!("Failed to quarantine unreadable file: {error}"))?;
-    Ok(target)
+
+    // The timestamp only resolves to a second, and rename replaces whatever is
+    // already there. Two files quarantined inside the same second would leave
+    // the first one destroyed - and this file exists precisely because it is
+    // the only surviving record of which vault entries an environment owned.
+    // So the name is reserved with create_new first: whoever wins the
+    // reservation owns that name, and the loser moves to the next suffix
+    // instead of overwriting.
+    for attempt in 0..1000 {
+        let target = if attempt == 0 {
+            parent.join(format!("{stem}.corrupt-{timestamp}.json"))
+        } else {
+            parent.join(format!("{stem}.corrupt-{timestamp}-{attempt}.json"))
+        };
+
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+        {
+            Ok(_) => {
+                // Renaming over our own placeholder is the point: the name is
+                // ours from here on.
+                fs::rename(path, &target).map_err(|error| {
+                    format!("Failed to quarantine unreadable file: {error}")
+                })?;
+                return Ok(target);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!("Failed to quarantine unreadable file: {error}"))
+            }
+        }
+    }
+
+    Err(format!(
+        "Failed to quarantine {}: too many quarantined copies in the same second",
+        path.display()
+    ))
 }
 
 fn read_previous_secret_metadata(path: &Path) -> Result<Vec<EnvVariable>, String> {
@@ -3061,9 +3155,27 @@ fn delete_environment(project: String, name: String) -> Result<(), String> {
     let normal_exists = normal_path.exists();
     let secrets_exists = secrets_path.exists();
 
+    // An unreadable metadata file is quarantined rather than deleted, matching
+    // what saving does. Deleting it was the worst of the three options this
+    // slice uses: loading fails loudly because a half-shown environment is what
+    // makes users overwrite it, saving renames the file aside because its bytes
+    // are the only record of which vault entries the environment owned - and
+    // deleting threw those bytes away while the entries they name stayed in the
+    // vault, unreachable and undeletable. That is the defect this slice exists
+    // to fix, reappearing at the one entry point that destroys the evidence.
+    // It also made the recovery instructions in both READMEs false.
     let mut candidates: Vec<String> = Vec::new();
+    let mut quarantined_metadata: Option<PathBuf> = None;
     if secrets_exists {
-        for variable in read_env_variables(&secrets_path, true).unwrap_or_default() {
+        let previous = match read_env_variables(&secrets_path, true) {
+            Ok(variables) => variables,
+            Err(_) => {
+                quarantined_metadata = Some(quarantine_unreadable_file(&secrets_path)?);
+                Vec::new()
+            }
+        };
+
+        for variable in previous {
             let recorded = variable.vault_key.trim();
             let owned = if recorded.is_empty() {
                 vault_key_for(&resolved.dir, &name, &variable.key)
@@ -3092,7 +3204,11 @@ fn delete_environment(project: String, name: String) -> Result<(), String> {
         fs::remove_file(&normal_path)
             .map_err(|error| format!("Failed to delete environment: {error}"))?;
     }
-    if secrets_exists {
+    // Quarantining already moved the file off this path, and the environment is
+    // gone from the list either way because the renamed file no longer matches
+    // the .env.secrets.json suffix. The user's delete is honoured; the bytes
+    // survive for whoever has to work out what was in the vault.
+    if secrets_exists && quarantined_metadata.is_none() {
         fs::remove_file(&secrets_path)
             .map_err(|error| format!("Failed to delete environment secrets: {error}"))?;
     }
@@ -10533,17 +10649,16 @@ mod tests {
             );
         }
 
-        let scratch = temp_home.path().join("ApiSolo/scratch");
-        let restore = std::fs::metadata(&scratch).unwrap().permissions();
-        let mut readonly = restore.clone();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut readonly, 0o555);
-        std::fs::set_permissions(&scratch, readonly).unwrap();
-
-        let outcome = load_environment("Legacy".to_string(), "生产".to_string());
-
-        // Restore before asserting, or TempDir cleanup fails and buries the
-        // real failure under an unrelated one.
-        std::fs::set_permissions(&scratch, restore).unwrap();
+        // Only the record fails; scratch stays writable on purpose. An
+        // unwritable scratch would also stop the queue write on the next line,
+        // and then a version that drops the record's error would fail there
+        // instead - same error, same intact vault, same unflipped pointer, so
+        // nothing would distinguish it. Measured: under an unwritable scratch
+        // that mutant survived the whole suite.
+        let outcome = {
+            let _failure = CollisionRecordFailure::on();
+            load_environment("Legacy".to_string(), "生产".to_string())
+        };
 
         assert!(
             outcome.is_err(),
@@ -10969,6 +11084,21 @@ mod tests {
         );
     }
 
+    struct CollisionRecordFailure;
+
+    impl CollisionRecordFailure {
+        fn on() -> Self {
+            set_collision_record_failure(true);
+            Self
+        }
+    }
+
+    impl Drop for CollisionRecordFailure {
+        fn drop(&mut self) {
+            set_collision_record_failure(false);
+        }
+    }
+
     struct SystemVaultFailure;
 
     impl SystemVaultFailure {
@@ -11263,6 +11393,25 @@ mod tests {
         outcome
     }
 
+    /// The list below is derived from the producing side, not copied from the
+    /// plan. Copying the plan is how it went wrong the first time: the table
+    /// was the spec's nine-row survey of the writes that existed when the spec
+    /// was written, so `write_maintenance_snapshot` - added by this same slice,
+    /// after that survey - was never in it and nothing noticed.
+    ///
+    /// Regenerate with, over the production half of this file:
+    ///   grep -n 'write_atomic(' src-tauri/src/lib.rs
+    ///   grep -n 'fs::write(\|File::create(' src-tauri/src/lib.rs
+    ///
+    /// Ten call sites, all covered below: write_history_entries,
+    /// write_project_meta, write_secret_storage_config, write_local_secret_map,
+    /// write_maintenance_snapshot, write_secret_metadata, save_request,
+    /// rename_request, move_request, and save_environment's plain file.
+    ///
+    /// One `fs::write` survives on purpose, for window-state.json, which
+    /// PRODUCT lists as a non-goal: it is regenerated from scratch on every
+    /// launch and losing it costs a window size. The history file's
+    /// pre-creation used to be the second one and is now gone entirely.
     #[test]
     fn test_every_production_writer_leaves_target_intact_on_failure() {
         for writer in [
@@ -11270,6 +11419,7 @@ mod tests {
             "write_project_meta",
             "write_secret_storage_config",
             "write_local_secret_map",
+            "write_maintenance_snapshot",
             "write_secret_metadata",
             "save_request",
             "rename_request",
@@ -11343,6 +11493,21 @@ mod tests {
                             local_secret_vault_path().unwrap(),
                             scratch.clone(),
                             Box::new(|| save_secret_value("K2", "v2")),
+                        )
+                    }
+                    "write_maintenance_snapshot" => {
+                        // Seeded so the target already holds bytes. Without
+                        // that the read-only directory would fail an
+                        // fs::write too, for want of a file to truncate, and
+                        // the two spellings would be indistinguishable.
+                        let key = "writers:dev:dG9rZW4".to_string();
+                        enqueue_pending_prune(std::slice::from_ref(&key)).unwrap();
+                        (
+                            vault_maintenance_path().unwrap(),
+                            scratch.clone(),
+                            // Rewrites the file whether or not the key matches
+                            // anything, so the write is reached unconditionally.
+                            Box::new(move || acknowledge_secret_key_collision(key.clone())),
                         )
                     }
                     "write_secret_metadata" => {
@@ -11508,6 +11673,244 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_setting_up_the_data_directory_never_touches_the_history_file() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        // Preparing the data directory used to create an empty history file
+        // behind an exists() check. Two callers could both find it missing,
+        // and the one that resumed second would blank whatever the first had
+        // written in between - a truncating write, on user data, and the only
+        // one in the directory that never went through write_atomic.
+        let history_path = data_dir().unwrap().join("scratch").join("history.jsonl");
+        assert!(
+            !history_path.exists(),
+            "preparing the data directory created the history file"
+        );
+
+        // Absent is not broken; it means no history yet.
+        assert!(load_history().unwrap().is_empty());
+        assert_eq!(get_history_health().unwrap().skipped_lines, 0);
+
+        append_history(sample_history_entry("A", "2026-03-27T10:00:00Z")).unwrap();
+        let after_first = std::fs::read(&history_path).unwrap();
+        assert!(!after_first.is_empty());
+
+        // Every command prepares the directory first, so this runs constantly
+        // against a file that already holds entries.
+        data_dir().unwrap();
+        assert_eq!(
+            std::fs::read(&history_path).unwrap(),
+            after_first,
+            "preparing the data directory rewrote an existing history file"
+        );
+        assert_eq!(load_history().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_delete_environment_quarantines_unreadable_secret_metadata() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Legacy".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/legacy");
+        let owned = vault_key_for(&project_dir, "dev", "token");
+        save_secret_value(&owned, "STILL-IN-THE-VAULT").unwrap();
+
+        let normal_path = d03_env_file(temp_home.path(), "legacy", "dev", false);
+        std::fs::write(&normal_path, "[]").unwrap();
+        let secrets_path = d03_env_file(temp_home.path(), "legacy", "dev", true);
+        let corrupt = b"{ this is not the metadata it used to be".to_vec();
+        std::fs::write(&secrets_path, &corrupt).unwrap();
+
+        delete_environment("Legacy".to_string(), "dev".to_string()).unwrap();
+
+        // The user asked for the environment to go, and it is gone.
+        assert!(!normal_path.exists());
+        assert!(!secrets_path.exists());
+        assert!(!list_environments("Legacy".to_string())
+            .unwrap()
+            .contains(&"dev".to_string()));
+
+        // But its bytes are not gone. They are the only surviving record of
+        // which vault entries this environment owned, and deleting them left
+        // those entries in the vault with nothing left on disk naming them -
+        // unreachable and undeletable, which is the defect this slice exists
+        // to fix. Loading refuses outright and saving renames the file aside;
+        // deleting now matches saving.
+        let env_dir = temp_home.path().join("ApiSolo/projects/legacy/environments");
+        let quarantined: Vec<PathBuf> = std::fs::read_dir(&env_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(".corrupt-"))
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1, "expected one quarantined file");
+        assert_eq!(
+            std::fs::read(&quarantined[0]).unwrap(),
+            corrupt,
+            "the quarantined bytes were not preserved"
+        );
+
+        // Renaming a file back is what both READMEs tell the user to do, so
+        // the name has to be one the environment list ignores until then.
+        assert_eq!(load_secret_value(&owned).unwrap(), "STILL-IN-THE-VAULT");
+    }
+
+    #[test]
+    fn test_quarantine_never_overwrites_an_earlier_copy_from_the_same_second() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        let dir = temp_home.path();
+
+        // The name carries a timestamp that only resolves to a second, and
+        // rename replaces silently. Two quarantines inside one second used to
+        // leave the first destroyed - the file whose entire purpose is to be
+        // the last surviving copy.
+        //
+        // Both candidate seconds are occupied up front so the collision does
+        // not depend on which side of a tick the call lands.
+        let source = dir.join("dev.env.secrets.json");
+        std::fs::write(&source, b"the corrupt bytes").unwrap();
+
+        let mut blocked = Vec::new();
+        for offset in [0_i64, 1] {
+            let stamp = (Utc::now() + chrono::Duration::seconds(offset))
+                .format("%Y%m%dT%H%M%SZ")
+                .to_string();
+            let path = dir.join(format!("dev.env.secrets.corrupt-{stamp}.json"));
+            std::fs::write(&path, format!("earlier copy {offset}")).unwrap();
+            blocked.push(path);
+        }
+
+        let target = quarantine_unreadable_file(&source).unwrap();
+
+        assert!(
+            !blocked.contains(&target),
+            "quarantine landed on a name that was already taken: {}",
+            target.display()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"the corrupt bytes");
+        for (offset, path) in blocked.iter().enumerate() {
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                format!("earlier copy {offset}").into_bytes(),
+                "an earlier quarantined copy was overwritten: {}",
+                path.display()
+            );
+        }
+        assert!(!source.exists());
+    }
+
+    // --------------------------------------- the harness checking itself (P9)
+    // The probe protocol was validated on a standalone model before it was
+    // written here, and the model is not the harness. These two fixtures drive
+    // the real one through the branches the model covered: a child that panics
+    // while holding the lock, and a lock that is already poisoned when the
+    // probe looks at it. Both are infrastructure failures that must not be
+    // reported as lock verdicts - a poisoned result carries an acquired guard,
+    // so folding it into "held" would state the opposite of the truth.
+
+    fn d03_without_panic_output<T>(body: impl FnOnce() -> T) -> T {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = body();
+        std::panic::set_hook(previous);
+        outcome
+    }
+
+    #[test]
+    fn test_the_probe_reports_a_child_that_panics_and_leaves_the_lock_usable() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        let probe = d03_without_panic_output(|| {
+            probe_lock_at_checkpoint("maintenance_enter", vault_maintenance_tx(), || {
+                let _held = lock_vault_maintenance_tx();
+                checkpoint("maintenance_enter");
+                panic!("child panics after arriving at the checkpoint");
+            })
+        });
+
+        // The lock really was held, so the verdict alone looks like a pass.
+        // That is the point of checking the other three: a child that arrives
+        // holding the lock and then dies never did the work the test believes
+        // it observed.
+        assert_eq!(probe.verdict, LockVerdict::LockHeld);
+        assert!(
+            !probe.child_ok,
+            "a child that panicked was reported as having finished"
+        );
+        assert!(
+            probe.returned.is_empty(),
+            "a child that panicked reported a return value: {:?}",
+            probe.returned
+        );
+
+        // And the next probe has to be unaffected. Without the harness clearing
+        // the poison, one panicking child turns every later try_lock in the
+        // file into Poisoned, and a whole run reports infrastructure failures
+        // that read exactly like real ones.
+        let after = probe_lock_at_checkpoint("maintenance_enter", vault_maintenance_tx(), || {
+            let _held = lock_vault_maintenance_tx();
+            checkpoint("maintenance_enter");
+            Ok(())
+        });
+        assert_eq!(
+            after.verdict,
+            LockVerdict::LockHeld,
+            "a previous panic leaked into the next probe"
+        );
+        assert!(after.child_ok);
+    }
+
+    #[test]
+    fn test_the_probe_calls_an_already_poisoned_lock_a_harness_failure() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        // Poison it from outside, then park the child *without* taking it, so
+        // try_lock succeeds and reports the poison rather than WouldBlock.
+        d03_without_panic_output(|| {
+            let _ = std::thread::spawn(|| {
+                let _held = vault_maintenance_tx().lock().unwrap();
+                panic!("poisoning the maintenance lock on purpose");
+            })
+            .join();
+        });
+
+        let probe = probe_lock_at_checkpoint("maintenance_enter", vault_maintenance_tx(), || {
+            checkpoint("maintenance_enter");
+            Ok(())
+        });
+
+        assert_eq!(
+            probe.verdict,
+            LockVerdict::HarnessError,
+            "a poisoned lock was reported as a lock verdict"
+        );
+        assert!(probe.child_ok);
+
+        // The guard that came with the poisoned result has to have been
+        // dropped, and the poison cleared, or the rest of the file is ruined.
+        assert!(
+            vault_maintenance_tx().try_lock().is_ok(),
+            "the poisoned guard was never released"
+        );
+        enqueue_pending_prune(&["probe:after:poison".to_string()]).unwrap();
+        assert_eq!(read_pending_prune().unwrap(), vec!["probe:after:poison"]);
     }
 
     // ------------------------------------------------- cross-slice (D01+D03)
