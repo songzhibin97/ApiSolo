@@ -317,6 +317,61 @@ describe("useEnvironmentsStore", () => {
     expect(store.variables).toEqual(betaVariables)
   })
 
+  it("ignores environment variables that arrive after another environment was selected", async () => {
+    const prodVariables = [{ key: "API_URL", value: "https://api.example.com", secret: false }]
+    const devEnvironment = deferred<{ name: string; variables: typeof prodVariables }>()
+
+    invokeMock.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "list_environments") {
+        return ["dev", "prod"]
+      }
+
+      if (command === "get_collection_tree") {
+        return []
+      }
+
+      if (command === "load_environment") {
+        return args?.name === "dev"
+          ? devEnvironment.promise
+          : { name: "prod", variables: prodVariables }
+      }
+
+      throw new Error(`Unexpected invoke: ${command}`)
+    })
+
+    const projectsStore = useProjectsStore()
+    projectsStore.activeProject = "demo"
+
+    const store = useEnvironmentsStore()
+    await settle()
+
+    // "dev" sorts first, so the opening load is the slow one and is still in
+    // flight. Nothing has changed project here — this is one project's own
+    // selection moving on.
+    expect(
+      invokeMock.mock.calls.some(
+        ([command, args]) => command === "load_environment" && args?.name === "dev",
+      ),
+    ).toBe(true)
+
+    await store.setActiveEnv("prod")
+    await settle()
+
+    devEnvironment.resolve({
+      name: "dev",
+      variables: [{ key: "API_URL", value: "https://dev.example.com", secret: false }],
+    })
+    await settle()
+
+    // Asserted together: the stale answer would restore both the variables and
+    // the name they belong to, and splitting them into two assertions would
+    // leave neither one proven to carry the case.
+    expect({ activeEnv: store.activeEnv, variables: store.variables }).toEqual({
+      activeEnv: "prod",
+      variables: prodVariables,
+    })
+  })
+
   // D03 invariant 21
   it("marks only unsaved draft environments as create", async () => {
     let envList = ["dev"]

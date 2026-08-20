@@ -12254,9 +12254,24 @@ mod tests {
             },
         ];
 
-        /// Anything unreadable fails rather than passes. A non-inline module or
-        /// an item-level `include!` would hide code from the parse, and a check
-        /// that stays quiet about code it never saw is worse than no check.
+        /// Anything unreadable fails rather than passes, and "unreadable" is
+        /// decided by what this function can expand rather than by a list of
+        /// shapes known to be dangerous. It expands nothing, so **every** item
+        /// macro at this level is rejected, not just `include!`.
+        ///
+        /// The earlier version named `include!` specifically, which read as
+        /// thorough and was not: any other item macro walked through, and
+        /// `check` below only ever collects functions spelled out in the
+        /// source. A macro expanding to a read-before-lock `read_pending_prune`
+        /// under `#[cfg(test)]`, sitting beside a compliant `#[cfg(not(test))]`
+        /// one, is what the compiler builds while the check reads only the
+        /// compliant copy and reports nothing. Enumerating which macros can
+        /// hide a function has no fixed point - the same reason the guard rule
+        /// stopped enumerating ways to drop a guard.
+        ///
+        /// The crate root is the whole scope on purpose: it is exactly where
+        /// `check` collects its targets from, and a macro nested inside a module
+        /// cannot declare an item out here.
         pub fn unanalysable(file: &File) -> Vec<String> {
             let mut problems = Vec::new();
             for item in &file.items {
@@ -12265,8 +12280,19 @@ mod tests {
                         "module {} is not inline, so its contents are not analysable",
                         item.ident
                     )),
-                    syn::Item::Macro(item) if item.mac.path.is_ident("include") => problems
-                        .push("an item-level include! hides code from this check".to_string()),
+                    syn::Item::Macro(item) => {
+                        let name = item
+                            .mac
+                            .path
+                            .segments
+                            .last()
+                            .map(|segment| segment.ident.to_string())
+                            .unwrap_or_else(|| "<unnamed>".to_string());
+                        problems.push(format!(
+                            "the item macro {name}! is not expanded here, so anything it \
+                             declares is invisible to this check"
+                        ));
+                    }
                     _ => {}
                 }
             }
@@ -12734,6 +12760,48 @@ mod tests {
         ),
     ];
 
+    /// Fixtures for the other half of the check - "code I cannot read fails" -
+    /// which none of the rows above can reach. They all go through `check`, and
+    /// `check` only ever sees functions spelled out in the source; anything that
+    /// would *produce* a function is judged before that point or not at all.
+    ///
+    /// The first row is the bypass this pair exists for: a macro that could be
+    /// declaring the target function next to a compliant explicit one. The
+    /// compiler runs whatever the macro expands to, `check` reads only the
+    /// spelled-out copy, and every row above stays green.
+    const LOCK_STRUCTURE_UNANALYSABLE_FIXTURES: &[(&str, &str, &str)] = &[
+        (
+            "an item macro that could be declaring the target function",
+            r#"declare_reader!{}
+            #[cfg(not(test))]
+            fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "is not expanded here",
+        ),
+        (
+            "a module whose body lives in another file",
+            r#"mod elsewhere;
+            fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "is not inline",
+        ),
+        (
+            "nothing hidden from the parse at all",
+            r#"fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "",
+        ),
+    ];
+
     #[test]
     fn test_every_lock_protected_function_takes_its_guard_first() {
         // Self-test before the real run. A harness whose quiet output is the
@@ -12755,6 +12823,25 @@ mod tests {
                 probe
             };
             let problems = lock_structure::check(&file, target);
+
+            if expected.is_empty() {
+                assert!(
+                    problems.is_empty(),
+                    "fixture {label} should have been accepted, got {problems:?}"
+                );
+            } else {
+                assert!(
+                    problems.iter().any(|problem| problem.contains(expected)),
+                    "fixture {label} should have been rejected with {expected:?}, got {problems:?}"
+                );
+            }
+        }
+
+        for (label, source, expected) in LOCK_STRUCTURE_UNANALYSABLE_FIXTURES {
+            let file = syn::parse_file(source).unwrap_or_else(|error| {
+                panic!("fixture {label} does not parse: {error}");
+            });
+            let problems = lock_structure::unanalysable(&file);
 
             if expected.is_empty() {
                 assert!(

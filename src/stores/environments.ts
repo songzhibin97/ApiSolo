@@ -92,7 +92,11 @@ export const useEnvironmentsStore = defineStore("environments", () => {
     }
 
     const env = await invoke<Environment>("load_environment", { project, name })
-    if (projectsStore.activeProject !== project) {
+    // Two ways to have moved on, and the project is only one of them. Picking
+    // another environment inside the same project does not cancel this request
+    // either, so a slow answer for A landing after B is on screen would put A's
+    // variables back and rename the selection to A with them.
+    if (projectsStore.activeProject !== project || activeEnv.value !== name) {
       return null
     }
 
