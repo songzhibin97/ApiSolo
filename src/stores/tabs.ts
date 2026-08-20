@@ -89,16 +89,7 @@ async function cleanupWebSocketTab(tab: Tab) {
     return
   }
 
-  const connectionId = tab.wsConnectionId
-  const websocketStore = useWebSocketStore()
-
-  try {
-    await websocketStore.disconnect(connectionId)
-  } catch {
-    // Keep tab cleanup best-effort even if the socket is already gone.
-  }
-
-  websocketStore.clearMessages(connectionId)
+  await useWebSocketStore().teardown(tab.wsConnectionId)
 }
 
 function createEditablePairs<T extends KeyValuePair>(items: T[]): T[] {
@@ -208,13 +199,20 @@ export const useTabsStore = defineStore("tabs", () => {
   }
 
   async function removeTab(id: string) {
-    const index = tabs.value.findIndex((tab) => tab.id === id);
-    if (index === -1) {
+    const target = tabs.value.find((tab) => tab.id === id)
+    if (!target) {
       return;
     }
 
-    const target = tabs.value[index]
     await cleanupWebSocketTab(target)
+
+    // Re-resolved after the await. The list can change while the socket is
+    // closing, and splicing a pre-await index would remove whichever tab
+    // happens to sit there now.
+    const index = tabs.value.findIndex((tab) => tab.id === id)
+    if (index === -1) {
+      return;
+    }
 
     if (tabs.value.length === 1) {
       const replacement = createEmptyTab(1)
@@ -485,11 +483,14 @@ export const useTabsStore = defineStore("tabs", () => {
     }
 
     const closingTabs = tabs.value.filter((tab) => tab.id !== id)
+    const closingIds = new Set(closingTabs.map((tab) => tab.id))
     for (const tab of closingTabs) {
       await cleanupWebSocketTab(tab)
     }
 
-    tabs.value = [target]
+    // Filter by id rather than assigning the pre-await snapshot: tabs created
+    // while the sockets were closing must survive.
+    tabs.value = tabs.value.filter((tab) => tab.id === id || !closingIds.has(tab.id))
     activeTabId.value = id
   }
 
@@ -500,11 +501,14 @@ export const useTabsStore = defineStore("tabs", () => {
     }
 
     const closingTabs = tabs.value.slice(index + 1)
+    const closingIds = new Set(closingTabs.map((tab) => tab.id))
     for (const tab of closingTabs) {
       await cleanupWebSocketTab(tab)
     }
 
-    tabs.value = tabs.value.slice(0, index + 1)
+    // Same reason as closeOtherTabs: filter by id, never re-slice a stale
+    // snapshot.
+    tabs.value = tabs.value.filter((tab) => !closingIds.has(tab.id))
     if (!tabs.value.some((tab) => tab.id === activeTabId.value)) {
       activeTabId.value = id
     }

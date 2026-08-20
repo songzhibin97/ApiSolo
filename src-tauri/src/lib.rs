@@ -463,15 +463,42 @@ const DEV_BRIDGE_WS_EVENT_BUFFER_LIMIT: usize = 256;
 const DEV_BRIDGE_ENABLE_ENV: &str = "APISOLO_ENABLE_DEV_BRIDGE";
 const DEV_BRIDGE_TOKEN_ENV: &str = "APISOLO_DEV_BRIDGE_TOKEN";
 
+const WS_HANDSHAKE_BUDGET_SECS: u64 = 30;
+const WS_CLOSE_BUDGET_SECS: u64 = 5;
+const WS_CANCELLED: &str = "WebSocket connection was cancelled";
+
 type WsSender = futures_util::stream::SplitSink<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     WsMessage,
 >;
 
-static WS_CONNECTIONS: OnceLock<Arc<TokioMutex<HashMap<String, WsSender>>>> = OnceLock::new();
+type WsReader = futures_util::stream::SplitStream<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+>;
+
+/// An established connection. `sender` is behind its own mutex so `ws_send` and
+/// `close_ws_sender` can drop the *pool* lock before touching the network — a
+/// stuck peer must not serialize every other connection's send/disconnect.
+struct WsOpen {
+    sender: Arc<TokioMutex<WsSender>>,
+    reader: AbortHandle,
+    /// Broadcasts "this connection is over". An in-flight `ws_send` uses it to
+    /// abandon *both* the lock wait and the network send.
+    cancel: tokio::sync::watch::Sender<bool>,
+}
+
+enum WsSlot {
+    /// The cancel channel is created in `ws_prepare`, so a cancel arriving
+    /// *during* the handshake has somewhere to land. Moving to `Open` hands the
+    /// same sender over to `WsOpen`: one connection, one channel, start to end.
+    Pending {
+        cancel: tokio::sync::watch::Sender<bool>,
+    },
+    Open(WsOpen),
+}
+
+static WS_CONNECTIONS: OnceLock<Arc<TokioMutex<HashMap<String, WsSlot>>>> = OnceLock::new();
 static WS_EVENT_QUEUES: OnceLock<Arc<TokioMutex<HashMap<String, Vec<WsEventPayload>>>>> =
-    OnceLock::new();
-static WS_SUPPRESSED_DISCONNECT_EVENTS: OnceLock<Arc<TokioMutex<HashMap<String, ()>>>> =
     OnceLock::new();
 static ACTIVE_REQUESTS: OnceLock<Arc<TokioMutex<HashMap<String, ActiveRequestState>>>> =
     OnceLock::new();
@@ -547,7 +574,7 @@ impl Default for ActiveRequestState {
     }
 }
 
-fn ws_pool() -> Arc<TokioMutex<HashMap<String, WsSender>>> {
+fn ws_pool() -> Arc<TokioMutex<HashMap<String, WsSlot>>> {
     WS_CONNECTIONS
         .get_or_init(|| Arc::new(TokioMutex::new(HashMap::new())))
         .clone()
@@ -559,12 +586,6 @@ fn ws_event_queue_pool() -> Arc<TokioMutex<HashMap<String, Vec<WsEventPayload>>>
         .clone()
 }
 
-fn ws_suppressed_disconnect_pool() -> Arc<TokioMutex<HashMap<String, ()>>> {
-    WS_SUPPRESSED_DISCONNECT_EVENTS
-        .get_or_init(|| Arc::new(TokioMutex::new(HashMap::new())))
-        .clone()
-}
-
 fn active_request_pool() -> Arc<TokioMutex<HashMap<String, ActiveRequestState>>> {
     ACTIVE_REQUESTS
         .get_or_init(|| Arc::new(TokioMutex::new(HashMap::new())))
@@ -572,27 +593,23 @@ fn active_request_pool() -> Arc<TokioMutex<HashMap<String, ActiveRequestState>>>
 }
 
 async fn publish_ws_event(app: Option<&tauri::AppHandle>, payload: WsEventPayload) {
+    record_published_ws_event(&payload);
+
     if let Some(app) = app {
         let event_name = format!("ws-event-{}", payload.connection_id);
         let _ = app.emit(&event_name, payload.clone());
         return;
     }
 
-    if payload.event_type == "disconnected" {
-        let suppress_pool = ws_suppressed_disconnect_pool();
-        let mut suppressed = suppress_pool.lock().await;
-        if suppressed.remove(&payload.connection_id).is_some() {
-            ws_event_queue_pool()
-                .lock()
-                .await
-                .remove(&payload.connection_id);
-            return;
-        }
-    }
-
     let pool = ws_event_queue_pool();
     let mut queues = pool.lock().await;
-    let queue = queues.entry(payload.connection_id.clone()).or_default();
+    // `get_mut`, never `entry().or_default()`: a queue is created by
+    // `ws_connect_inner` before the handshake and removed by `ws_disconnect`.
+    // Recreating it here would resurrect the queue of a connection nobody is
+    // draining any more — the orphan-pool defect this slice exists to remove.
+    let Some(queue) = queues.get_mut(&payload.connection_id) else {
+        return;
+    };
     queue.push(payload);
     if queue.len() > DEV_BRIDGE_WS_EVENT_BUFFER_LIMIT {
         let overflow = queue.len() - DEV_BRIDGE_WS_EVENT_BUFFER_LIMIT;
@@ -799,6 +816,102 @@ fn io_checkpoint(tag: &'static str) {
         let _ = checkpoint.notify.send(tag);
         let _ = checkpoint.resume.recv();
     }
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket test-only facilities.
+//
+// Same shape as `io_checkpoint` above, but the WS paths run inside an async
+// context, so the rendezvous must use async channels: a blocking recv would
+// deadlock the current-thread runtime a `#[tokio::test]` runs on.
+// ---------------------------------------------------------------------------
+
+#[cfg(not(test))]
+#[inline(always)]
+async fn ws_checkpoint(_tag: &'static str) {}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn record_published_ws_event(_payload: &WsEventPayload) {}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn ws_reader_alive_guard() {}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn ws_first_pending_signal(_tag: &'static str) {}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn ws_handshake_budget() -> Duration {
+    Duration::from_secs(WS_HANDSHAKE_BUDGET_SECS)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn ws_close_budget() -> Duration {
+    Duration::from_secs(WS_CLOSE_BUDGET_SECS)
+}
+
+/// Wraps a future and signals the first time it returns `Poll::Pending`.
+///
+/// The observation point has to be bound to a real state transition of the
+/// awaited future, not to the moment we called it: "we invoked send" is not
+/// "send is stuck", and "the task was spawned" is not "the task is running".
+/// Two earlier designs keyed off our own actions and both admitted a false
+/// green.
+#[cfg(not(test))]
+#[inline(always)]
+async fn observing_first_pending<F: std::future::Future>(_tag: &'static str, fut: F) -> F::Output {
+    fut.await
+}
+
+#[cfg(test)]
+async fn ws_checkpoint(tag: &'static str) {
+    tests::ws_support::ws_checkpoint(tag).await
+}
+
+#[cfg(test)]
+fn record_published_ws_event(payload: &WsEventPayload) {
+    tests::ws_support::record_published_ws_event(payload)
+}
+
+#[cfg(test)]
+fn ws_reader_alive_guard() -> tests::ws_support::ReaderAliveGuard {
+    tests::ws_support::ReaderAliveGuard::new()
+}
+
+#[cfg(test)]
+fn ws_first_pending_signal(tag: &'static str) {
+    tests::ws_support::first_pending_signal(tag)
+}
+
+#[cfg(test)]
+fn ws_handshake_budget() -> Duration {
+    tests::ws_support::handshake_budget()
+}
+
+#[cfg(test)]
+fn ws_close_budget() -> Duration {
+    tests::ws_support::close_budget()
+}
+
+#[cfg(test)]
+async fn observing_first_pending<F: std::future::Future>(tag: &'static str, fut: F) -> F::Output {
+    let mut fut = Box::pin(fut); // Box::pin sidesteps pin projection, no unsafe.
+    let mut signalled = false;
+    std::future::poll_fn(move |cx| match fut.as_mut().poll(cx) {
+        std::task::Poll::Pending => {
+            if !signalled {
+                signalled = true;
+                ws_first_pending_signal(tag);
+            }
+            std::task::Poll::Pending
+        }
+        ready => ready,
+    })
+    .await
 }
 
 /// Test-only rendezvous keyed by name, used by the lock tests to park a thread
@@ -3399,12 +3512,34 @@ fn get_history_health() -> Result<HistoryHealth, String> {
     })
 }
 
-async fn ws_connect_inner(
-    app: Option<tauri::AppHandle>,
-    url: String,
-    headers: Vec<KeyValuePair>,
-) -> Result<String, String> {
+/// Allocates the connection id and parks a `Pending` slot in the pool. Zero
+/// I/O — the whole point is that the frontend can register its event listener
+/// against a *known* id before any handshake starts. Tauri has no event replay,
+/// so "listener first" has to be a happens-before relationship, not a race the
+/// frontend usually wins.
+#[tauri::command]
+async fn ws_prepare() -> Result<String, String> {
     let connection_id = Uuid::new_v4().to_string();
+    let (cancel, _) = tokio::sync::watch::channel(false);
+    ws_pool()
+        .lock()
+        .await
+        .insert(connection_id.clone(), WsSlot::Pending { cancel });
+    Ok(connection_id)
+}
+
+/// Removes a slot this coroutine itself created and owns. Only used on
+/// `ws_connect_inner`'s *own* error paths — on the cancel paths the slot
+/// belongs to `ws_disconnect` (see `take_open_ws_slot`).
+async fn release_ws_slot(connection_id: &str) {
+    ws_pool().lock().await.remove(connection_id);
+    ws_event_queue_pool().lock().await.remove(connection_id);
+}
+
+fn build_ws_request(
+    url: &str,
+    headers: &[KeyValuePair],
+) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, String> {
     let mut request = url
         .into_client_request()
         .map_err(|error| format!("Invalid WebSocket URL: {error}"))?;
@@ -3421,145 +3556,417 @@ async fn ws_connect_inner(
         );
     }
 
-    let (ws_stream, _) = tokio_tungstenite::connect_async(request)
-        .await
-        .map_err(|error| format!("WebSocket connection failed: {error}"))?;
-    let (write, mut read) = ws_stream.split();
+    Ok(request)
+}
 
-    ws_pool().lock().await.insert(connection_id.clone(), write);
-    let connected_event = WsEventPayload {
-        connection_id: connection_id.clone(),
-        event_type: "connected".to_string(),
-        content: String::new(),
-        timestamp: now_iso(),
+async fn ws_connect_inner(
+    app: Option<tauri::AppHandle>,
+    connection_id: String,
+    url: String,
+    headers: Vec<KeyValuePair>,
+) -> Result<(), String> {
+    // 1. Claim the prepared slot and subscribe to its cancel channel.
+    //
+    // A missing slot is the *normal* outcome of "cancel arrived first":
+    // `ws_disconnect` removes the Pending slot itself, so the handshake is
+    // never even started. It shares the wording with "this id was never
+    // prepared" on purpose — the only caller is the frontend using an id it
+    // just received, so both cases are programming errors or a cancel, and all
+    // three are refused identically. Whether the user sees an error is decided
+    // by the frontend's own `cancelled` flag, not by this string.
+    let mut cancel_rx = {
+        let pool = ws_pool();
+        let connections = pool.lock().await;
+        match connections.get(&connection_id) {
+            Some(WsSlot::Pending { cancel }) => cancel.subscribe(),
+            _ => return Err("Unknown WebSocket connection".to_string()),
+        }
     };
-    publish_ws_event(app.as_ref(), connected_event.clone()).await;
 
-    let pool = ws_pool();
-    let cid = connection_id.clone();
-    tokio::spawn(async move {
-        while let Some(message) = read.next().await {
-            match message {
-                Ok(WsMessage::Text(text)) => {
-                    publish_ws_event(
-                        app.as_ref(),
-                        WsEventPayload {
-                            connection_id: cid.clone(),
-                            event_type: "message".to_string(),
-                            content: text.to_string(),
-                            timestamp: now_iso(),
-                        },
-                    )
-                    .await;
-                }
-                Ok(WsMessage::Binary(data)) => {
-                    publish_ws_event(
-                        app.as_ref(),
-                        WsEventPayload {
-                            connection_id: cid.clone(),
-                            event_type: "message".to_string(),
-                            content: format!("[binary {} bytes]", data.len()),
-                            timestamp: now_iso(),
-                        },
-                    )
-                    .await;
-                }
-                Ok(WsMessage::Close(_)) => {
-                    break;
-                }
-                Err(error) => {
-                    publish_ws_event(
-                        app.as_ref(),
-                        WsEventPayload {
-                            connection_id: cid.clone(),
-                            event_type: "error".to_string(),
-                            content: error.to_string(),
-                            timestamp: now_iso(),
-                        },
-                    )
-                    .await;
-                    break;
-                }
-                _ => {}
+    // 2. The dev-bridge queue must exist before the handshake, otherwise frames
+    //    that arrive with the upgrade have nowhere to land. The Tauri path
+    //    deliberately builds no queue: nobody drains it there, and an undrained
+    //    pool is exactly the leak this slice removes.
+    if app.is_none() {
+        ws_event_queue_pool()
+            .lock()
+            .await
+            .insert(connection_id.clone(), Vec::new());
+    }
+
+    // 3. Build the request.
+    let request = match build_ws_request(&url, &headers) {
+        Ok(request) => request,
+        Err(error) => {
+            release_ws_slot(&connection_id).await;
+            return Err(error);
+        }
+    };
+
+    // 4. Handshake and cancel share one `select!`. `biased` polls cancel first,
+    //    so a cancel that landed before we got here means the handshake is
+    //    never initiated at all.
+    let handshake = observing_first_pending(
+        "handshake",
+        tokio::time::timeout(ws_handshake_budget(), tokio_tungstenite::connect_async(request)),
+    );
+    let (ws_stream, _) = tokio::select! {
+        biased;
+        // The `watch::Ref` this yields holds a non-Send read guard, so it is
+        // dropped inside the branch future rather than becoming part of the
+        // select's output type — otherwise the whole command future stops being
+        // Send and Tauri cannot register it.
+        _ = async { let _ = cancel_rx.wait_for(|cancelled| *cancelled).await; } => {
+            // Dropping the handshake future here drops the half-open TcpStream,
+            // so the socket closes at the moment of cancellation rather than
+            // when the budget expires.
+            //
+            // The slot is NOT removed here: reaching this branch means
+            // `ws_disconnect` already ran and already removed it. A second
+            // remove would be a harmless no-op, but it would create a second
+            // owner, and the next person to read this could not tell which one
+            // is load-bearing. Same for the queue.
+            return Err(WS_CANCELLED.to_string());
+        }
+        result = handshake => match result {
+            Err(_elapsed) => {
+                release_ws_slot(&connection_id).await;
+                return Err(format!(
+                    "WebSocket handshake timed out after {WS_HANDSHAKE_BUDGET_SECS}s"
+                ));
             }
+            Ok(Err(error)) => {
+                release_ws_slot(&connection_id).await;
+                return Err(format!("WebSocket connection failed: {error}"));
+            }
+            Ok(Ok(stream)) => stream,
+        },
+    };
+
+    // 5. Test-only rendezvous. It proves the handshake *completed*; it does not
+    //    prove the handshake is cancellable — that is what the "handshake" tag
+    //    on the future above observes.
+    ws_checkpoint("handshake-done").await;
+
+    let (write, read) = ws_stream.split();
+
+    // 6. Spawn the reader parked behind a gate, then install the slot. The gate
+    //    is what makes "connected precedes the first frame" structural instead
+    //    of a scheduling coin flip.
+    let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+    let reader_task = tokio::spawn(ws_reader_loop(
+        app.clone(),
+        connection_id.clone(),
+        read,
+        gate_rx,
+    ));
+
+    let cancel = {
+        let pool = ws_pool();
+        let mut connections = pool.lock().await;
+        let cancelled = !matches!(
+            connections.get(&connection_id),
+            Some(WsSlot::Pending { .. })
+        ) || *cancel_rx.borrow();
+
+        if cancelled {
+            drop(connections);
+            // Only tear down what this coroutine created: gate, reader task,
+            // write half. Slot and queue belong to `ws_disconnect`.
+            drop(gate_tx);
+            let _ = reader_task.await;
+            drop(write);
+            return Err(WS_CANCELLED.to_string());
         }
 
-        pool.lock().await.remove(&cid);
-        publish_ws_event(
-            app.as_ref(),
-            WsEventPayload {
-                connection_id: cid.clone(),
-                event_type: "disconnected".to_string(),
-                content: String::new(),
-                timestamp: now_iso(),
-            },
-        )
-        .await;
-    });
+        let Some(WsSlot::Pending { cancel }) = connections.remove(&connection_id) else {
+            // Unreachable given the check above, but expressing it as a value
+            // keeps the ownership story total.
+            drop(connections);
+            drop(gate_tx);
+            let _ = reader_task.await;
+            drop(write);
+            return Err(WS_CANCELLED.to_string());
+        };
 
-    Ok(connection_id)
+        connections.insert(
+            connection_id.clone(),
+            WsSlot::Open(WsOpen {
+                sender: Arc::new(TokioMutex::new(write)),
+                reader: reader_task.abort_handle(),
+                cancel: cancel.clone(),
+            }),
+        );
+        cancel
+    };
+    let _ = cancel;
+
+    // 7. Re-check before publishing.
+    //
+    // This NARROWS the window, it does not close it: `ws_disconnect` can still
+    // take the Open slot between this unlock and the emit below. The actual fix
+    // for that race is the frontend's terminal-state guard, which discards a
+    // `connected` event that arrives after cancel/disconnect/teardown.
+    //
+    // Keep this re-check anyway — deleting it is invisible under most
+    // interleavings, which is exactly why the reason has to live in the code
+    // and not only in the spec:
+    //   (a) in the common case the backend avoids emitting an event it already
+    //       knows is false;
+    //   (b) on the browser path it is the only interception point, since the
+    //       queue is gone and `publish_ws_event` no longer recreates it.
+    //
+    // Publishing is deliberately NOT done under the pool lock. That would make
+    // "slot is Open" and "connected emitted" atomic, but it puts an `await`
+    // inside the pool lock — the very shape this slice removes from ws_send and
+    // ws_disconnect. On the dev-bridge path publish itself awaits another lock,
+    // so folding it in would nest async locks.
+    let still_open = {
+        let pool = ws_pool();
+        let connections = pool.lock().await;
+        matches!(connections.get(&connection_id), Some(WsSlot::Open(_))) && !*cancel_rx.borrow()
+    };
+
+    if !still_open {
+        drop(gate_tx);
+        return Err(WS_CANCELLED.to_string());
+    }
+
+    publish_ws_event(
+        app.as_ref(),
+        WsEventPayload {
+            connection_id: connection_id.clone(),
+            event_type: "connected".to_string(),
+            content: String::new(),
+            timestamp: now_iso(),
+        },
+    )
+    .await;
+
+    // 8. Publish first, then open the gate: frame ordering must not depend on
+    //    the scheduler.
+    let _ = gate_tx.send(());
+
+    Ok(())
+}
+
+async fn ws_reader_loop(
+    app: Option<tauri::AppHandle>,
+    connection_id: String,
+    mut read: WsReader,
+    gate: tokio::sync::oneshot::Receiver<()>,
+) {
+    // Marks "this task was polled and entered the body", which is what the
+    // liveness tests wait for. It has to sit *before* the gate await: a
+    // cancelled connection would otherwise never be observed alive, and the
+    // cancel and reader-termination invariants would contradict each other.
+    let _alive = ws_reader_alive_guard();
+
+    if gate.await.is_err() {
+        return;
+    }
+
+    while let Some(message) = read.next().await {
+        match message {
+            Ok(WsMessage::Text(text)) => {
+                publish_ws_event(
+                    app.as_ref(),
+                    WsEventPayload {
+                        connection_id: connection_id.clone(),
+                        event_type: "message".to_string(),
+                        content: text.to_string(),
+                        timestamp: now_iso(),
+                    },
+                )
+                .await;
+            }
+            Ok(WsMessage::Binary(data)) => {
+                publish_ws_event(
+                    app.as_ref(),
+                    WsEventPayload {
+                        connection_id: connection_id.clone(),
+                        event_type: "message".to_string(),
+                        content: format!("[binary {} bytes]", data.len()),
+                        timestamp: now_iso(),
+                    },
+                )
+                .await;
+            }
+            Ok(WsMessage::Close(_)) => {
+                break;
+            }
+            Err(error) => {
+                publish_ws_event(
+                    app.as_ref(),
+                    WsEventPayload {
+                        connection_id: connection_id.clone(),
+                        event_type: "error".to_string(),
+                        content: error.to_string(),
+                        timestamp: now_iso(),
+                    },
+                )
+                .await;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // Only reachable when the *peer* ended the connection. A user-initiated
+    // disconnect aborts this task, so no late `disconnected` is produced and no
+    // suppression bookkeeping is needed.
+    ws_pool().lock().await.remove(&connection_id);
+    publish_ws_event(
+        app.as_ref(),
+        WsEventPayload {
+            connection_id: connection_id.clone(),
+            event_type: "disconnected".to_string(),
+            content: String::new(),
+            timestamp: now_iso(),
+        },
+    )
+    .await;
 }
 
 #[tauri::command]
 async fn ws_connect(
     app: tauri::AppHandle,
+    connection_id: String,
     url: String,
     headers: Vec<KeyValuePair>,
-) -> Result<String, String> {
-    ws_connect_inner(Some(app), url, headers).await
+) -> Result<(), String> {
+    ws_connect_inner(Some(app), connection_id, url, headers).await
 }
 
 #[tauri::command]
 async fn ws_send(connection_id: String, message: String) -> Result<(), String> {
-    let pool = ws_pool();
-    let mut connections = pool.lock().await;
-    let sender = connections
-        .get_mut(&connection_id)
-        .ok_or_else(|| "Connection not found or already closed".to_string())?;
+    let (sender, mut cancel_rx) = {
+        let pool = ws_pool();
+        let connections = pool.lock().await;
+        let taken = match connections.get(&connection_id) {
+            Some(WsSlot::Open(open)) => (open.sender.clone(), open.cancel.subscribe()),
+            Some(WsSlot::Pending { .. }) => {
+                return Err("Connection is still being established".to_string())
+            }
+            None => return Err("Connection not found or already closed".to_string()),
+        };
+        drop(connections); // Explicit: this line is what keeps the network send out of the pool lock.
+        taken
+    };
+    ws_checkpoint("send-after-unlock").await;
 
-    sender
-        .send(WsMessage::Text(message.into()))
-        .await
-        .map_err(|error| format!("Failed to send message: {error}"))
+    tokio::select! {
+        biased;
+        // The lock wait and the send live in the *same* branch, so cancelling
+        // abandons the whole path rather than just the network call.
+        result = async {
+            let mut guard = sender.lock().await;
+            observing_first_pending("send", guard.send(WsMessage::Text(message.into()))).await
+        } => result.map_err(|error| format!("Failed to send message: {error}")),
+        // Ref dropped inside the branch future — see the note in ws_connect_inner.
+        _ = async { let _ = cancel_rx.wait_for(|cancelled| *cancelled).await; } => Err("Connection was closed".to_string()),
+    }
+}
+
+/// Takes ownership of an established connection, or cancels a pending one.
+///
+/// Destroying the slot is this function's job in *both* cases, because it is
+/// the only party on the cancel path guaranteed to run: after `ws_prepare`
+/// succeeds there are legitimate frontend paths that never call `ws_connect` at
+/// all, so a Pending slot whose removal is deferred to that coroutine would
+/// leak forever.
+fn take_open_ws_slot(
+    connections: &mut HashMap<String, WsSlot>,
+    connection_id: &str,
+) -> Option<WsOpen> {
+    match connections.get(connection_id) {
+        Some(WsSlot::Pending { cancel }) => {
+            let _ = cancel.send(true);
+            connections.remove(connection_id);
+            None
+        }
+        Some(WsSlot::Open(_)) => match connections.remove(connection_id) {
+            Some(WsSlot::Open(open)) => Some(open),
+            _ => None,
+        },
+        None => None,
+    }
+}
+
+fn spawn_ws_close(sender: Arc<TokioMutex<WsSender>>) {
+    tokio::spawn(close_ws_sender(sender));
+}
+
+async fn close_ws_sender(sender: Arc<TokioMutex<WsSender>>) {
+    // The budget has to cover the *lock wait* too. Covering only the network
+    // send leaves a stuck `ws_send` holding the guard and the close task
+    // waiting on it forever — the same "await outside the budget" shape this
+    // slice removes elsewhere.
+    //
+    // With the cancel path present the stuck sender releases its guard almost
+    // immediately, so this budget is defence in depth rather than the
+    // load-bearing half. It is kept for the case where the cancel path is
+    // absent or the send task is not polled for a long time; it has no
+    // independent mutation killer, and that is recorded rather than papered
+    // over.
+    let _ = tokio::time::timeout(ws_close_budget(), async {
+        let mut guard = sender.lock().await;
+        let _ = guard.send(WsMessage::Close(None)).await;
+    })
+    .await;
+    // Guard and the last Arc drop here, releasing the write half. Budget
+    // expiry releases it just the same.
 }
 
 #[tauri::command]
 async fn ws_disconnect(connection_id: String) -> Result<(), String> {
     let pool = ws_pool();
     let mut connections = pool.lock().await;
-    if let Some(mut sender) = connections.remove(&connection_id) {
-        ws_event_queue_pool().lock().await.remove(&connection_id);
-        ws_suppressed_disconnect_pool()
-            .lock()
-            .await
-            .insert(connection_id.clone(), ());
-        let _ = sender.send(WsMessage::Close(None)).await;
-    }
-    Ok(())
-}
+    let open = take_open_ws_slot(&mut connections, &connection_id);
+    drop(connections); // Explicit: this line is what keeps the Close frame out of the pool lock.
+    ws_checkpoint("disconnect-after-unlock").await;
 
-#[tauri::command]
-async fn ws_status(connection_id: String) -> Result<String, String> {
-    let pool = ws_pool();
-    let connections = pool.lock().await;
-    if connections.contains_key(&connection_id) {
-        Ok("connected".to_string())
-    } else {
-        Ok("disconnected".to_string())
+    ws_event_queue_pool().lock().await.remove(&connection_id);
+
+    if let Some(open) = open {
+        // Explicit send rather than relying on the Sender being dropped below.
+        // Dropping it has the same effect, so this line has no independent
+        // killer — it is kept so the cancellation is visible in the code and a
+        // later refactor cannot lose the unwritten "drop implies cancel"
+        // dependency.
+        let _ = open.cancel.send(true);
+        // Dropping the read half is what actually closes the socket against a
+        // peer that never sends Close: SplitSink has no Drop, so releasing the
+        // write half alone would leave the reader parked forever.
+        open.reader.abort();
+        // Best-effort polite Close on a bounded, detached task, so the
+        // disconnect button's latency is decoupled from the peer's.
+        spawn_ws_close(open.sender);
     }
+
+    // Cancelling a connection that has not been established yet still
+    // *succeeded*. Reporting it as an error would surface a user's own cancel
+    // as a failure.
+    Ok(())
 }
 
 #[tauri::command]
 async fn ws_drain_events(connection_id: String) -> Result<Vec<WsEventPayload>, String> {
     let pool = ws_event_queue_pool();
     let mut queues = pool.lock().await;
-    let events = queues.entry(connection_id).or_default();
+    // `get_mut`, never `entry().or_default()`: draining an unknown id must not
+    // create an entry nobody will ever remove.
+    let Some(events) = queues.get_mut(&connection_id) else {
+        return Ok(Vec::new());
+    };
     let drained = std::mem::take(events);
     if drained
         .iter()
         .any(|event| event.event_type == "disconnected")
     {
-        queues.remove(&drained[0].connection_id);
+        // Keyed by the argument, not by `drained[0]`, so an empty batch cannot
+        // panic and a mixed batch cannot remove the wrong queue.
+        queues.remove(&connection_id);
     }
     Ok(drained)
 }
@@ -4560,6 +4967,7 @@ struct WsConnectionArgs {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WsConnectArgs {
+    connection_id: String,
     url: String,
     #[serde(default)]
     headers: Vec<KeyValuePair>,
@@ -4690,8 +5098,12 @@ async fn api_resolve_variables(Json(args): Json<ResolveVariablesArgs>) -> impl I
     api_response(resolve_variables(args.template, args.variables))
 }
 
+async fn api_ws_prepare() -> impl IntoResponse {
+    api_response(ws_prepare().await)
+}
+
 async fn api_ws_connect(Json(args): Json<WsConnectArgs>) -> impl IntoResponse {
-    api_response(ws_connect_inner(None, args.url, args.headers).await)
+    api_unit(ws_connect_inner(None, args.connection_id, args.url, args.headers).await)
 }
 
 async fn api_ws_send(Json(args): Json<WsSendArgs>) -> impl IntoResponse {
@@ -4700,10 +5112,6 @@ async fn api_ws_send(Json(args): Json<WsSendArgs>) -> impl IntoResponse {
 
 async fn api_ws_disconnect(Json(args): Json<WsConnectionArgs>) -> impl IntoResponse {
     api_unit(ws_disconnect(args.connection_id).await)
-}
-
-async fn api_ws_status(Json(args): Json<WsConnectionArgs>) -> impl IntoResponse {
-    api_response(ws_status(args.connection_id).await)
 }
 
 async fn api_send_request(Json(args): Json<SendRequestEnvelope>) -> impl IntoResponse {
@@ -4777,10 +5185,10 @@ async fn start_dev_server() {
         .route("/api/save_environment", post(api_save_environment))
         .route("/api/delete_environment", post(api_delete_environment))
         .route("/api/resolve_variables", post(api_resolve_variables))
+        .route("/api/ws_prepare", post(api_ws_prepare))
         .route("/api/ws_connect", post(api_ws_connect))
         .route("/api/ws_send", post(api_ws_send))
         .route("/api/ws_disconnect", post(api_ws_disconnect))
-        .route("/api/ws_status", post(api_ws_status))
         .route("/api/send_request", post(api_send_request))
         .route("/api/cancel_request", post(api_cancel_request))
         .route("/api/ws_drain_events", post(api_ws_drain_events))
@@ -4835,10 +5243,10 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            ws_prepare,
             ws_connect,
             ws_send,
             ws_disconnect,
-            ws_status,
             ws_drain_events,
             send_request,
             cancel_request,
@@ -4959,6 +5367,420 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clear();
         }
+    }
+
+    /// Test-only WebSocket support: rendezvous points, liveness probes, and
+    /// the offline peer used by the lifecycle tests.
+    ///
+    /// Every observation point here is bound to a real state transition of the
+    /// thing being observed, never to the moment the test called something.
+    /// "We invoked send" is not "send is stuck"; "the task was spawned" is not
+    /// "the task is running". Both of those shortcuts admitted a false green in
+    /// earlier designs.
+    pub(super) mod ws_support {
+        use super::super::{WsEventPayload, WS_CLOSE_BUDGET_SECS, WS_HANDSHAKE_BUDGET_SECS};
+        use std::collections::HashSet;
+        use std::sync::{Mutex, OnceLock};
+        use std::time::Duration;
+
+        pub(crate) struct WsCheckpoint {
+            pub notify: tokio::sync::mpsc::UnboundedSender<&'static str>,
+            pub resume: tokio::sync::oneshot::Receiver<()>,
+        }
+
+        fn checkpoint_slot() -> &'static Mutex<Option<WsCheckpoint>> {
+            static SLOT: OnceLock<Mutex<Option<WsCheckpoint>>> = OnceLock::new();
+            SLOT.get_or_init(|| Mutex::new(None))
+        }
+
+        /// take() ⇒ each installed checkpoint fires at most once. "One-shot"
+        /// has to be a property of the mechanism: if it relied on the test
+        /// remembering to drain, a second arrival would park forever while the
+        /// test waits to join, and both sides would hang.
+        pub(crate) async fn ws_checkpoint(tag: &'static str) {
+            let taken = {
+                checkpoint_slot()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+            };
+
+            if let Some(checkpoint) = taken {
+                let _ = checkpoint.notify.send(tag);
+                let _ = checkpoint.resume.await;
+            }
+        }
+
+        pub(crate) fn install_ws_checkpoint(
+        ) -> (tokio::sync::mpsc::UnboundedReceiver<&'static str>, tokio::sync::oneshot::Sender<()>)
+        {
+            let (notify_tx, notify_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+            *checkpoint_slot()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(WsCheckpoint {
+                notify: notify_tx,
+                resume: resume_rx,
+            });
+            (notify_rx, resume_tx)
+        }
+
+        // --- published event log ------------------------------------------
+        //
+        // Installed inside the *production* `publish_ws_event` body, so it
+        // records that publishing actually happened rather than that a helper
+        // could work in isolation.
+
+        fn published() -> &'static Mutex<Vec<(String, String)>> {
+            static LOG: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
+            LOG.get_or_init(|| Mutex::new(Vec::new()))
+        }
+
+        pub(crate) fn record_published_ws_event(payload: &WsEventPayload) {
+            published()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((payload.connection_id.clone(), payload.event_type.clone()));
+        }
+
+        pub(crate) fn published_events() -> Vec<(String, String)> {
+            published()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        // --- reader liveness ----------------------------------------------
+
+        fn alive_channel() -> &'static tokio::sync::watch::Sender<usize> {
+            static ALIVE: OnceLock<tokio::sync::watch::Sender<usize>> = OnceLock::new();
+            ALIVE.get_or_init(|| tokio::sync::watch::channel(0).0)
+        }
+
+        /// Published over a `watch`, not a bare counter plus `Notify`: the
+        /// tests must *positively* wait for `alive == 1` before judging
+        /// anything, and `Notify` drops a notification that arrives before the
+        /// wait — which is exactly the false green this guards against.
+        pub(crate) struct ReaderAliveGuard;
+
+        impl ReaderAliveGuard {
+            pub(crate) fn new() -> Self {
+                alive_channel().send_modify(|count| *count += 1);
+                Self
+            }
+        }
+
+        impl Drop for ReaderAliveGuard {
+            fn drop(&mut self) {
+                alive_channel().send_modify(|count| *count = count.saturating_sub(1));
+            }
+        }
+
+        pub(crate) fn reader_alive_rx() -> tokio::sync::watch::Receiver<usize> {
+            alive_channel().subscribe()
+        }
+
+        // --- first-Pending signals ----------------------------------------
+
+        fn first_pending_channel() -> &'static tokio::sync::watch::Sender<HashSet<&'static str>> {
+            static TAGS: OnceLock<tokio::sync::watch::Sender<HashSet<&'static str>>> =
+                OnceLock::new();
+            TAGS.get_or_init(|| tokio::sync::watch::channel(HashSet::new()).0)
+        }
+
+        pub(crate) fn first_pending_signal(tag: &'static str) {
+            first_pending_channel().send_modify(|tags| {
+                tags.insert(tag);
+            });
+        }
+
+        pub(crate) fn first_pending_rx() -> tokio::sync::watch::Receiver<HashSet<&'static str>> {
+            first_pending_channel().subscribe()
+        }
+
+        // --- overridable budgets ------------------------------------------
+        //
+        // The tests assert *which branch was taken*, never a wall-clock
+        // duration.
+
+        fn handshake_budget_slot() -> &'static Mutex<Duration> {
+            static SLOT: OnceLock<Mutex<Duration>> = OnceLock::new();
+            SLOT.get_or_init(|| Mutex::new(Duration::from_secs(WS_HANDSHAKE_BUDGET_SECS)))
+        }
+
+        fn close_budget_slot() -> &'static Mutex<Duration> {
+            static SLOT: OnceLock<Mutex<Duration>> = OnceLock::new();
+            SLOT.get_or_init(|| Mutex::new(Duration::from_secs(WS_CLOSE_BUDGET_SECS)))
+        }
+
+        pub(crate) fn handshake_budget() -> Duration {
+            *handshake_budget_slot()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        pub(crate) fn close_budget() -> Duration {
+            *close_budget_slot()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        pub(crate) fn set_handshake_budget(value: Duration) {
+            *handshake_budget_slot()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = value;
+        }
+
+        pub(crate) fn set_close_budget(value: Duration) {
+            *close_budget_slot()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = value;
+        }
+
+        /// Process-wide state is shared by every test in this binary, so the WS
+        /// tests depend on `--test-threads=1` (i.e. `npm run test:rust`).
+        pub(crate) async fn reset_ws_state() {
+            super::super::ws_pool().lock().await.clear();
+            super::super::ws_event_queue_pool().lock().await.clear();
+            published()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+            *checkpoint_slot()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            first_pending_channel().send_modify(|tags| tags.clear());
+            set_handshake_budget(Duration::from_secs(WS_HANDSHAKE_BUDGET_SECS));
+            set_close_budget(Duration::from_secs(WS_CLOSE_BUDGET_SECS));
+        }
+    }
+
+    /// Verdicts are four-valued and mutually exclusive on purpose. Once
+    /// "never observed" is allowed to slide into a benign result, the test's
+    /// upper bound quietly stops being a deadlock guard and becomes the
+    /// judgement itself.
+    #[cfg(test)]
+    #[derive(Debug, PartialEq, Eq)]
+    enum HandshakeVerdict {
+        BudgetEnforced,
+        NoBudget,
+        UnexpectedSuccess,
+        HarnessError,
+    }
+
+    #[cfg(test)]
+    #[derive(Debug, PartialEq, Eq)]
+    enum CancelVerdict {
+        HandshakeCancelled,
+        HandshakeNotCancelled,
+        HandshakeNeverPending,
+        HarnessError,
+    }
+
+    #[cfg(test)]
+    #[derive(Debug, PartialEq, Eq)]
+    enum ReaderVerdict {
+        ReaderTerminated,
+        ReaderStillAlive,
+        ReaderNeverStarted,
+        HarnessError,
+    }
+
+    #[cfg(test)]
+    #[derive(Debug, PartialEq, Eq)]
+    enum WriterVerdict {
+        WriterReleased,
+        WriterStillHeld,
+        SendNeverStuck,
+        HarnessError,
+    }
+
+    /// Offline test peers. Everything is loopback; nothing leaves the machine.
+    #[cfg(test)]
+    #[derive(Clone, Copy)]
+    enum TestPeer {
+        /// Sends one frame immediately after the upgrade, then closes.
+        FrameThenClose,
+        /// Accepts, then never sends a frame, never sends Close, never closes
+        /// the TCP connection.
+        SilentForever,
+        /// Completes the TCP handshake and never replies 101, so the client's
+        /// handshake future parks deterministically.
+        AcceptTcpNeverUpgrade,
+        /// Stays connected and idle.
+        HoldOpen,
+    }
+
+    #[cfg(test)]
+    struct TestPeerHandle {
+        url: String,
+        accepted: tokio::sync::watch::Receiver<usize>,
+        /// Whether the accepted stream has seen EOF — i.e. the *client* closed
+        /// the socket. The peer itself never closes, so EOF has exactly one
+        /// cause.
+        eof: tokio::sync::watch::Receiver<bool>,
+        /// Connections currently being serviced. A peer that died before the
+        /// verdict would make the reader terminate, the writer release and the
+        /// handshake return all on its own, so none of those endpoints could be
+        /// attributed to the mechanism under test.
+        live: tokio::sync::watch::Receiver<usize>,
+        task: tokio::task::JoinHandle<()>,
+        /// Per-connection tasks, so a finished test can release its sockets
+        /// instead of leaving them parked for the rest of the binary.
+        connections: Arc<StdMutex<Vec<tokio::task::JoinHandle<()>>>>,
+    }
+
+    #[cfg(test)]
+    async fn spawn_test_ws_peer(peer: TestPeer) -> TestPeerHandle {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::watch::channel(0usize);
+        let (eof_tx, eof_rx) = tokio::sync::watch::channel(false);
+        let (live_tx, live_rx) = tokio::sync::watch::channel(0usize);
+        let connections: Arc<StdMutex<Vec<tokio::task::JoinHandle<()>>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let connections_for_loop = connections.clone();
+
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                accepted_tx.send_modify(|count| *count += 1);
+                live_tx.send_modify(|count| *count += 1);
+
+                // Each connection is serviced on its own task: the peers below
+                // deliberately park forever, and doing that inline would stop
+                // the listener from ever accepting a second connection.
+                let eof_tx = eof_tx.clone();
+                let live_tx = live_tx.clone();
+                let handle = tokio::spawn(async move {
+                    match peer {
+                        TestPeer::AcceptTcpNeverUpgrade => {
+                            // Read until EOF and nothing else. Never close,
+                            // never shut down: that keeps "the stream saw EOF"
+                            // uniquely caused by the client releasing its
+                            // socket, which is what the cancel assertion reads.
+                            let mut stream = stream;
+                            let mut buffer = [0u8; 1024];
+                            loop {
+                                match stream.read(&mut buffer).await {
+                                    Ok(0) => {
+                                        eof_tx.send_replace(true);
+                                        break;
+                                    }
+                                    Ok(_) => continue,
+                                    Err(_) => {
+                                        eof_tx.send_replace(true);
+                                        break;
+                                    }
+                                }
+                            }
+                            std::future::pending::<()>().await;
+                        }
+                        TestPeer::FrameThenClose => {
+                            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                                live_tx.send_modify(|count| *count -= 1);
+                                return;
+                            };
+                            use futures_util::SinkExt;
+                            let _ = ws
+                                .send(tokio_tungstenite::tungstenite::Message::Text(
+                                    "first-frame".into(),
+                                ))
+                                .await;
+                            let _ = ws
+                                .send(tokio_tungstenite::tungstenite::Message::Close(None))
+                                .await;
+                            let _ = ws.flush().await;
+                            std::future::pending::<()>().await;
+                        }
+                        TestPeer::SilentForever | TestPeer::HoldOpen => {
+                            let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                                live_tx.send_modify(|count| *count -= 1);
+                                return;
+                            };
+                            // Hold the stream open and read nothing, so a large
+                            // client send fills the window and parks.
+                            let _ws = ws;
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                });
+                connections_for_loop
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(handle);
+            }
+        });
+
+        TestPeerHandle {
+            url: format!("ws://{addr}/socket"),
+            accepted: accepted_rx,
+            eof: eof_rx,
+            live: live_rx,
+            task,
+            connections,
+        }
+    }
+
+    #[cfg(test)]
+    impl TestPeerHandle {
+        async fn wait_accepted(&mut self, at_least: usize) -> bool {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                self.accepted.wait_for(|count| *count >= at_least),
+            )
+            .await
+            .is_ok()
+        }
+
+        async fn wait_eof(&mut self, budget: Duration) -> bool {
+            tokio::time::timeout(budget, self.eof.wait_for(|seen| *seen))
+                .await
+                .is_ok()
+        }
+
+        fn servicing(&self) -> usize {
+            *self.live.borrow()
+        }
+
+        /// Releases the listener and every serviced connection. Without this the
+        /// parked peer tasks would hold their sockets for the rest of the test
+        /// binary, which is both a leak and a source of cross-test timing noise.
+        fn shutdown(&self) {
+            self.task.abort();
+            for handle in self
+                .connections
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+            {
+                handle.abort();
+            }
+        }
+    }
+
+    /// Waits for a `observing_first_pending` tag, i.e. for the awaited future
+    /// to have actually parked. Failing to observe it is never a pass.
+    #[cfg(test)]
+    async fn wait_first_pending(tag: &'static str, budget: Duration) -> bool {
+        let mut rx = ws_support::first_pending_rx();
+        let observed = tokio::time::timeout(budget, rx.wait_for(|tags| tags.contains(tag)))
+            .await
+            .is_ok();
+        observed
+    }
+
+    #[cfg(test)]
+    async fn wait_reader_alive(target: usize, budget: Duration) -> bool {
+        let mut rx = ws_support::reader_alive_rx();
+        let observed = tokio::time::timeout(budget, rx.wait_for(|count| *count == target))
+            .await
+            .is_ok();
+        observed
     }
 
     /// How long the test thread waits for a child to reach its checkpoint.
@@ -7067,36 +7889,337 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_suppressed_disconnect_event_does_not_recreate_queue() {
-        ws_event_queue_pool().lock().await.insert(
-            "ws-test".to_string(),
-            vec![WsEventPayload {
-                connection_id: "ws-test".to_string(),
-                event_type: "message".to_string(),
-                content: "hello".to_string(),
-                timestamp: now_iso(),
-            }],
-        );
-        ws_suppressed_disconnect_pool()
-            .lock()
-            .await
-            .insert("ws-test".to_string(), ());
+    // -----------------------------------------------------------------------
+    // WebSocket lifecycle tests.
+    //
+    // Every liveness test below first *positively observes its starting point*
+    // and only then waits, under a test-side bound, for the end state. A bound
+    // that expires is mapped to a named red verdict, never to a pass; and a
+    // starting point that was never observed is its own verdict, because
+    // "it never got going" and "it finished" are different facts that an
+    // earlier design folded into one.
+    //
+    // These tests read process-wide pools, so they require --test-threads=1
+    // (that is, `npm run test:rust`).
+    // -----------------------------------------------------------------------
 
-        publish_ws_event(
-            None,
-            WsEventPayload {
-                connection_id: "ws-test".to_string(),
-                event_type: "disconnected".to_string(),
-                content: String::new(),
-                timestamp: now_iso(),
-            },
+    #[tokio::test]
+    async fn test_ws_handshake_budget_is_enforced() {
+        ws_support::reset_ws_state().await;
+        ws_support::set_handshake_budget(Duration::from_millis(300));
+        let mut peer = spawn_test_ws_peer(TestPeer::AcceptTcpNeverUpgrade).await;
+
+        let connection_id = ws_prepare().await.unwrap();
+        // The bound lives in the test, so a missing product budget makes the
+        // test go red and stop rather than hang.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            ws_connect_inner(None, connection_id.clone(), peer.url.clone(), Vec::new()),
         )
         .await;
 
-        let pool = ws_event_queue_pool();
-        let queues = pool.lock().await;
-        assert!(!queues.contains_key("ws-test"));
+        let verdict = match outcome {
+            Err(_elapsed) => HandshakeVerdict::NoBudget,
+            Ok(Err(error)) if error.contains("timed out") => HandshakeVerdict::BudgetEnforced,
+            Ok(Err(_)) => HandshakeVerdict::HarnessError,
+            Ok(Ok(())) => HandshakeVerdict::UnexpectedSuccess,
+        };
+
+        assert_eq!(verdict, HandshakeVerdict::BudgetEnforced);
+        assert!(peer.wait_accepted(1).await, "peer never accepted a connection");
+        peer.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_ws_disconnect_cancels_an_in_flight_handshake() {
+        ws_support::reset_ws_state().await;
+        // Left at the default 30s on purpose: with a millisecond budget the
+        // handshake would end on its own and a green would prove the budget
+        // works, not that cancelling works. Same endpoint, different cause.
+        let mut peer = spawn_test_ws_peer(TestPeer::AcceptTcpNeverUpgrade).await;
+
+        let connection_id = ws_prepare().await.unwrap();
+        let handshake = tokio::spawn(ws_connect_inner(
+            None,
+            connection_id.clone(),
+            peer.url.clone(),
+            Vec::new(),
+        ));
+
+        // Starting point, observed positively: the handshake future has parked
+        // at least once, and the peer really has a connection in hand.
+        let pending_observed = wait_first_pending("handshake", Duration::from_secs(5)).await;
+        let accepted = peer.wait_accepted(1).await;
+
+        ws_disconnect(connection_id.clone()).await.unwrap();
+
+        // 2s, far below the 30s product budget: this gap is what separates
+        // "cancelled now" from "gave up when the budget expired".
+        let returned = tokio::time::timeout(Duration::from_secs(2), handshake).await;
+
+        let verdict = if !pending_observed || !accepted {
+            CancelVerdict::HandshakeNeverPending
+        } else {
+            match returned {
+                Err(_elapsed) => CancelVerdict::HandshakeNotCancelled,
+                Ok(Ok(Err(error))) if error == WS_CANCELLED => {
+                    // Returning is not releasing: the peer must see EOF, which
+                    // only the client closing its socket can produce.
+                    if peer.wait_eof(Duration::from_secs(2)).await {
+                        CancelVerdict::HandshakeCancelled
+                    } else {
+                        CancelVerdict::HandshakeNotCancelled
+                    }
+                }
+                Ok(Ok(_)) | Ok(Err(_)) => CancelVerdict::HarnessError,
+            }
+        };
+
+        assert_eq!(verdict, CancelVerdict::HandshakeCancelled);
+        assert!(
+            !ws_support::published_events()
+                .iter()
+                .any(|(id, kind)| id == &connection_id && kind == "connected"),
+            "a connected event was published for a cancelled handshake"
+        );
+        assert!(ws_pool().lock().await.is_empty());
+        peer.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_ws_prepare_then_disconnect_without_connect_leaves_nothing() {
+        ws_support::reset_ws_state().await;
+
+        // The window where no coroutine will ever arrive to clean up: the
+        // frontend prepared a connection and then abandoned it without ever
+        // calling ws_connect. Destroying the slot has to be ws_disconnect's
+        // job, because it is the only party guaranteed to run here.
+        let connection_id = ws_prepare().await.unwrap();
+        assert_eq!(ws_pool().lock().await.len(), 1);
+
+        ws_disconnect(connection_id).await.unwrap();
+
+        assert_eq!(ws_pool().lock().await.len(), 0);
+        assert_eq!(ws_event_queue_pool().lock().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_ws_disconnect_terminates_the_reader_against_a_silent_peer() {
+        ws_support::reset_ws_state().await;
+        let peer = spawn_test_ws_peer(TestPeer::SilentForever).await;
+
+        let connection_id = ws_prepare().await.unwrap();
+        ws_connect_inner(None, connection_id.clone(), peer.url.clone(), Vec::new())
+            .await
+            .unwrap();
+
+        // Starting point: the reader task really is running. A count of zero
+        // could just as well mean it was never polled.
+        let started = wait_reader_alive(1, Duration::from_secs(5)).await;
+
+        ws_disconnect(connection_id.clone()).await.unwrap();
+
+        let terminated = wait_reader_alive(0, Duration::from_secs(5)).await;
+
+        let verdict = if !started {
+            ReaderVerdict::ReaderNeverStarted
+        } else if terminated {
+            ReaderVerdict::ReaderTerminated
+        } else {
+            ReaderVerdict::ReaderStillAlive
+        };
+
+        assert_eq!(verdict, ReaderVerdict::ReaderTerminated);
+        assert!(
+            peer.servicing() >= 1,
+            "peer stopped servicing the connection before the verdict"
+        );
+        peer.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_ws_disconnect_releases_a_stuck_writer_within_budget() {
+        ws_support::reset_ws_state().await;
+        ws_support::set_close_budget(Duration::from_millis(100));
+        let peer = spawn_test_ws_peer(TestPeer::SilentForever).await;
+
+        let connection_id = ws_prepare().await.unwrap();
+        ws_connect_inner(None, connection_id.clone(), peer.url.clone(), Vec::new())
+            .await
+            .unwrap();
+
+        let sender = {
+            let pool = ws_pool();
+            let connections = pool.lock().await;
+            match connections.get(&connection_id) {
+                Some(WsSlot::Open(open)) => open.sender.clone(),
+                _ => panic!("connection was not open"),
+            }
+        };
+        // A second strong reference so "released" can be observed from here.
+        let probe = sender.clone();
+        drop(sender);
+
+        let send_id = connection_id.clone();
+        let stuck_send = tokio::spawn(async move {
+            // Big enough that a peer which never reads cannot absorb it, so the
+            // send parks instead of completing.
+            let payload = "x".repeat(64 * 1024 * 1024);
+            ws_send(send_id, payload).await
+        });
+
+        // Starting point: the send future has actually parked. If the peer had
+        // drained it, killing the cancel path would not be observable and a
+        // green would mean nothing.
+        let stuck = wait_first_pending("send", Duration::from_secs(10)).await;
+
+        ws_disconnect(connection_id.clone()).await.unwrap();
+
+        let mut released = false;
+        for _ in 0..100 {
+            if Arc::strong_count(&probe) == 1 {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let verdict = if !stuck {
+            WriterVerdict::SendNeverStuck
+        } else if released {
+            WriterVerdict::WriterReleased
+        } else {
+            WriterVerdict::WriterStillHeld
+        };
+
+        assert_eq!(verdict, WriterVerdict::WriterReleased);
+        assert!(
+            peer.servicing() >= 1,
+            "peer stopped servicing the connection before the verdict"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(2), stuck_send).await;
+        peer.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_ws_disconnect_does_not_hold_the_pool_lock() {
+        ws_support::reset_ws_state().await;
+        let peer = spawn_test_ws_peer(TestPeer::HoldOpen).await;
+
+        let connection_id = ws_prepare().await.unwrap();
+        ws_connect_inner(None, connection_id.clone(), peer.url.clone(), Vec::new())
+            .await
+            .unwrap();
+
+        let (mut arrivals, resume) = ws_support::install_ws_checkpoint();
+        let disconnect_id = connection_id.clone();
+        let disconnecting = tokio::spawn(async move { ws_disconnect(disconnect_id).await });
+
+        let tag = tokio::time::timeout(Duration::from_secs(5), arrivals.recv())
+            .await
+            .expect("disconnect never reached its checkpoint")
+            .expect("checkpoint channel closed");
+        assert_eq!(tag, "disconnect-after-unlock");
+
+        // Synchronous judgement at a pinned instant — no timeout anywhere in
+        // the assertion itself.
+        let free = ws_pool().try_lock().is_ok();
+        let _ = resume.send(());
+        let _ = disconnecting.await;
+
+        assert!(free, "ws_disconnect still held the pool lock past the unlock point");
+        assert!(
+            peer.servicing() >= 1,
+            "peer stopped servicing the connection before the verdict"
+        );
+        peer.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_ws_send_does_not_hold_the_pool_lock() {
+        ws_support::reset_ws_state().await;
+        let peer = spawn_test_ws_peer(TestPeer::HoldOpen).await;
+
+        let connection_id = ws_prepare().await.unwrap();
+        ws_connect_inner(None, connection_id.clone(), peer.url.clone(), Vec::new())
+            .await
+            .unwrap();
+
+        let (mut arrivals, resume) = ws_support::install_ws_checkpoint();
+        let send_id = connection_id.clone();
+        let sending = tokio::spawn(async move { ws_send(send_id, "ping".to_string()).await });
+
+        let tag = tokio::time::timeout(Duration::from_secs(5), arrivals.recv())
+            .await
+            .expect("send never reached its checkpoint")
+            .expect("checkpoint channel closed");
+        assert_eq!(tag, "send-after-unlock");
+
+        let free = ws_pool().try_lock().is_ok();
+        let _ = resume.send(());
+        let _ = tokio::time::timeout(Duration::from_secs(5), sending).await;
+
+        assert!(free, "ws_send still held the pool lock past the unlock point");
+        assert!(
+            peer.servicing() >= 1,
+            "peer stopped servicing the connection before the verdict"
+        );
+        peer.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_ws_connection_state_does_not_accumulate() {
+        ws_support::reset_ws_state().await;
+        let mut peer = spawn_test_ws_peer(TestPeer::HoldOpen).await;
+
+        for _ in 0..5 {
+            let connection_id = ws_prepare().await.unwrap();
+            // app: None ⇒ the dev-bridge path, which is the one that builds an
+            // event queue, so both maps are exercised.
+            ws_connect_inner(None, connection_id.clone(), peer.url.clone(), Vec::new())
+                .await
+                .unwrap();
+            // The frontend drains after disconnecting; draining an unknown id
+            // must not resurrect an entry.
+            ws_disconnect(connection_id.clone()).await.unwrap();
+            let drained = ws_drain_events(connection_id).await.unwrap();
+            assert!(drained.is_empty());
+        }
+
+        assert_eq!(ws_pool().lock().await.len(), 0);
+        assert_eq!(ws_event_queue_pool().lock().await.len(), 0);
+        assert!(peer.wait_accepted(5).await);
+        peer.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_ws_connect_publishes_connected_before_the_first_frame() {
+        ws_support::reset_ws_state().await;
+        let peer = spawn_test_ws_peer(TestPeer::FrameThenClose).await;
+
+        let connection_id = ws_prepare().await.unwrap();
+        ws_connect_inner(None, connection_id.clone(), peer.url.clone(), Vec::new())
+            .await
+            .unwrap();
+
+        // Wait for the frame to make it through the gate.
+        let mut seen = Vec::new();
+        for _ in 0..100 {
+            seen = ws_support::published_events()
+                .into_iter()
+                .filter(|(id, _)| id == &connection_id)
+                .map(|(_, kind)| kind)
+                .collect();
+            if seen.iter().any(|kind| kind == "message") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Ordering is enforced by the reader's gate, not by scheduling luck.
+        assert_eq!(seen.first().map(String::as_str), Some("connected"));
+        assert!(seen.iter().any(|kind| kind == "message"));
+        peer.shutdown();
     }
 
     #[test]
@@ -7205,6 +8328,13 @@ mod tests {
     #[tokio::test]
     async fn test_dev_bridge_ws_event_queue_is_bounded() {
         let connection_id = "ws-bounded".to_string();
+        // The queue is now created by ws_connect_inner rather than by
+        // publish_ws_event, so the fixture has to register it first. The
+        // assertions below are unchanged.
+        ws_event_queue_pool()
+            .lock()
+            .await
+            .insert(connection_id.clone(), Vec::new());
         for index in 0..(DEV_BRIDGE_WS_EVENT_BUFFER_LIMIT + 5) {
             publish_ws_event(
                 None,

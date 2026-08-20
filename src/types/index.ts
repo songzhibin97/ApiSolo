@@ -225,6 +225,8 @@ export interface WsMessage {
   direction: "sent" | "received" | "system"
   content: string
   timestamp: string
+  /** Set when the content was cut to the per-message character cap. */
+  truncated?: boolean
 }
 
 export interface WsEventPayload {

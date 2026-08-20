@@ -341,5 +341,10 @@ export default {
     newHttp: "HTTP 请求",
     newWebSocket: "WebSocket",
     headers: "握手请求头",
+    cancel: "取消",
+    notConnected: "尚未连接，无法发送",
+    emptyDraft: "消息为空，无法发送",
+    truncated: "已截断",
+    droppedMessages: "已丢弃 {count} 条",
   },
 } as const

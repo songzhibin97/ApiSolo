@@ -29,7 +29,7 @@ ApiSolo is a local-first desktop API client built with Tauri, Rust, Vue, and Pin
 - Project collections with request save/load plus Postman-compatible import/export paths.
 - Environment variables with normal values plus user-selected secret storage: a local encrypted vault by default, or the operating system keychain if explicitly selected.
 - Pre-request and test scripts executed in a QuickJS WebAssembly sandbox with timeouts.
-- WebSocket connections with handshake headers, sent/received message history, and connection state.
+- WebSocket connections with handshake headers, sent/received message history, and connection state. Deliberate boundaries: the handshake has a 30-second budget and can be cancelled while it is still in flight; a connection keeps its most recent 500 messages and shows how many were dropped; a single message is stored up to 65536 characters and is marked when cut; there is no automatic reconnect; and WebSocket frames are never written to request history.
 - Request history grouped by URL prefix, time, or method, with replay-friendly saved entries.
 - Built-in debug console for app, network, and script events.
 - Light/dark/system themes, English and Simplified Chinese UI, proxy, and TLS settings.

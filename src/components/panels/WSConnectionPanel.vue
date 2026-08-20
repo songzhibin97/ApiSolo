@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue"
+import { computed, onMounted, onUnmounted, ref } from "vue"
 import { storeToRefs } from "pinia"
 import { AlertCircle, LoaderCircle } from "lucide-vue-next"
 import { useI18n } from "vue-i18n"
@@ -53,9 +53,17 @@ function updateHeaders(headers: KeyValuePair[]) {
 async function handleConnectionToggle() {
   errorMessage.value = ""
 
-  if (activeTab.value.wsStatus === "connected" && activeTab.value.wsConnectionId) {
+  // "connecting" is included on purpose: the backend can cancel an in-flight
+  // handshake, so the button must expose that. Leaving it disabled would hide a
+  // capability the implementation has, which is the mirror image of showing one
+  // it does not.
+  const connectionId = activeTab.value.wsConnectionId
+  if (
+    (activeTab.value.wsStatus === "connected" || activeTab.value.wsStatus === "connecting") &&
+    connectionId
+  ) {
     try {
-      await websocketStore.disconnect(activeTab.value.wsConnectionId)
+      await websocketStore.disconnect(connectionId)
     } catch (error) {
       errorMessage.value = error instanceof Error ? error.message : String(error)
     }
@@ -100,6 +108,32 @@ function handleMessageKeydown(event: KeyboardEvent) {
   event.preventDefault()
   void sendMessage()
 }
+
+/**
+ * Cmd/Ctrl+Enter on a websocket tab routes here. When the draft cannot be sent
+ * the user gets a visible reason — silence would read as a broken shortcut.
+ */
+function handleShortcutSend() {
+  if (!canSend.value) {
+    errorMessage.value = t("ws.notConnected")
+    return
+  }
+
+  if (!messageDraft.value.trim()) {
+    errorMessage.value = t("ws.emptyDraft")
+    return
+  }
+
+  void sendMessage()
+}
+
+onMounted(() => {
+  window.addEventListener("apisolo:ws-send", handleShortcutSend)
+})
+
+onUnmounted(() => {
+  window.removeEventListener("apisolo:ws-send", handleShortcutSend)
+})
 </script>
 
 <template>
@@ -128,11 +162,10 @@ function handleMessageKeydown(event: KeyboardEvent) {
             : 'bg-emerald-500 hover:brightness-110'
         "
         type="button"
-        :disabled="activeTab.wsStatus === 'connecting'"
         @click="handleConnectionToggle"
       >
         <LoaderCircle v-if="activeTab.wsStatus === 'connecting'" :size="15" class="animate-spin" />
-        <span v-if="activeTab.wsStatus === 'connecting'">{{ t("ws.connecting") }}</span>
+        <span v-if="activeTab.wsStatus === 'connecting'">{{ t("ws.cancel") }}</span>
         <span v-else-if="activeTab.wsStatus === 'connected'">{{ t("ws.disconnect") }}</span>
         <span v-else>{{ t("ws.connect") }}</span>
       </button>

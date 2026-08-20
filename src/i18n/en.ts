@@ -342,5 +342,10 @@ export default {
     newHttp: "HTTP Request",
     newWebSocket: "WebSocket",
     headers: "Handshake Headers",
+    cancel: "Cancel",
+    notConnected: "Not connected — nothing was sent",
+    emptyDraft: "Message is empty — nothing was sent",
+    truncated: "truncated",
+    droppedMessages: "{count} dropped",
   },
 } as const
