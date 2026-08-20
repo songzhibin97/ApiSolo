@@ -3679,9 +3679,17 @@ async fn ws_connect_inner(
             return Err(WS_CANCELLED.to_string());
         }
 
+        // This branch is not merely defensive: it is what actually handles a
+        // cancel that lands between the handshake completing and this lock
+        // being taken, because ws_disconnect removes the Pending slot itself.
+        //
+        // Measured, not assumed: disabling the `cancelled` computation above
+        // leaves every test green, and a probe panic placed here fires — so
+        // that computation is redundant with this branch for every reachable
+        // cancel. It is kept as defence in depth and carries no independent
+        // mutation killer; see the ledger's exemption entry for the conditions
+        // that would make it load-bearing again.
         let Some(WsSlot::Pending { cancel }) = connections.remove(&connection_id) else {
-            // Unreachable given the check above, but expressing it as a value
-            // keeps the ownership story total.
             drop(connections);
             drop(gate_tx);
             let _ = reader_task.await;

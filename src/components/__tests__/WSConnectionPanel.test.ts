@@ -78,15 +78,23 @@ describe("WSConnectionPanel", () => {
     expect(connectMock).not.toHaveBeenCalled()
   })
 
+  // The window the critical finding was about: the button reads "cancel"
+  // before any id exists. Two separate consequences, two separate cases.
   it("still routes the toggle to cancel while connecting without an id yet", async () => {
     const tab = wsTab({ wsStatus: "connecting", wsConnectionId: undefined })
     const wrapper = mountPanel()
 
     await wrapper.find("button").trigger("click")
 
-    // The window the critical finding was about: the button reads "cancel"
-    // before any id exists, and a click here must not start a connection.
     expect(cancelOrDisconnectMock).toHaveBeenCalledWith(tab.id, undefined)
+  })
+
+  it("does not start a connection when the toggle is clicked while connecting without an id", async () => {
+    wsTab({ wsStatus: "connecting", wsConnectionId: undefined })
+    const wrapper = mountPanel()
+
+    await wrapper.find("button").trigger("click")
+
     expect(connectMock).not.toHaveBeenCalled()
   })
 

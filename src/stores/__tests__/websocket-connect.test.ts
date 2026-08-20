@@ -407,7 +407,10 @@ describe("websocket connect lifecycle", () => {
     expect(backend.state.calls.filter((call) => call === "ws_prepare")).toHaveLength(1)
   })
 
-  it("releases the prepared connection when cancel arrives before the id exists", async () => {
+  // One consequence per case. Cancelling in this window changes four things at
+  // once, and a fixture where four assertions fail together cannot show which
+  // of them is doing the work.
+  async function cancelBeforeIdExists() {
     const { tabsStore, wsStore, tab } = setup()
     const deferred = backend.makeDeferred()
     backend.state.deferPrepare = deferred as never
@@ -420,11 +423,36 @@ describe("websocket connect lifecycle", () => {
     deferred.release()
     const result = await connecting
 
+    return {
+      result,
+      calls: backend.state.calls,
+      status: tabsStore.tabs.find((item) => item.id === tab.id)?.wsStatus,
+    }
+  }
+
+  it("reports no connection when cancel arrives before the id exists", async () => {
+    const { result } = await cancelBeforeIdExists()
+
     expect(result).toBeUndefined()
-    // The id the backend handed us after the cancel must still be given back.
-    expect(backend.state.calls).toContain("ws_disconnect")
-    expect(backend.state.calls).not.toContain("ws_connect")
-    expect(tabsStore.tabs.find((item) => item.id === tab.id)?.wsStatus).toBe("disconnected")
+  })
+
+  it("gives the prepared connection back when cancel arrives before the id exists", async () => {
+    const { calls } = await cancelBeforeIdExists()
+
+    // The id the backend handed us after the cancel must still be returned.
+    expect(calls).toContain("ws_disconnect")
+  })
+
+  it("never starts the handshake when cancel arrives before the id exists", async () => {
+    const { calls } = await cancelBeforeIdExists()
+
+    expect(calls).not.toContain("ws_connect")
+  })
+
+  it("converges the tab when cancel arrives before the id exists", async () => {
+    const { status } = await cancelBeforeIdExists()
+
+    expect(status).toBe("disconnected")
   })
 
   it("converges the tab to disconnected when ws_prepare fails", async () => {
@@ -452,6 +480,19 @@ describe("websocket connect lifecycle", () => {
     expect(second).not.toBe(first)
     // Reachable only through the old id, which the tab no longer holds.
     expect(wsStore.connections[first]).toBeUndefined()
+  })
+
+  it("drops the previous connection's buffered messages when the same tab reconnects", async () => {
+    const { wsStore, tab } = setup()
+
+    const first = (await wsStore.connect(tab.id, tab.url, []))!
+    emit(first, { eventType: "connected" })
+    emit(first, { eventType: "message", content: "old" })
+    await wsStore.disconnect(first)
+
+    backend.state.preparedId = "ws-2"
+    await wsStore.connect(tab.id, tab.url, [])
+
     expect(wsStore.getMessages(first)).toHaveLength(0)
   })
 
