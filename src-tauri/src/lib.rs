@@ -3701,6 +3701,11 @@ async fn ws_connect_inner(
     };
     let _ = cancel;
 
+    // Test-only rendezvous for the window the re-check below narrows but does
+    // not close: the slot is Open, the pool lock is released, and `connected`
+    // has not been published yet.
+    ws_checkpoint("open-installed").await;
+
     // 7. Re-check before publishing.
     //
     // This NARROWS the window, it does not close it: `ws_disconnect` can still
@@ -3742,6 +3747,10 @@ async fn ws_connect_inner(
         },
     )
     .await;
+
+    // Test-only rendezvous for the last window: `connected` is out but the
+    // reader is still parked, so nothing has been delivered yet.
+    ws_checkpoint("connected-published").await;
 
     // 8. Publish first, then open the gate: frame ordering must not depend on
     //    the scheduler.
@@ -5389,8 +5398,8 @@ mod tests {
             pub resume: tokio::sync::oneshot::Receiver<()>,
         }
 
-        fn checkpoint_slot() -> &'static Mutex<Option<WsCheckpoint>> {
-            static SLOT: OnceLock<Mutex<Option<WsCheckpoint>>> = OnceLock::new();
+        fn checkpoint_slot() -> &'static Mutex<Option<(&'static str, WsCheckpoint)>> {
+            static SLOT: OnceLock<Mutex<Option<(&'static str, WsCheckpoint)>>> = OnceLock::new();
             SLOT.get_or_init(|| Mutex::new(None))
         }
 
@@ -5399,11 +5408,17 @@ mod tests {
         /// remembering to drain, a second arrival would park forever while the
         /// test waits to join, and both sides would hang.
         pub(crate) async fn ws_checkpoint(tag: &'static str) {
+            // Keyed by tag: several checkpoints sit on the same connect path, so
+            // an untagged one-shot slot would be consumed by whichever fires
+            // first and a test waiting for a later one would hang.
             let taken = {
-                checkpoint_slot()
+                let mut slot = checkpoint_slot()
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match slot.as_ref() {
+                    Some((wanted, _)) if *wanted == tag => slot.take().map(|(_, cp)| cp),
+                    _ => None,
+                }
             };
 
             if let Some(checkpoint) = taken {
@@ -5413,16 +5428,20 @@ mod tests {
         }
 
         pub(crate) fn install_ws_checkpoint(
+            tag: &'static str,
         ) -> (tokio::sync::mpsc::UnboundedReceiver<&'static str>, tokio::sync::oneshot::Sender<()>)
         {
             let (notify_tx, notify_rx) = tokio::sync::mpsc::unbounded_channel();
             let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
             *checkpoint_slot()
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(WsCheckpoint {
-                notify: notify_tx,
-                resume: resume_rx,
-            });
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((
+                tag,
+                WsCheckpoint {
+                    notify: notify_tx,
+                    resume: resume_rx,
+                },
+            ));
             (notify_rx, resume_tx)
         }
 
@@ -8124,7 +8143,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (mut arrivals, resume) = ws_support::install_ws_checkpoint();
+        let (mut arrivals, resume) = ws_support::install_ws_checkpoint("disconnect-after-unlock");
         let disconnect_id = connection_id.clone();
         let disconnecting = tokio::spawn(async move { ws_disconnect(disconnect_id).await });
 
@@ -8158,7 +8177,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (mut arrivals, resume) = ws_support::install_ws_checkpoint();
+        let (mut arrivals, resume) = ws_support::install_ws_checkpoint("send-after-unlock");
         let send_id = connection_id.clone();
         let sending = tokio::spawn(async move { ws_send(send_id, "ping".to_string()).await });
 
@@ -8202,6 +8221,105 @@ mod tests {
         assert_eq!(ws_pool().lock().await.len(), 0);
         assert_eq!(ws_event_queue_pool().lock().await.len(), 0);
         assert!(peer.wait_accepted(5).await);
+        peer.shutdown();
+    }
+
+    /// Parks the connect coroutine at `tag`, cancels from the outside, then
+    /// releases it — turning a window into an exact instant instead of a race.
+    #[cfg(test)]
+    async fn cancel_at_checkpoint(
+        tag: &'static str,
+        peer_url: String,
+    ) -> (Result<(), String>, String) {
+        let (mut arrivals, resume) = ws_support::install_ws_checkpoint(tag);
+        let connection_id = ws_prepare().await.unwrap();
+        let id = connection_id.clone();
+        let url = peer_url;
+        let connecting = tokio::spawn(async move { ws_connect_inner(None, id, url, Vec::new()).await });
+
+        let arrived = tokio::time::timeout(Duration::from_secs(10), arrivals.recv())
+            .await
+            .expect("connect never reached the checkpoint")
+            .expect("checkpoint channel closed");
+        assert_eq!(arrived, tag);
+
+        // The coroutine is pinned here; the cancel lands in this exact window.
+        ws_disconnect(connection_id.clone()).await.unwrap();
+        let _ = resume.send(());
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), connecting)
+            .await
+            .expect("connect never returned after the checkpoint was released")
+            .expect("connect task panicked");
+        (outcome, connection_id)
+    }
+
+    /// W3 — handshake returned, slot not yet promoted to Open.
+    #[tokio::test]
+    async fn test_cancel_between_handshake_and_open_leaves_nothing() {
+        ws_support::reset_ws_state().await;
+        let peer = spawn_test_ws_peer(TestPeer::HoldOpen).await;
+
+        let (outcome, connection_id) =
+            cancel_at_checkpoint("handshake-done", peer.url.clone()).await;
+
+        assert_eq!(outcome, Err(WS_CANCELLED.to_string()));
+        assert!(
+            !ws_support::published_events()
+                .iter()
+                .any(|(id, kind)| id == &connection_id && kind == "connected"),
+            "a connected event was published for a connection cancelled before it opened"
+        );
+        assert_eq!(ws_pool().lock().await.len(), 0);
+        assert!(wait_reader_alive(0, Duration::from_secs(5)).await);
+        peer.shutdown();
+    }
+
+    /// W4 — slot is Open and the pool lock is released, but `connected` has not
+    /// been published yet. The backend re-check narrows this window; it does not
+    /// close it, which is why the frontend also carries a terminal-state guard.
+    #[tokio::test]
+    async fn test_cancel_after_open_but_before_connected_publishes_nothing() {
+        ws_support::reset_ws_state().await;
+        let peer = spawn_test_ws_peer(TestPeer::HoldOpen).await;
+
+        let (outcome, connection_id) =
+            cancel_at_checkpoint("open-installed", peer.url.clone()).await;
+
+        assert_eq!(outcome, Err(WS_CANCELLED.to_string()));
+        assert!(
+            !ws_support::published_events()
+                .iter()
+                .any(|(id, kind)| id == &connection_id && kind == "connected"),
+            "the pre-publish re-check did not suppress a connected event it knew was false"
+        );
+        assert_eq!(ws_pool().lock().await.len(), 0);
+        peer.shutdown();
+    }
+
+    /// W5 — `connected` is already out and is a true statement; the connection
+    /// really was established. Cancelling here must still release everything.
+    #[tokio::test]
+    async fn test_cancel_after_connected_published_still_releases_everything() {
+        ws_support::reset_ws_state().await;
+        let peer = spawn_test_ws_peer(TestPeer::HoldOpen).await;
+
+        let (outcome, connection_id) =
+            cancel_at_checkpoint("connected-published", peer.url.clone()).await;
+
+        // Not an error: the handshake did complete. The event is true, and the
+        // frontend's terminal-state guard is what stops the UI adopting it.
+        assert_eq!(outcome, Ok(()));
+        assert!(
+            ws_support::published_events()
+                .iter()
+                .any(|(id, kind)| id == &connection_id && kind == "connected"),
+            "connected was suppressed even though the connection really opened"
+        );
+        // The point of the window: a true event does not excuse a leaked slot
+        // or a surviving reader task.
+        assert_eq!(ws_pool().lock().await.len(), 0);
+        assert!(wait_reader_alive(0, Duration::from_secs(5)).await);
         peer.shutdown();
     }
 

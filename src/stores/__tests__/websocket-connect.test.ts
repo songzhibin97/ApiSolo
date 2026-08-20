@@ -21,6 +21,25 @@ const backend = vi.hoisted(() => {
     /** Runs inside the ws_connect invoke, before it resolves. */
     onConnect: undefined as undefined | ((connectionId: string) => void),
     connectRejection: undefined as unknown,
+    prepareRejection: undefined as unknown,
+    /**
+     * When set, ws_prepare parks until the test resolves it. That turns "the
+     * window while prepare is in flight" from a race into an exact instant the
+     * test controls.
+     */
+    deferPrepare: undefined as undefined | { entered: Promise<void>; release: () => void },
+  }
+
+  function makeDeferred() {
+    let release!: () => void
+    let signalEntered!: () => void
+    const entered = new Promise<void>((resolve) => {
+      signalEntered = resolve
+    })
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    return { entered, release, gate, signalEntered }
   }
 
   function lastArgs(command: string) {
@@ -31,6 +50,7 @@ const backend = vi.hoisted(() => {
   return {
     state,
     lastArgs,
+    makeDeferred,
     isTauri: () => state.tauri,
     invoke: async (command: string, args?: Record<string, unknown>) => {
       state.calls.push(command)
@@ -38,6 +58,15 @@ const backend = vi.hoisted(() => {
 
       if (command === "ws_prepare") {
         state.onPrepare?.()
+        if (state.deferPrepare) {
+          const pending = state.deferPrepare as unknown as {
+            gate: Promise<void>
+            signalEntered: () => void
+          }
+          pending.signalEntered()
+          await pending.gate
+        }
+        if (state.prepareRejection) throw state.prepareRejection
         return state.preparedId
       }
 
@@ -146,6 +175,8 @@ describe("websocket connect lifecycle", () => {
     backend.state.onPrepare = undefined
     backend.state.onConnect = undefined
     backend.state.connectRejection = undefined
+    backend.state.prepareRejection = undefined
+    backend.state.deferPrepare = undefined
   })
 
   it("marks the tab connecting before the first backend call", async () => {
@@ -349,6 +380,95 @@ describe("websocket connect lifecycle", () => {
       .getMessages(connectionId)
       .filter((item) => item.content === T("ws.disconnected"))
     expect(lines).toHaveLength(1)
+  })
+
+  // --- the connecting-state machine: cancel must be reachable in every phase ---
+
+  it("does not start a second connection when cancel is clicked before the id exists", async () => {
+    const { tabsStore, wsStore, tab } = setup()
+    const deferred = backend.makeDeferred()
+    backend.state.deferPrepare = deferred as never
+
+    const connecting = wsStore.connect(tab.id, tab.url, [])
+    // Parked exactly inside ws_prepare: the tab already says "connecting" and
+    // the button already reads "cancel", but no id exists yet.
+    await deferred.entered
+    expect(tabsStore.tabs.find((item) => item.id === tab.id)?.wsStatus).toBe("connecting")
+    expect(tabsStore.tabs.find((item) => item.id === tab.id)?.wsConnectionId).toBeUndefined()
+
+    // What the panel does on a click in that window.
+    const second = wsStore.connect(tab.id, tab.url, [])
+
+    deferred.release()
+    await Promise.all([connecting, second])
+
+    // One prepare, therefore one connection. Two would leave the first
+    // unreachable forever.
+    expect(backend.state.calls.filter((call) => call === "ws_prepare")).toHaveLength(1)
+  })
+
+  it("releases the prepared connection when cancel arrives before the id exists", async () => {
+    const { tabsStore, wsStore, tab } = setup()
+    const deferred = backend.makeDeferred()
+    backend.state.deferPrepare = deferred as never
+
+    const connecting = wsStore.connect(tab.id, tab.url, [])
+    await deferred.entered
+
+    await wsStore.cancelOrDisconnect(tab.id, undefined)
+
+    deferred.release()
+    const result = await connecting
+
+    expect(result).toBeUndefined()
+    // The id the backend handed us after the cancel must still be given back.
+    expect(backend.state.calls).toContain("ws_disconnect")
+    expect(backend.state.calls).not.toContain("ws_connect")
+    expect(tabsStore.tabs.find((item) => item.id === tab.id)?.wsStatus).toBe("disconnected")
+  })
+
+  it("converges the tab to disconnected when ws_prepare fails", async () => {
+    const { tabsStore, wsStore, tab } = setup()
+    backend.state.prepareRejection = new Error("dev bridge unreachable")
+
+    await expect(wsStore.connect(tab.id, tab.url, [])).rejects.toThrow("dev bridge unreachable")
+
+    // Staying on "connecting" would leave a cancel button for a connection that
+    // never existed, and the next click would start a fresh connect.
+    expect(tabsStore.tabs.find((item) => item.id === tab.id)?.wsStatus).toBe("disconnected")
+  })
+
+  it("clears the previous connection state when the same tab reconnects", async () => {
+    const { wsStore, tab } = setup()
+
+    const first = (await wsStore.connect(tab.id, tab.url, []))!
+    emit(first, { eventType: "connected" })
+    emit(first, { eventType: "message", content: "old" })
+    await wsStore.disconnect(first)
+
+    backend.state.preparedId = "ws-2"
+    const second = (await wsStore.connect(tab.id, tab.url, []))!
+
+    expect(second).not.toBe(first)
+    // Reachable only through the old id, which the tab no longer holds.
+    expect(wsStore.connections[first]).toBeUndefined()
+    expect(wsStore.getMessages(first)).toHaveLength(0)
+  })
+
+  it("does not accumulate hidden state across repeated reconnects", async () => {
+    const { wsStore, tab } = setup()
+
+    for (let round = 0; round < 4; round += 1) {
+      backend.state.preparedId = `ws-round-${round}`
+      const id = (await wsStore.connect(tab.id, tab.url, []))!
+      emit(id, { eventType: "connected" })
+      emit(id, { eventType: "message", content: `round-${round}` })
+      await wsStore.disconnect(id)
+    }
+
+    // Only the connection the tab still points at may remain.
+    expect(Object.keys(wsStore.connections)).toEqual(["ws-round-3"])
+    expect(Object.keys(wsStore.messages)).toEqual(["ws-round-3"])
   })
 
   it.each([

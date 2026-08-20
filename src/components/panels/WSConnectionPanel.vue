@@ -57,13 +57,14 @@ async function handleConnectionToggle() {
   // handshake, so the button must expose that. Leaving it disabled would hide a
   // capability the implementation has, which is the mirror image of showing one
   // it does not.
-  const connectionId = activeTab.value.wsConnectionId
-  if (
-    (activeTab.value.wsStatus === "connected" || activeTab.value.wsStatus === "connecting") &&
-    connectionId
-  ) {
+  //
+  // Deliberately NOT conditioned on wsConnectionId. The button reads
+  // "cancel" from the moment the status becomes "connecting", which is before
+  // the id exists; requiring the id here would send a click in that window down
+  // the connect branch and start a second connection.
+  if (activeTab.value.wsStatus === "connected" || activeTab.value.wsStatus === "connecting") {
     try {
-      await websocketStore.disconnect(connectionId)
+      await websocketStore.cancelOrDisconnect(activeTab.value.id, activeTab.value.wsConnectionId)
     } catch (error) {
       errorMessage.value = error instanceof Error ? error.message : String(error)
     }

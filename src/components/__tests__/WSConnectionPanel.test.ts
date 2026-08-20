@@ -12,8 +12,9 @@ vi.mock("vue-i18n", async (importOriginal) => ({
   useI18n: () => ({ t }),
 }))
 
-const { disconnectMock, sendMock, connectMock } = vi.hoisted(() => ({
+const { disconnectMock, cancelOrDisconnectMock, sendMock, connectMock } = vi.hoisted(() => ({
   disconnectMock: vi.fn(async (_connectionId: string) => {}),
+  cancelOrDisconnectMock: vi.fn(async (_tabId: string, _connectionId?: string) => {}),
   sendMock: vi.fn(async () => {}),
   connectMock: vi.fn(async () => "ws-1"),
 }))
@@ -21,6 +22,7 @@ const { disconnectMock, sendMock, connectMock } = vi.hoisted(() => ({
 vi.mock("../../stores/websocket", () => ({
   useWebSocketStore: () => ({
     disconnect: disconnectMock,
+    cancelOrDisconnect: cancelOrDisconnectMock,
     send: sendMock,
     connect: connectMock,
     getMessages: () => [],
@@ -58,12 +60,13 @@ describe("WSConnectionPanel", () => {
     setActivePinia(pinia)
     t.mockClear()
     disconnectMock.mockClear()
+    cancelOrDisconnectMock.mockClear()
     sendMock.mockClear()
     connectMock.mockClear()
   })
 
-  it("routes the connecting-state toggle to the store disconnect", async () => {
-    wsTab({ wsStatus: "connecting", wsConnectionId: "ws-inflight" })
+  it("routes the connecting-state toggle to the store cancel path", async () => {
+    const tab = wsTab({ wsStatus: "connecting", wsConnectionId: "ws-inflight" })
     const wrapper = mountPanel()
 
     await wrapper.find("button").trigger("click")
@@ -71,7 +74,19 @@ describe("WSConnectionPanel", () => {
     // A20 category (d): a store call. This proves the cancel path is wired up.
     // It does NOT prove the button is enabled — only the packaged-app check
     // covers the `disabled` attribute.
-    expect(disconnectMock).toHaveBeenCalledWith("ws-inflight")
+    expect(cancelOrDisconnectMock).toHaveBeenCalledWith(tab.id, "ws-inflight")
+    expect(connectMock).not.toHaveBeenCalled()
+  })
+
+  it("still routes the toggle to cancel while connecting without an id yet", async () => {
+    const tab = wsTab({ wsStatus: "connecting", wsConnectionId: undefined })
+    const wrapper = mountPanel()
+
+    await wrapper.find("button").trigger("click")
+
+    // The window the critical finding was about: the button reads "cancel"
+    // before any id exists, and a click here must not start a connection.
+    expect(cancelOrDisconnectMock).toHaveBeenCalledWith(tab.id, undefined)
     expect(connectMock).not.toHaveBeenCalled()
   })
 

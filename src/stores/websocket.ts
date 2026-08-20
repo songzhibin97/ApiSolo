@@ -27,6 +27,27 @@ interface WsConnectionState {
   label: string
 }
 
+/**
+ * One connect attempt for one tab, created synchronously before the first
+ * await.
+ *
+ * The tab alone cannot represent "connecting": `wsStatus` flips to
+ * `"connecting"` at the top of `connect`, but `wsConnectionId` only exists
+ * after `ws_prepare` returns. Anything that decides whether cancelling is
+ * possible by looking at the id therefore has a window where the button says
+ * "cancel" and the cancel path is unreachable — and a click in that window used
+ * to fall through and start a *second* connection, orphaning the first.
+ *
+ * This record closes that window: it exists for the whole attempt, so a cancel
+ * always has somewhere to land, and a second connect always has something to
+ * refuse.
+ */
+interface PendingConnect {
+  cancelled: boolean
+  /** Set as soon as ws_prepare returns; undefined before that. */
+  connectionId?: string
+}
+
 function describeError(error: unknown) {
   return error instanceof Error ? error.message : String(error)
 }
@@ -34,6 +55,8 @@ function describeError(error: unknown) {
 export const useWebSocketStore = defineStore("websocket", () => {
   const messages = ref<Record<string, WsMessage[]>>({})
   const connections = ref<Record<string, WsConnectionState>>({})
+  /** Keyed by tab id — see PendingConnect. */
+  const pendingConnects = ref<Record<string, PendingConnect>>({})
 
   const getMessages = computed(() => (connectionId: string) => messages.value[connectionId] ?? [])
   const getDroppedCount = computed(() => (connectionId: string) =>
@@ -197,52 +220,90 @@ export const useWebSocketStore = defineStore("websocket", () => {
     const tabsStore = useTabsStore()
     const environmentsStore = useEnvironmentsStore()
 
+    // Established before the first await, so a second click cannot start a
+    // second connection for this tab no matter which await the first one is
+    // parked on.
+    if (pendingConnects.value[tabId]) {
+      return undefined
+    }
+    const attempt: PendingConnect = { cancelled: false }
+    pendingConnects.value[tabId] = attempt
+
     tabsStore.updateTab(tabId, { wsStatus: "connecting" })
     // The template, never the resolved value: secret variables must not reach
     // the console.
     recordConsoleEntry("info", `[network] WebSocket connecting: ${url}`, "network")
 
-    const variables = environmentsStore.variables
-    const resolvedUrl = resolveTemplate(url, variables)
-    const resolvedHeaders = headers
-      .filter((item) => item.enabled && item.key.trim())
-      .map((item) => ({
-        ...item,
-        key: resolveTemplate(item.key, variables),
-        value: resolveTemplate(item.value, variables),
-      }))
-
-    const connectionId = await invoke<string>("ws_prepare")
-
-    // The tab can be closed while ws_prepare is in flight. The id was never
-    // written back, so tab cleanup could not find this connection — release it
-    // here instead of leaving a slot behind.
-    if (!tabsStore.tabs.some((tab) => tab.id === tabId)) {
-      await invoke("ws_disconnect", { connectionId })
-      return undefined
-    }
-
-    connections.value[connectionId] = {
-      pollCancelled: false,
-      closed: false,
-      cancelled: false,
-      dropped: 0,
-      label: url,
-    }
-    // Written back *before* the handshake, so closing the tab mid-handshake
-    // reaches this connection.
-    tabsStore.updateTab(tabId, { wsConnectionId: connectionId })
-
     try {
+      // Reconnecting on this tab: the previous connection's store state and its
+      // buffered messages are reachable only through the old id, and the line
+      // below is about to overwrite it. Releasing it here is what stops N
+      // reconnects from leaving N-1 hidden message buffers behind.
+      const previousId = tabsStore.tabs.find((tab) => tab.id === tabId)?.wsConnectionId
+      if (previousId) {
+        await teardown(previousId)
+      }
+
+      const variables = environmentsStore.variables
+      const resolvedUrl = resolveTemplate(url, variables)
+      const resolvedHeaders = headers
+        .filter((item) => item.enabled && item.key.trim())
+        .map((item) => ({
+          ...item,
+          key: resolveTemplate(item.key, variables),
+          value: resolveTemplate(item.value, variables),
+        }))
+
+      const connectionId = await invoke<string>("ws_prepare")
+      attempt.connectionId = connectionId
+
+      // Cancelled while prepare was in flight, or the tab went away. Either way
+      // the id was never written back, so nothing else can reach this
+      // connection — release it here rather than leave a slot behind.
+      if (attempt.cancelled || !tabsStore.tabs.some((tab) => tab.id === tabId)) {
+        await invoke("ws_disconnect", { connectionId })
+        tabsStore.updateTab(tabId, { wsStatus: "disconnected", wsConnectionId: undefined })
+        return undefined
+      }
+
+      connections.value[connectionId] = {
+        pollCancelled: false,
+        closed: false,
+        cancelled: false,
+        dropped: 0,
+        label: url,
+      }
+      // Written back *before* the handshake, so closing the tab mid-handshake
+      // reaches this connection.
+      tabsStore.updateTab(tabId, { wsConnectionId: connectionId })
+
       // Listener first, handshake second. This ordering is enforced by the
       // await chain, not by winning a race.
       await startListening(connectionId)
       await invoke("ws_connect", { connectionId, url: resolvedUrl, headers: resolvedHeaders })
+
+      if (!isTauri()) {
+        void pollBrowserEvents(connectionId)
+      }
+
+      // Note there is no `wsStatus: "connected"` anywhere in this function. The
+      // status is written only by the connected event branch, which is
+      // therefore the single gate deciding whether the UI can claim a
+      // connection exists.
+      return connectionId
     } catch (error) {
+      // Every failure converges the tab, including one thrown by ws_prepare
+      // itself. Leaving the tab on "connecting" would strand it showing a
+      // cancel button for a connection that does not exist.
+      const id = attempt.connectionId
       // State already gone ⇒ teardown ran ⇒ the user closed the tab, which is
-      // also a cancel.
-      const wasCancelled = connections.value[connectionId]?.cancelled ?? true
-      await teardown(connectionId)
+      // also a cancel. A failure before any id exists is a real error.
+      const wasCancelled =
+        attempt.cancelled || (id !== undefined && (connections.value[id]?.cancelled ?? true))
+
+      if (id !== undefined) {
+        await teardown(id)
+      }
       tabsStore.updateTab(tabId, { wsStatus: "disconnected", wsConnectionId: undefined })
 
       if (wasCancelled) {
@@ -256,16 +317,39 @@ export const useWebSocketStore = defineStore("websocket", () => {
         "network",
       )
       throw error
+    } finally {
+      delete pendingConnects.value[tabId]
+    }
+  }
+
+  /**
+   * The single entry point for the connect/cancel toggle.
+   *
+   * Reachable in every phase: before an id exists it marks the in-flight
+   * attempt cancelled (which `connect` observes when prepare returns), and
+   * afterwards it disconnects normally. Calling it twice is harmless.
+   */
+  async function cancelOrDisconnect(tabId: string, connectionId?: string) {
+    const attempt = pendingConnects.value[tabId]
+
+    if (attempt) {
+      attempt.cancelled = true
+      const id = attempt.connectionId ?? connectionId
+
+      if (id === undefined) {
+        // No id yet: converge the tab now, and let connect release the
+        // connection it is about to be handed.
+        useTabsStore().updateTab(tabId, { wsStatus: "disconnected", wsConnectionId: undefined })
+        return
+      }
+
+      await disconnect(id)
+      return
     }
 
-    if (!isTauri()) {
-      void pollBrowserEvents(connectionId)
+    if (connectionId !== undefined) {
+      await disconnect(connectionId)
     }
-
-    // Note there is no `wsStatus: "connected"` anywhere in this function. The
-    // status is written only by the connected event branch, which is therefore
-    // the single gate deciding whether the UI can claim a connection exists.
-    return connectionId
   }
 
   async function send(connectionId: string, content: string) {
@@ -358,7 +442,9 @@ export const useWebSocketStore = defineStore("websocket", () => {
   return {
     messages,
     connections,
+    pendingConnects,
     connect,
+    cancelOrDisconnect,
     send,
     disconnect,
     teardown,
