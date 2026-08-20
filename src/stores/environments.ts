@@ -47,16 +47,25 @@ export const useEnvironmentsStore = defineStore("environments", () => {
   )
 
   async function loadEnvironments() {
-    if (!projectsStore.activeProject) {
+    // The project this round belongs to, captured before the await. Switching
+    // projects does not cancel a request already in flight, so without this the
+    // slower answer wins on arrival: the previous project's list replaces the
+    // current one, and a name the two happen to share then loads the wrong
+    // project's variables over the real ones.
+    const project = projectsStore.activeProject
+    if (!project) {
       environments.value = []
       activeEnv.value = null
       variables.value = []
       return
     }
 
-    environments.value = await invoke<string[]>("list_environments", {
-      project: projectsStore.activeProject,
-    })
+    const names = await invoke<string[]>("list_environments", { project })
+    if (projectsStore.activeProject !== project) {
+      return
+    }
+
+    environments.value = names
 
     if (activeEnv.value && environments.value.includes(activeEnv.value)) {
       await loadEnvironment(activeEnv.value)
@@ -70,7 +79,8 @@ export const useEnvironmentsStore = defineStore("environments", () => {
   }
 
   async function loadEnvironment(name = activeEnv.value) {
-    if (!projectsStore.activeProject || !name) {
+    const project = projectsStore.activeProject
+    if (!project || !name) {
       variables.value = []
       return null
     }
@@ -81,10 +91,11 @@ export const useEnvironmentsStore = defineStore("environments", () => {
       return null
     }
 
-    const env = await invoke<Environment>("load_environment", {
-      project: projectsStore.activeProject,
-      name,
-    })
+    const env = await invoke<Environment>("load_environment", { project, name })
+    if (projectsStore.activeProject !== project) {
+      return null
+    }
+
     activeEnv.value = env.name
     variables.value = env.variables
     return env

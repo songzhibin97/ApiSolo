@@ -29,6 +29,19 @@ async function settle() {
   }
 }
 
+/**
+ * A promise the test resolves by hand. Every other mock here settles on the
+ * next tick, which is the one ordering that cannot show what happens when an
+ * answer arrives after the user has already moved on.
+ */
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((settleWith) => {
+    resolve = settleWith
+  })
+  return { promise, resolve }
+}
+
 function lastCallFor(command: string) {
   const calls = invokeMock.mock.calls.filter(([name]) => name === command)
   return calls[calls.length - 1]?.[1] as Record<string, unknown> | undefined
@@ -210,6 +223,97 @@ describe("useEnvironmentsStore", () => {
         ([command, args]) => command === "load_environment" && args?.name === "local",
       ),
     ).toBe(true)
+    expect(store.variables).toEqual(betaVariables)
+  })
+
+  it("ignores an environment list that arrives after the project changed", async () => {
+    const alphaList = deferred<string[]>()
+
+    invokeMock.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "list_environments") {
+        return args?.project === "alpha" ? alphaList.promise : ["beta-env"]
+      }
+
+      if (command === "get_collection_tree") {
+        return []
+      }
+
+      if (command === "load_environment") {
+        return { name: args?.name, variables: [] }
+      }
+
+      throw new Error(`Unexpected invoke: ${command}`)
+    })
+
+    const projectsStore = useProjectsStore()
+    projectsStore.activeProject = "alpha"
+
+    const store = useEnvironmentsStore()
+    await settle()
+
+    projectsStore.activeProject = "beta"
+    await settle()
+
+    // Without a request genuinely left in flight there is no ordering here to
+    // get wrong, and the assertion below would hold for the wrong reason.
+    expect(
+      invokeMock.mock.calls.some(
+        ([command, args]) => command === "list_environments" && args?.project === "alpha",
+      ),
+    ).toBe(true)
+
+    alphaList.resolve(["alpha-env"])
+    await settle()
+
+    expect(store.environments).toEqual(["beta-env"])
+  })
+
+  it("ignores environment variables that arrive after the project changed", async () => {
+    const betaVariables = [{ key: "API_URL", value: "https://beta.example.com", secret: false }]
+    const alphaEnvironment = deferred<{ name: string; variables: typeof betaVariables }>()
+
+    invokeMock.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "list_environments") {
+        return ["shared"]
+      }
+
+      if (command === "get_collection_tree") {
+        return []
+      }
+
+      if (command === "load_environment") {
+        return args?.project === "alpha"
+          ? alphaEnvironment.promise
+          : { name: "shared", variables: betaVariables }
+      }
+
+      throw new Error(`Unexpected invoke: ${command}`)
+    })
+
+    const projectsStore = useProjectsStore()
+    projectsStore.activeProject = "alpha"
+
+    const store = useEnvironmentsStore()
+    await settle()
+
+    projectsStore.activeProject = "beta"
+    await settle()
+
+    expect(
+      invokeMock.mock.calls.some(
+        ([command, args]) => command === "load_environment" && args?.project === "alpha",
+      ),
+    ).toBe(true)
+    expect(store.variables).toEqual(betaVariables)
+
+    // Both projects have an environment called "shared". The slow one now
+    // answers for a project nobody is looking at any more.
+    alphaEnvironment.resolve({
+      name: "shared",
+      variables: [{ key: "API_URL", value: "https://alpha.example.com", secret: false }],
+    })
+    await settle()
+
     expect(store.variables).toEqual(betaVariables)
   })
 

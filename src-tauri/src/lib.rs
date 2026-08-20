@@ -1789,6 +1789,33 @@ impl Default for MaintenanceSnapshot {
     }
 }
 
+/// Guards a vault key's whole lifetime, which is the unit neither of the two
+/// locks below can express.
+///
+/// Writing a secret and publishing the metadata that names it are two separate
+/// writes, and so are scanning for references and deleting what nothing names.
+/// Each individual write is already safe; the damage comes from interleaving
+/// the two *pairs*. A key still queued from an interrupted round and typed in
+/// again by the user gets its new value deleted in the gap before the metadata
+/// naming it reaches disk, and the environment then points at an empty slot
+/// permanently - the exact data loss this slice exists to stop, re-entering
+/// through the cleanup that was supposed to prevent it.
+///
+/// Lock order: this one is outermost. Whoever holds it may go on to take the
+/// maintenance lock or the vault lock; nothing takes this one while holding
+/// either. Cleanup being maintenance rather than something the user asked for,
+/// the cost of waiting here is a deferred deletion, never a blocked save.
+fn vault_key_lifecycle_tx() -> &'static StdMutex<()> {
+    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| StdMutex::new(()))
+}
+
+fn lock_vault_key_lifecycle_tx() -> MutexGuard<'static, ()> {
+    vault_key_lifecycle_tx()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Guards the maintenance file's read-merge-write cycle. Atomic replacement
 /// alone is not enough: two loads that each discover a different collision
 /// would read the same old snapshot and each write back only their own, and
@@ -2170,12 +2197,28 @@ fn legacy_vault_key_candidates(
     vec![derived]
 }
 
+/// Takes the lifecycle lock and runs a cleanup round under it. The scan and
+/// the deletion it authorises have to be one unit against a save in flight,
+/// or the scan's answer is already stale by the time it is acted on.
+///
+/// The empty-queue shortcut lives inside, not here: the guard is taken
+/// unconditionally so that this stays a statement about the lock rather than a
+/// statement about the argument.
+fn retry_pending_prune(pending: &[String]) {
+    let _guard = lock_vault_key_lifecycle_tx();
+    retry_pending_prune_locked(pending);
+}
+
 /// Runs the deferred cleanup queue and records failures without blocking the
 /// user. Cleanup is maintenance, not part of what the user asked for: refusing
 /// to open an environment because a stale prune never finished points exactly
 /// the wrong way. Failures are still never swallowed — they leave a dated,
 /// classified marker on disk.
-fn retry_pending_prune(pending: &[String]) {
+///
+/// Callers must already hold the lifecycle lock. The two that reach it directly
+/// do so because they are themselves mid-lifecycle and would otherwise deadlock
+/// against a guard they already own.
+fn retry_pending_prune_locked(pending: &[String]) {
     if pending.is_empty() {
         return;
     }
@@ -2237,9 +2280,15 @@ fn resolve_secret_variables(
     variables: Vec<EnvVariable>,
     secrets_path: &Path,
 ) -> Result<Vec<EnvVariable>, String> {
+    // Held across the whole migration, which is the same shape as saving: the
+    // values are copied forward first and the metadata naming them is written
+    // at the end, so a cleanup round let in between would delete what was just
+    // copied.
+    let _guard = lock_vault_key_lifecycle_tx();
+
     // Step 0: pick up cleanup a previous run could not finish. Failures here
     // never block the load.
-    retry_pending_prune(&read_pending_prune()?);
+    retry_pending_prune_locked(&read_pending_prune()?);
 
     let mut candidates: Vec<String> = Vec::new();
     for variable in &variables {
@@ -2300,7 +2349,7 @@ fn resolve_secret_variables(
         // genuinely unreferenced. The queue was written before the flip, so an
         // interrupted cleanup is retried on the next load rather than lost.
         write_secret_metadata(secrets_path, &resolved)?;
-        retry_pending_prune(&candidates);
+        retry_pending_prune_locked(&candidates);
     }
 
     Ok(resolved)
@@ -3039,6 +3088,12 @@ fn load_environment(project: String, name: String) -> Result<Environment, String
 /// rollback of the frontend cannot break this.
 #[tauri::command]
 fn save_environment(project: String, env: Environment, create: Option<bool>) -> Result<(), String> {
+    // Outermost statement, and deliberately ahead of the validation below: from
+    // here to the metadata write at the end, this call owns the lifetime of
+    // every vault key it touches. Quarantining the old metadata is inside that
+    // span too - while the file is renamed aside, the keys it named look
+    // unreferenced to a scan, which is a second way into the same deletion.
+    let _guard = lock_vault_key_lifecycle_tx();
     let resolved = resolve_project(&project)?;
     let env_dir = project_environments_dir(&resolved.dir);
     fs::create_dir_all(&env_dir)
@@ -3131,12 +3186,17 @@ fn save_environment(project: String, env: Environment, create: Option<bool>) -> 
         enqueue_pending_prune(&removed)?;
     }
 
+    // Between the backend writes above and the metadata below, a value exists
+    // that nothing on disk names yet. That is the window the cleanup thread
+    // must not be allowed into.
+    checkpoint("secret_values_written");
+
     write_atomic(&normal_path, pretty_json(&normal_variables)?.as_bytes())
         .map_err(|error| format!("Failed to save environment: {error}"))?;
     // The pointer flips here; only now are the removed keys truly unreferenced.
     write_secret_metadata(&secrets_path, &secret_variables)?;
 
-    retry_pending_prune(&removed);
+    retry_pending_prune_locked(&removed);
     touch_project(&resolved.dir)
 }
 
@@ -11373,6 +11433,87 @@ mod tests {
         }
     }
 
+    /// Saving a secret writes its value into the backend first and publishes
+    /// the metadata that names it afterwards. In between, the value exists and
+    /// nothing on disk references it - and the cleanup thread's own composite,
+    /// "scan for references, then delete what nothing names", straddles exactly
+    /// that gap. A key left in the queue by an earlier round and then typed in
+    /// again by the user is deleted between the two writes, after which the
+    /// environment points at an empty vault slot for good.
+    ///
+    /// Driven through `delete_environment`, which drains the queue ahead of its
+    /// "does not exist" early return: the deletion this reproduces happens
+    /// inside a production entry point, not in a helper called by hand.
+    ///
+    /// The wait below is not what makes the outcome deterministic. Without the
+    /// exclusion the cleanup runs to completion on local files in milliseconds;
+    /// with it the cleanup cannot proceed until the parked save is released, so
+    /// the scan that follows sees the published metadata. The assertion reads
+    /// the same either way - the value that was saved is still there, or it is
+    /// not.
+    #[test]
+    fn test_a_queued_key_is_not_pruned_while_it_is_being_saved() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Race".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/race");
+        let key = vault_key_for(&project_dir, "dev", "token");
+
+        // The state an interrupted cleanup round leaves behind: the key is
+        // queued for deletion and nothing on disk names it.
+        d03_seed_maintenance(&[], &[&key]);
+        assert_eq!(
+            d03_pending_prune(),
+            vec![key.clone()],
+            "fixture: the queue was not seeded, so nothing here could prune"
+        );
+
+        let saved_key = key.clone();
+        let run = with_thread_parked_at(
+            "secret_values_written",
+            move || {
+                save_environment(
+                    "Race".to_string(),
+                    d03_env("dev", vec![sample_env_variable("token", "RESTORED", true)]),
+                    Some(true),
+                )
+            },
+            || {
+                let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+                let cleanup = std::thread::spawn(move || {
+                    let outcome = delete_environment("Race".to_string(), "gone".to_string());
+                    let _ = finished_tx.send(());
+                    outcome
+                });
+                let finished = finished_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .is_ok();
+                (cleanup, finished)
+            },
+        );
+
+        let (cleanup, cleanup_finished_while_parked) = run
+            .probe
+            .expect("the save never reached the checkpoint, so no interleaving was tested");
+        let cleanup_outcome = match cleanup.join() {
+            Ok(outcome) => format!("{outcome:?}"),
+            Err(_) => "panicked".to_string(),
+        };
+
+        assert_eq!(
+            load_secret_value(&saved_key).unwrap(),
+            "RESTORED",
+            "the cleanup deleted the value this save had just written \
+             (cleanup finished while the save was parked: {cleanup_finished_while_parked}, \
+             cleanup returned {cleanup_outcome}, save returned {returned:?}, child_ok={child_ok})",
+            returned = run.returned,
+            child_ok = run.child_ok
+        );
+    }
+
     // ------------------------------------------------ D03 §六 (every writer)
     // Each of the nine production writers, driven through its own command with
     // its target directory read-only. Testing write_atomic alone proves nothing
@@ -12084,6 +12225,33 @@ mod tests {
                 read: "read_maintenance_snapshot",
                 allowed_macros: &[],
             },
+            // The three lifecycle rows. Appended rather than slotted in beside
+            // their relatives, because the self-test above addresses two rows by
+            // index and renumbering them would move the probe silently.
+            //
+            // What each one buys is the same guarantee the dynamic test proves
+            // for one interleaving, made structural: the guard is bound before
+            // the composite it protects can start. A refactor that moves it a
+            // few statements down reopens the window without failing anything
+            // else.
+            Target {
+                function: "retry_pending_prune",
+                accessor: "lock_vault_key_lifecycle_tx",
+                read: "retry_pending_prune_locked",
+                allowed_macros: &[],
+            },
+            Target {
+                function: "resolve_secret_variables",
+                accessor: "lock_vault_key_lifecycle_tx",
+                read: "read_pending_prune",
+                allowed_macros: &[],
+            },
+            Target {
+                function: "save_environment",
+                accessor: "lock_vault_key_lifecycle_tx",
+                read: "read_previous_secret_metadata",
+                allowed_macros: &["format"],
+            },
         ];
 
         /// Anything unreadable fails rather than passes. A non-inline module or
@@ -12350,11 +12518,28 @@ mod tests {
                 // Being on the list means the check does not expand it, not that
                 // it goes unread: a read hidden in the token stream would
                 // otherwise walk straight through.
+                //
+                // The guard is swept for here as well, and the reason is the
+                // same one that put the read on this list. Macro tokens are
+                // never parsed, so `visit_path` never sees them: a
+                // `format!("{}", { drop(_guard); "" })` ends the lock in the
+                // middle of the function while every rule above stays satisfied
+                // and this check says nothing at all. Sweeping for the read
+                // alone left that open, which is the shape an earlier version
+                // of this same check was already caught in - an allow list has
+                // to cover everything the rules outside it cover, or it is a
+                // hole with a name.
                 let rendered = mac.tokens.to_string();
                 for word in rendered.split(|character: char| !character.is_alphanumeric() && character != '_') {
                     if word == self.accessor || word == self.read {
                         self.problems.push(format!(
                             "{word} appears inside the allowed macro {called}!"
+                        ));
+                    }
+                    if word == self.guard {
+                        self.problems.push(format!(
+                            "the guard {word} is named inside the allowed macro {called}!, so it \
+                             may be released before the function ends"
                         ));
                     }
                 }
@@ -12495,6 +12680,16 @@ mod tests {
             "appears inside the allowed macro",
         ),
         (
+            "the guard released inside an allowed macro",
+            r#"fn unlock_local_secret_vault_locked() -> u8 {
+                let _guard = lock_local_vault_tx();
+                let vault = read_local_secret_vault_file();
+                let _ = format!("{}", { drop(_guard); "" });
+                vault
+            }"#,
+            "named inside the allowed macro",
+        ),
+        (
             "a macro nobody declared",
             r#"fn read_pending_prune() -> u8 {
                 let _guard = lock_vault_maintenance_tx();
@@ -12587,7 +12782,7 @@ mod tests {
 
         // The row count is asserted because the list is the check's own weak
         // point: removing a row removes a guarantee and nothing else changes.
-        assert_eq!(lock_structure::TARGETS.len(), 8);
+        assert_eq!(lock_structure::TARGETS.len(), 11);
 
         let mut problems = Vec::new();
         for target in lock_structure::TARGETS {
