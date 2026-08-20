@@ -22,6 +22,10 @@ const backend = vi.hoisted(() => {
     onConnect: undefined as undefined | ((connectionId: string) => void),
     connectRejection: undefined as unknown,
     prepareRejection: undefined as unknown,
+    /** Makes ws_disconnect fail, so cleanup failure paths become testable. */
+    disconnectRejection: undefined as unknown,
+    /** Parks the unlisten() call until the test releases it. */
+    deferUnlisten: undefined as undefined | { entered: Promise<void>; release: () => void },
     /**
      * When set, ws_prepare parks until the test resolves it. That turns "the
      * window while prepare is in flight" from a race into an exact instant the
@@ -76,6 +80,10 @@ const backend = vi.hoisted(() => {
         return undefined
       }
 
+      if (command === "ws_disconnect" && state.disconnectRejection) {
+        throw state.disconnectRejection
+      }
+
       if (command === "ws_drain_events") return []
       return undefined
     },
@@ -88,7 +96,15 @@ const backend = vi.hoisted(() => {
       state.calls.push("listen")
       state.args.push({}) // keep calls/args index-aligned
       state.handlers.set(event, handler)
-      return () => {
+      return async () => {
+        if (state.deferUnlisten) {
+          const pending = state.deferUnlisten as unknown as {
+            gate: Promise<void>
+            signalEntered: () => void
+          }
+          pending.signalEntered()
+          await pending.gate
+        }
         state.handlers.delete(event)
       }
     },
@@ -177,6 +193,8 @@ describe("websocket connect lifecycle", () => {
     backend.state.connectRejection = undefined
     backend.state.prepareRejection = undefined
     backend.state.deferPrepare = undefined
+    backend.state.disconnectRejection = undefined
+    backend.state.deferUnlisten = undefined
   })
 
   it("marks the tab connecting before the first backend call", async () => {
@@ -510,6 +528,92 @@ describe("websocket connect lifecycle", () => {
     // Only the connection the tab still points at may remain.
     expect(Object.keys(wsStore.connections)).toEqual(["ws-round-3"])
     expect(Object.keys(wsStore.messages)).toEqual(["ws-round-3"])
+  })
+
+  // --- cleanup failures must not be swallowed ---
+
+  async function connectedThenDisconnectFails() {
+    const { tabsStore, wsStore, tab } = setup()
+    const first = (await wsStore.connect(tab.id, tab.url, []))!
+    emit(first, { eventType: "connected" })
+    emit(first, { eventType: "message", content: "old" })
+    // Every later ws_disconnect fails, including the retry inside teardown.
+    backend.state.disconnectRejection = new Error("backend refused to close")
+    return { tabsStore, wsStore, tab, first }
+  }
+
+  it("aborts the reconnect when the previous connection cannot be closed", async () => {
+    const { wsStore, tab } = await connectedThenDisconnectFails()
+    backend.state.preparedId = "ws-2"
+
+    const before = backend.state.calls.filter((call) => call === "ws_connect").length
+
+    await expect(wsStore.connect(tab.id, tab.url, [])).rejects.toThrow("backend refused to close")
+
+    // Overwriting the id would have stranded a connection the backend still
+    // holds, with nothing able to address it — so no new handshake may start.
+    const after = backend.state.calls.filter((call) => call === "ws_connect").length
+    expect(after).toBe(before)
+  })
+
+  it("keeps the tab pointing at a previous connection that would not close", async () => {
+    const { tabsStore, wsStore, tab, first } = await connectedThenDisconnectFails()
+    backend.state.preparedId = "ws-2"
+
+    await wsStore.connect(tab.id, tab.url, []).catch(() => undefined)
+
+    expect(tabsStore.tabs.find((item) => item.id === tab.id)?.wsConnectionId).toBe(first)
+  })
+
+  it("keeps the previous connection state when its teardown fails", async () => {
+    const { wsStore, tab, first } = await connectedThenDisconnectFails()
+    backend.state.preparedId = "ws-2"
+
+    await wsStore.connect(tab.id, tab.url, []).catch(() => undefined)
+
+    // The state record is the only remaining handle to that backend slot.
+    expect(wsStore.connections[first]).toBeDefined()
+  })
+
+  it("reports a failure instead of a clean cancel when handing the id back fails", async () => {
+    const { wsStore, tab } = setup()
+    const deferred = backend.makeDeferred()
+    backend.state.deferPrepare = deferred as never
+
+    const connecting = wsStore.connect(tab.id, tab.url, [])
+    await deferred.entered
+    backend.state.disconnectRejection = new Error("backend refused to close")
+    await wsStore.cancelOrDisconnect(tab.id, undefined).catch(() => undefined)
+    deferred.release()
+
+    // Returning undefined here would claim the connection was released when it
+    // may still be open.
+    await expect(connecting).rejects.toThrow("backend refused to close")
+  })
+
+  it("does not recreate the message map when a parked disconnect resumes after teardown", async () => {
+    const { wsStore, tab } = setup()
+    const connectionId = (await wsStore.connect(tab.id, tab.url, []))!
+    emit(connectionId, { eventType: "connected" })
+    emit(connectionId, { eventType: "message", content: "buffered" })
+
+    // A: a disconnect parks inside unlisten().
+    const unlistenGate = backend.makeDeferred()
+    backend.state.deferUnlisten = unlistenGate as never
+    const parked = wsStore.disconnect(connectionId)
+    await unlistenGate.entered
+
+    // B: the tab closes and tears the same connection down to completion.
+    backend.state.deferUnlisten = undefined
+    await wsStore.teardown(connectionId)
+    expect(wsStore.getMessages(connectionId)).toHaveLength(0)
+
+    // A resumes against state that no longer exists.
+    unlistenGate.release()
+    await parked
+
+    // Writing a system line here would rebuild a map nothing can reach.
+    expect(wsStore.getMessages(connectionId)).toHaveLength(0)
   })
 
   it.each([

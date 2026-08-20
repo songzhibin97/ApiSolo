@@ -2,6 +2,7 @@ import { computed, nextTick, ref } from "vue";
 import { defineStore } from "pinia";
 
 import i18n from "../i18n";
+import { recordConsoleEntry } from "./console"
 import { useWebSocketStore } from "./websocket"
 import {
   bodyKindFromBodyType,
@@ -89,7 +90,21 @@ async function cleanupWebSocketTab(tab: Tab) {
     return
   }
 
-  await useWebSocketStore().teardown(tab.wsConnectionId)
+  try {
+    await useWebSocketStore().teardown(tab.wsConnectionId)
+  } catch (error) {
+    // The tab still closes — refusing to close it would leave the user stuck.
+    // But the failure is reported rather than swallowed: the connection may
+    // still be open on the backend, and the store keeps its state record so the
+    // connection remains addressable.
+    recordConsoleEntry(
+      "error",
+      `[network] WebSocket cleanup failed while closing a tab, connection may still be open: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      "network",
+    )
+  }
 }
 
 function createEditablePairs<T extends KeyValuePair>(items: T[]): T[] {

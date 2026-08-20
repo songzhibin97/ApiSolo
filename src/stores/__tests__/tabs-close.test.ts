@@ -1,13 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { createPinia, setActivePinia } from "pinia"
 
-const { teardownMock } = vi.hoisted(() => ({
+const { teardownMock, consoleMock } = vi.hoisted(() => ({
   teardownMock: vi.fn(async (_connectionId: string) => {}),
+  consoleMock: vi.fn(),
 }))
 
 vi.mock("../websocket", () => ({
   useWebSocketStore: () => ({ teardown: teardownMock }),
 }))
+
+vi.mock("../console", () => ({ recordConsoleEntry: consoleMock }))
 
 import { useTabsStore } from "../tabs"
 
@@ -24,6 +27,7 @@ describe("useTabsStore websocket cleanup", () => {
     setActivePinia(createPinia())
     teardownMock.mockClear()
     teardownMock.mockImplementation(async () => {})
+    consoleMock.mockClear()
   })
 
   it("disconnects a websocket tab closed during the handshake", async () => {
@@ -160,6 +164,35 @@ describe("useTabsStore websocket cleanup", () => {
     await store.removeTab(only.id)
 
     expect(store.tabs).toHaveLength(1)
+  })
+
+  it("still closes the tab when the connection cannot be torn down", async () => {
+    const store = useTabsStore()
+    const wsTab = store.addWsTab()
+    store.updateTab(wsTab.id, { wsStatus: "connected", wsConnectionId: "ws-stuck" })
+    teardownMock.mockImplementation(async () => {
+      throw new Error("backend refused to close")
+    })
+
+    await store.removeTab(wsTab.id)
+
+    // Refusing to close the tab would strand the user; the failure is surfaced
+    // instead of swallowed.
+    expect(store.tabs.some((tab) => tab.id === wsTab.id)).toBe(false)
+  })
+
+  it("reports a cleanup failure while closing a tab", async () => {
+    const store = useTabsStore()
+    const wsTab = store.addWsTab()
+    store.updateTab(wsTab.id, { wsStatus: "connected", wsConnectionId: "ws-stuck" })
+    teardownMock.mockImplementation(async () => {
+      throw new Error("backend refused to close")
+    })
+
+    await store.removeTab(wsTab.id)
+
+    const logged = consoleMock.mock.calls.map((call) => String(call[1])).join("\n")
+    expect(logged).toContain("connection may still be open")
   })
 
   it("leaves non-websocket tabs alone", async () => {

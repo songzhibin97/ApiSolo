@@ -114,13 +114,16 @@ export const useWebSocketStore = defineStore("websocket", () => {
   function markDisconnected(connectionId: string, timestamp?: string) {
     const state = connections.value[connectionId]
 
-    if (state?.closed) {
+    // A connection we no longer track is a true no-op, not "a connection that
+    // has not been closed yet". A disconnect can be parked on an await while a
+    // tab close tears the same connection down; when it resumes, writing a
+    // system line here would rebuild the message map that teardown just
+    // deleted, and nothing would ever be able to reach it again.
+    if (!state || state.closed) {
       return
     }
 
-    if (state) {
-      state.closed = true
-    }
+    state.closed = true
 
     updateTabByConnectionId(connectionId, "disconnected")
     addSystemMessage(connectionId, i18n.global.t("ws.disconnected"), timestamp)
@@ -234,6 +237,8 @@ export const useWebSocketStore = defineStore("websocket", () => {
     // the console.
     recordConsoleEntry("info", `[network] WebSocket connecting: ${url}`, "network")
 
+    let reconnectAborted = false
+
     try {
       // Reconnecting on this tab: the previous connection's store state and its
       // buffered messages are reachable only through the old id, and the line
@@ -241,7 +246,21 @@ export const useWebSocketStore = defineStore("websocket", () => {
       // reconnects from leaving N-1 hidden message buffers behind.
       const previousId = tabsStore.tabs.find((tab) => tab.id === tabId)?.wsConnectionId
       if (previousId) {
-        await teardown(previousId)
+        try {
+          await teardown(previousId)
+        } catch (error) {
+          // Abort instead of overwriting. The tab's id is the user's remaining
+          // route to a connection the backend may still hold, so it stays put
+          // and the status goes back to disconnected, leaving a retry possible.
+          reconnectAborted = true
+          tabsStore.updateTab(tabId, { wsStatus: "disconnected" })
+          recordConsoleEntry(
+            "error",
+            `[network] WebSocket reconnect aborted, previous connection is still open: ${describeError(error)}`,
+            "network",
+          )
+          throw error
+        }
       }
 
       const variables = environmentsStore.variables
@@ -292,6 +311,12 @@ export const useWebSocketStore = defineStore("websocket", () => {
       // connection exists.
       return connectionId
     } catch (error) {
+      if (reconnectAborted) {
+        // Already converged, and the tab must keep pointing at the connection
+        // that would not close.
+        throw error
+      }
+
       // Every failure converges the tab, including one thrown by ws_prepare
       // itself. Leaving the tab on "connecting" would strand it showing a
       // cancel button for a connection that does not exist.
@@ -301,10 +326,28 @@ export const useWebSocketStore = defineStore("websocket", () => {
       const wasCancelled =
         attempt.cancelled || (id !== undefined && (connections.value[id]?.cancelled ?? true))
 
+      let cleanupError: unknown
       if (id !== undefined) {
-        await teardown(id)
+        try {
+          await teardown(id)
+        } catch (failure) {
+          cleanupError = failure
+        }
       }
       tabsStore.updateTab(tabId, { wsStatus: "disconnected", wsConnectionId: undefined })
+
+      if (cleanupError !== undefined) {
+        // Handing the id back failed twice. The backend may still hold this
+        // connection, so reporting a clean cancel here would be a lie — and a
+        // cancel that silently leaves a socket open is exactly what the caller
+        // needs to hear about.
+        recordConsoleEntry(
+          "error",
+          `[network] WebSocket cleanup failed, connection may still be open: ${describeError(cleanupError)}`,
+          "network",
+        )
+        throw cleanupError
+      }
 
       if (wasCancelled) {
         // A cancel is the user's intent, not a failure to report.
@@ -390,13 +433,17 @@ export const useWebSocketStore = defineStore("websocket", () => {
     }
   }
 
-  /** Closing a tab: disconnect, then drop this connection's state entirely. */
+  /**
+   * Closing a tab: disconnect, then drop this connection's state entirely.
+   *
+   * Deliberately not best-effort. If the disconnect fails the backend may still
+   * hold the connection, and the state record deleted below is the only handle
+   * left that can address it — dropping it anyway would strand the socket with
+   * nothing able to reach it. So the failure propagates and the record stays,
+   * and every caller decides for itself whether it can still proceed.
+   */
   async function teardown(connectionId: string) {
-    try {
-      await disconnect(connectionId)
-    } catch {
-      // Tab cleanup stays best-effort even if the socket is already gone.
-    }
+    await disconnect(connectionId)
 
     clearMessages(connectionId)
     delete connections.value[connectionId]
