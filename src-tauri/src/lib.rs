@@ -2197,27 +2197,17 @@ fn legacy_vault_key_candidates(
     vec![derived]
 }
 
-/// Takes the lifecycle lock and runs a cleanup round under it. The scan and
-/// the deletion it authorises have to be one unit against a save in flight,
-/// or the scan's answer is already stale by the time it is acted on.
-///
-/// The empty-queue shortcut lives inside, not here: the guard is taken
-/// unconditionally so that this stays a statement about the lock rather than a
-/// statement about the argument.
-fn retry_pending_prune(pending: &[String]) {
-    let _guard = lock_vault_key_lifecycle_tx();
-    retry_pending_prune_locked(pending);
-}
-
 /// Runs the deferred cleanup queue and records failures without blocking the
 /// user. Cleanup is maintenance, not part of what the user asked for: refusing
 /// to open an environment because a stale prune never finished points exactly
 /// the wrong way. Failures are still never swallowed — they leave a dated,
 /// classified marker on disk.
 ///
-/// Callers must already hold the lifecycle lock. The two that reach it directly
-/// do so because they are themselves mid-lifecycle and would otherwise deadlock
-/// against a guard they already own.
+/// Callers must already hold the lifecycle lock. There is deliberately no
+/// wrapper that takes it here: every entry point that reaches cleanup - load,
+/// save, delete - now holds the lock from before it reads the metadata, so a
+/// self-locking variant would only be reachable by deadlocking against a guard
+/// the caller already owns.
 fn retry_pending_prune_locked(pending: &[String]) {
     if pending.is_empty() {
         return;
@@ -2274,18 +2264,21 @@ fn acknowledge_secret_key_collision(legacy_vault_key: String) -> Result<(), Stri
     write_maintenance_snapshot(&snapshot)
 }
 
-fn resolve_secret_variables(
+/// Callers must already hold the lifecycle lock, and must have taken it
+/// *before* reading the `variables` passed in here.
+///
+/// Taking it inside this function was not enough, and the reason is worth
+/// keeping: the migration rewrites the metadata file from the list it was
+/// handed, so the read that produced that list is part of the critical section
+/// even though it happens in the caller. A save landing in the gap between the
+/// read and the lock is not merely raced - the rewrite erases whatever it
+/// added, and the save has already reported success.
+fn resolve_secret_variables_locked(
     project_dir: &Path,
     env_name: &str,
     variables: Vec<EnvVariable>,
     secrets_path: &Path,
 ) -> Result<Vec<EnvVariable>, String> {
-    // Held across the whole migration, which is the same shape as saving: the
-    // values are copied forward first and the metadata naming them is written
-    // at the end, so a cleanup round let in between would delete what was just
-    // copied.
-    let _guard = lock_vault_key_lifecycle_tx();
-
     // Step 0: pick up cleanup a previous run could not finish. Failures here
     // never block the load.
     retry_pending_prune_locked(&read_pending_prune()?);
@@ -3061,19 +3054,27 @@ fn list_environments(project: String) -> Result<Vec<String>, String> {
 
 #[tauri::command]
 fn load_environment(project: String, name: String) -> Result<Environment, String> {
+    // Ahead of the reads below, not inside the migration they feed. Loading is
+    // a read-modify-write of the metadata file: what it rewrites is decided
+    // from the snapshot read here, so the snapshot is part of the critical
+    // section. A save that lands between the read and the rewrite loses every
+    // variable it added, and reports success while doing it.
+    let _guard = lock_vault_key_lifecycle_tx();
     let resolved = resolve_project(&project)?;
     let normal_path = environment_file_path(&resolved.dir, &name, false)?;
     let secrets_path = environment_file_path(&resolved.dir, &name, true)?;
     let env_name = slugify(&name);
 
+    // Both reads hoisted out of the call below, in their original order. As
+    // arguments they were evaluated before the callee could take any lock, so
+    // the metadata snapshot this load goes on to rewrite was read outside it.
+    let normal_variables = read_env_variables(&normal_path, false)?;
+    let secret_metadata = read_env_variables(&secrets_path, true)?;
+    checkpoint("environment_metadata_read");
+
     let variables = merge_environment_variables(
-        read_env_variables(&normal_path, false)?,
-        resolve_secret_variables(
-            &resolved.dir,
-            &env_name,
-            read_env_variables(&secrets_path, true)?,
-            &secrets_path,
-        )?,
+        normal_variables,
+        resolve_secret_variables_locked(&resolved.dir, &env_name, secret_metadata, &secrets_path)?,
     );
 
     Ok(Environment {
@@ -3202,13 +3203,21 @@ fn save_environment(project: String, env: Environment, create: Option<bool>) -> 
 
 #[tauri::command]
 fn delete_environment(project: String, name: String) -> Result<(), String> {
+    // The third entry into the same window, and the one the review did not
+    // name: this reads the metadata to learn which vault entries the
+    // environment owned, then removes the files. Unlocked, a save landing in
+    // between makes the key list stale - the secret it added is never queued
+    // and stays in the vault with nothing naming it - and a save landing after
+    // the files are gone republishes them, bringing a deleted environment back
+    // into the list.
+    let _guard = lock_vault_key_lifecycle_tx();
     let resolved = resolve_project(&project)?;
 
     // Ahead of the "does not exist" early return on purpose. A previous call
     // may have removed the files and then failed to finish cleanup; this is the
     // one entry point a user will trigger again, so if it bailed out early the
     // queue would never find another taker.
-    retry_pending_prune(&read_pending_prune()?);
+    retry_pending_prune_locked(&read_pending_prune()?);
 
     let normal_path = environment_file_path(&resolved.dir, &name, false)?;
     let secrets_path = environment_file_path(&resolved.dir, &name, true)?;
@@ -3278,7 +3287,7 @@ fn delete_environment(project: String, name: String) -> Result<(), String> {
 
     // Prune only now: an entry another environment still names is kept, which
     // is what stops deleting 测试 from taking 生产's token with it.
-    retry_pending_prune(&candidates);
+    retry_pending_prune_locked(&candidates);
     touch_project(&resolved.dir)
 }
 
@@ -11514,6 +11523,82 @@ mod tests {
         );
     }
 
+    /// The second half of the same window, on the other side of the pair.
+    /// R2 closed the gap between writing a secret and publishing the metadata
+    /// naming it; this one is the gap between *reading* that metadata and
+    /// rewriting it. A load reads the file, migration decides what the file
+    /// should say, and the file is rewritten from that decision - so a save
+    /// that lands in between is not merely raced, it is erased: the load
+    /// rewrites the metadata from a list that predates the new variable, and
+    /// the value saved for it stays in the vault with nothing naming it.
+    ///
+    /// The save reports success, which is what makes this worse than a lost
+    /// update. Nothing at any layer says the variable did not survive.
+    #[test]
+    fn test_a_stale_load_cannot_erase_a_secret_saved_while_it_was_reading() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Race".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        // Old-format metadata, so the load has migration work to do and really
+        // does reach the rewrite. Without that `changed` stays false and the
+        // load never writes, which would make this test pass for a reason that
+        // has nothing to do with the lock.
+        let project_dir = temp_home.path().join("ApiSolo/projects/race");
+        let legacy = legacy_vault_key_for(&project_dir, "My Env", "token");
+        save_secret_value(&legacy, "LEGACY-A").unwrap();
+        d03_write_recorded_metadata(
+            &d03_env_file(temp_home.path(), "race", "my-env", true),
+            &[("token", &legacy)],
+        );
+
+        let run = with_thread_parked_at(
+            "environment_metadata_read",
+            || load_environment("Race".to_string(), "My Env".to_string()).map(|_| ()),
+            || {
+                let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+                let save = std::thread::spawn(move || {
+                    let outcome = save_environment(
+                        "Race".to_string(),
+                        d03_env(
+                            "My Env",
+                            vec![
+                                sample_env_variable("token", "LEGACY-A", true),
+                                sample_env_variable("added", "NEW-B", true),
+                            ],
+                        ),
+                        None,
+                    );
+                    let _ = finished_tx.send(());
+                    outcome
+                });
+                let finished = finished_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+                (save, finished)
+            },
+        );
+
+        let (save, save_finished_while_parked) = run
+            .probe
+            .expect("the load never reached the checkpoint, so no interleaving was tested");
+        let save_outcome = match save.join() {
+            Ok(outcome) => format!("{outcome:?}"),
+            Err(_) => "panicked".to_string(),
+        };
+
+        assert_eq!(
+            d03_env_value("Race", "My Env", "added"),
+            "NEW-B",
+            "a load that had already read the old metadata rewrote it and dropped the \
+             variable this save added (save finished while the load was parked: \
+             {save_finished_while_parked}, save returned {save_outcome}, load returned \
+             {returned:?}, child_ok={child_ok})",
+            returned = run.returned,
+            child_ok = run.child_ok
+        );
+    }
+
     // ------------------------------------------------ D03 §六 (every writer)
     // Each of the nine production writers, driven through its own command with
     // its target directory read-only. Testing write_atomic alone proves nothing
@@ -12168,6 +12253,12 @@ mod tests {
             /// rejected rather than expanded, so every name listed here marks a
             /// place this check stops looking.
             pub allowed_macros: &'static [&'static str],
+            /// Same rule one level up. An attribute macro replaces the item it
+            /// is written on, so trusting attributes by default means checking
+            /// a function the compiler may never build. Listing them per target
+            /// keeps `#[tauri::command]` - which every command here carries -
+            /// from becoming a licence for any attribute at all.
+            pub allowed_attributes: &'static [&'static str],
         }
 
         /// The list is part of what gets reviewed. Deleting a row silently
@@ -12179,12 +12270,14 @@ mod tests {
                 accessor: "lock_local_vault_tx",
                 read: "load_local_secret_map",
                 allowed_macros: &[],
+                allowed_attributes: &[],
             },
             Target {
                 function: "delete_local_secret_value",
                 accessor: "lock_local_vault_tx",
                 read: "load_local_secret_map",
                 allowed_macros: &[],
+                allowed_attributes: &[],
             },
             Target {
                 function: "unlock_local_secret_vault_locked",
@@ -12194,63 +12287,75 @@ mod tests {
                 // than waved through: the token stream is still swept for the
                 // two names below, so a read cannot hide inside it.
                 allowed_macros: &["format"],
+                allowed_attributes: &[],
             },
             Target {
                 function: "record_vault_key_collisions",
                 accessor: "lock_vault_maintenance_tx",
                 read: "read_maintenance_snapshot",
                 allowed_macros: &[],
+                allowed_attributes: &[],
             },
             Target {
                 function: "acknowledge_secret_key_collision",
                 accessor: "lock_vault_maintenance_tx",
                 read: "read_maintenance_snapshot",
                 allowed_macros: &[],
+                allowed_attributes: &["tauri::command"],
             },
             Target {
                 function: "enqueue_pending_prune",
                 accessor: "lock_vault_maintenance_tx",
                 read: "read_maintenance_snapshot",
                 allowed_macros: &[],
+                allowed_attributes: &[],
             },
             Target {
                 function: "read_pending_prune",
                 accessor: "lock_vault_maintenance_tx",
                 read: "read_maintenance_snapshot",
                 allowed_macros: &[],
+                allowed_attributes: &[],
             },
             Target {
                 function: "resolve_pending_prune",
                 accessor: "lock_vault_maintenance_tx",
                 read: "read_maintenance_snapshot",
                 allowed_macros: &[],
+                allowed_attributes: &[],
             },
-            // The three lifecycle rows. Appended rather than slotted in beside
-            // their relatives, because the self-test above addresses two rows by
-            // index and renumbering them would move the probe silently.
+            // The lifecycle rows: the three commands that touch an
+            // environment's secret metadata. Appended rather than slotted in
+            // beside their relatives, because the self-test above addresses two
+            // rows by index and renumbering them would move the probe silently.
             //
-            // What each one buys is the same guarantee the dynamic test proves
-            // for one interleaving, made structural: the guard is bound before
-            // the composite it protects can start. A refactor that moves it a
-            // few statements down reopens the window without failing anything
-            // else.
+            // Each names as its `read` the call that must not happen first. For
+            // all three that is a *read of the metadata*, not the cleanup at the
+            // end - which is the correction R4 forced. The guard used to be
+            // taken inside the migration helper, after the caller had already
+            // read the file the migration goes on to rewrite; a save landing in
+            // that gap was erased. Binding the row to the read makes the
+            // boundary of the critical section the thing that gets checked.
             Target {
-                function: "retry_pending_prune",
+                function: "load_environment",
                 accessor: "lock_vault_key_lifecycle_tx",
-                read: "retry_pending_prune_locked",
+                read: "read_env_variables",
                 allowed_macros: &[],
-            },
-            Target {
-                function: "resolve_secret_variables",
-                accessor: "lock_vault_key_lifecycle_tx",
-                read: "read_pending_prune",
-                allowed_macros: &[],
+                allowed_attributes: &["tauri::command"],
             },
             Target {
                 function: "save_environment",
                 accessor: "lock_vault_key_lifecycle_tx",
                 read: "read_previous_secret_metadata",
                 allowed_macros: &["format"],
+                allowed_attributes: &["tauri::command"],
+            },
+            Target {
+                function: "delete_environment",
+                accessor: "lock_vault_key_lifecycle_tx",
+                read: "read_env_variables",
+                allowed_macros: &["format"],
+                allowed_attributes: &["tauri::command"],
             },
         ];
 
@@ -12299,7 +12404,56 @@ mod tests {
             problems
         }
 
+        /// Walks a `use` tree for anything that could bind `name` at the crate
+        /// root. Visits every branch rather than short-circuiting, because a
+        /// glob further along the same group still has to be reported.
+        fn use_tree_binds(tree: &syn::UseTree, name: &str, glob: &mut bool) -> bool {
+            match tree {
+                syn::UseTree::Path(path) => use_tree_binds(&path.tree, name, glob),
+                syn::UseTree::Name(leaf) => leaf.ident == name,
+                syn::UseTree::Rename(leaf) => leaf.rename == name,
+                syn::UseTree::Glob(_) => {
+                    *glob = true;
+                    false
+                }
+                syn::UseTree::Group(group) => {
+                    let mut binds = false;
+                    for item in &group.items {
+                        binds |= use_tree_binds(item, name, glob);
+                    }
+                    binds
+                }
+            }
+        }
+
         pub fn check(file: &File, target: &Target) -> Vec<String> {
+            // A `use` at the crate root can bind this name to an item declared
+            // somewhere the collection below never looks - a function generated
+            // inside a module and re-exported out, with a compliant explicit
+            // one left beside it under the opposite cfg. The compiler calls the
+            // re-export; this check would read only the compliant copy.
+            let mut problems = Vec::new();
+            for item in &file.items {
+                if let syn::Item::Use(item) = item {
+                    let mut glob = false;
+                    if use_tree_binds(&item.tree, target.function, &mut glob) {
+                        problems.push(format!(
+                            "{}: the name is bound by a use declaration at the crate root, so \
+                             the item the compiler builds under this name is not necessarily \
+                             the function checked here",
+                            target.function
+                        ));
+                    }
+                    if glob {
+                        problems.push(format!(
+                            "{}: a glob import at the crate root can bind this name from a \
+                             module this check does not read",
+                            target.function
+                        ));
+                    }
+                }
+            }
+
             let definitions: Vec<&ItemFn> = file
                 .items
                 .iter()
@@ -12312,20 +12466,63 @@ mod tests {
                 .collect();
 
             if definitions.is_empty() {
-                return vec![format!("{}: not found at the crate root", target.function)];
+                problems.push(format!("{}: not found at the crate root", target.function));
+                return problems;
             }
 
             // Every #[cfg] variant is judged on its own. syn does not evaluate
             // conditional compilation and sees both, so a bad variant sitting
             // next to a good one must not be covered by it.
-            definitions
-                .into_iter()
-                .flat_map(|definition| check_one(definition, target))
-                .collect()
+            problems.extend(
+                definitions
+                    .into_iter()
+                    .flat_map(|definition| check_one(definition, target)),
+            );
+            problems
         }
 
         fn check_one(function: &ItemFn, target: &Target) -> Vec<String> {
             let name = target.function;
+
+            // Before anything about the body is worth reading: an attribute
+            // macro receives this item and returns whatever it likes, so an
+            // undeclared attribute means the statements below may describe a
+            // function that is never built. Reported on its own and returned
+            // early - continuing would attach conclusions to the wrong item.
+            let undeclared: Vec<String> = function
+                .attrs
+                .iter()
+                .map(|attribute| {
+                    attribute
+                        .path()
+                        .segments
+                        .iter()
+                        .map(|segment| segment.ident.to_string())
+                        .collect::<Vec<_>>()
+                        .join("::")
+                })
+                // Two built-in exemptions, both narrow on purpose. `cfg` can
+                // only include or exclude the item as written, never rewrite
+                // it, and both variants are judged separately just below;
+                // `doc` is what a /// comment parses to and attaches no code
+                // at all. Neither can substitute an item, which is the whole
+                // risk being guarded against.
+                //
+                // `cfg_attr` is deliberately NOT exempt despite the name: it
+                // applies an arbitrary attribute conditionally, which is
+                // exactly the substitution this list exists to catch.
+                .filter(|rendered| rendered != "cfg" && rendered != "doc")
+                .filter(|rendered| !target.allowed_attributes.contains(&rendered.as_str()))
+                .map(|rendered| {
+                    format!(
+                        "{name}: attribute #[{rendered}] is not on this function's attribute \
+                         allow list, so the item the compiler builds may not be this one"
+                    )
+                })
+                .collect();
+            if !undeclared.is_empty() {
+                return undeclared;
+            }
 
             // The guard is statement 0 and nothing may precede it: no call, no
             // method call, no macro, no block, no `use`. That is the whole
@@ -12714,6 +12911,48 @@ mod tests {
                 vault
             }"#,
             "named inside the allowed macro",
+        ),
+        (
+            "a re-export that can bind the target name to something else",
+            r#"#[cfg(test)]
+            pub use hidden::read_pending_prune;
+            #[cfg(not(test))]
+            fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "bound by a use declaration",
+        ),
+        (
+            "a glob import that could bind the target name",
+            r#"use hidden::*;
+            fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "glob import",
+        ),
+        (
+            "an attribute that can replace the whole item",
+            r#"#[some_attribute_macro]
+            fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "attribute allow list",
+        ),
+        (
+            "an attribute applied conditionally, which cfg does not cover",
+            r#"#[cfg_attr(test, some_attribute_macro)]
+            fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "attribute allow list",
         ),
         (
             "a macro nobody declared",
