@@ -3840,19 +3840,20 @@ async fn ws_connect(
 
 #[tauri::command]
 async fn ws_send(connection_id: String, message: String) -> Result<(), String> {
-    let (sender, mut cancel_rx) = {
-        let pool = ws_pool();
-        let connections = pool.lock().await;
-        let taken = match connections.get(&connection_id) {
-            Some(WsSlot::Open(open)) => (open.sender.clone(), open.cancel.subscribe()),
-            Some(WsSlot::Pending { .. }) => {
-                return Err("Connection is still being established".to_string())
-            }
-            None => return Err("Connection not found or already closed".to_string()),
-        };
-        drop(connections); // Explicit: this line is what keeps the network send out of the pool lock.
-        taken
+    let pool = ws_pool();
+    // The guard is deliberately bound in the function scope rather than in a
+    // narrower block: the explicit drop below is what releases the pool lock
+    // before any network work, and a guard scoped to an inner block would be
+    // released by the block instead, making that drop unobservable.
+    let connections = pool.lock().await;
+    let (sender, mut cancel_rx) = match connections.get(&connection_id) {
+        Some(WsSlot::Open(open)) => (open.sender.clone(), open.cancel.subscribe()),
+        Some(WsSlot::Pending { .. }) => {
+            return Err("Connection is still being established".to_string())
+        }
+        None => return Err("Connection not found or already closed".to_string()),
     };
+    drop(connections);
     ws_checkpoint("send-after-unlock").await;
 
     tokio::select! {
@@ -8073,7 +8074,19 @@ mod tests {
         // green would mean nothing.
         let stuck = wait_first_pending("send", Duration::from_secs(10)).await;
 
-        ws_disconnect(connection_id.clone()).await.unwrap();
+        // Bounded: if ws_send were to hold the pool lock across its network
+        // send, this call would block forever and the whole suite would hang
+        // instead of reporting. A mutant has to end in a red result, not in a
+        // process that never finishes.
+        let disconnected = tokio::time::timeout(
+            Duration::from_secs(10),
+            ws_disconnect(connection_id.clone()),
+        )
+        .await;
+        assert!(
+            matches!(disconnected, Ok(Ok(()))),
+            "ws_disconnect did not return while a send was stuck: {disconnected:?}"
+        );
 
         let mut released = false;
         for _ in 0..100 {
