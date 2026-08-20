@@ -137,6 +137,11 @@ Release expectations:
 - The development bridge is behind the `dev-bridge` feature and is not part of the default release build.
 - `npm run tauri:build` sets `CI=true` so macOS automation environments do not need Finder access while decorating the DMG window.
 
+## Known Issues
+
+- History entries do not yet carry the machine-readable body-kind marker that live responses have. Replaying a binary response from history therefore renders its placeholder text as if it were the response body. Scheduled for the history-annotations slice (backlog D07b).
+- Response bodies are read fully into memory with no size cap on the network read (only the decompressed output is capped). Very large responses can exhaust memory. Tracked as backlog D09.
+
 ## License
 
 Apache-2.0. See [LICENSE](./LICENSE).

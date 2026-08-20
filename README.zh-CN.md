@@ -132,6 +132,11 @@ Release 约束：
 - 开发桥接服务受 `dev-bridge` feature 保护，不属于默认 release 构建。
 - `npm run tauri:build` 会设置 `CI=true`，避免 macOS 自动化环境在装饰 DMG 窗口时依赖 Finder。
 
+## 已知问题
+
+- 历史条目尚未携带在线响应已有的机器可读 body 类型标记：从历史重放二进制响应时，占位文本会被当作响应体原样显示。计划由历史备注切片（backlog D07b）修复。
+- 响应体在网络层被整体读进内存、无大小上限（只有解压后的输出有上限），超大响应可能耗尽内存。已登记为 backlog D09。
+
 ## License
 
 Apache-2.0。详见 [LICENSE](./LICENSE)。
