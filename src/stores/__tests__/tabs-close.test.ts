@@ -1,13 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { createPinia, setActivePinia } from "pinia"
 
-const { teardownMock, consoleMock } = vi.hoisted(() => ({
+const { teardownMock, consoleMock, adoptMock } = vi.hoisted(() => ({
   teardownMock: vi.fn(async (_connectionId: string) => {}),
   consoleMock: vi.fn(),
+  adoptMock: vi.fn(),
 }))
 
 vi.mock("../websocket", () => ({
-  useWebSocketStore: () => ({ teardown: teardownMock }),
+  useWebSocketStore: () => ({ teardown: teardownMock, adoptOrphanConnection: adoptMock }),
 }))
 
 vi.mock("../console", () => ({ recordConsoleEntry: consoleMock }))
@@ -28,6 +29,7 @@ describe("useTabsStore websocket cleanup", () => {
     teardownMock.mockClear()
     teardownMock.mockImplementation(async () => {})
     consoleMock.mockClear()
+    adoptMock.mockClear()
   })
 
   it("disconnects a websocket tab closed during the handshake", async () => {

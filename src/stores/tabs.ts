@@ -90,13 +90,17 @@ async function cleanupWebSocketTab(tab: Tab) {
     return
   }
 
+  const websocketStore = useWebSocketStore()
+
   try {
-    await useWebSocketStore().teardown(tab.wsConnectionId)
+    await websocketStore.teardown(tab.wsConnectionId)
   } catch (error) {
     // The tab still closes — refusing to close it would leave the user stuck.
-    // But the failure is reported rather than swallowed: the connection may
-    // still be open on the backend, and the store keeps its state record so the
-    // connection remains addressable.
+    // But this tab is the only thing naming that connection, and it is about to
+    // be removed from the list, so the id moves to an owner that survives the
+    // tab. Without this the handle would vanish along with the tab it was
+    // stored on.
+    websocketStore.adoptOrphanConnection(tab.wsConnectionId)
     recordConsoleEntry(
       "error",
       `[network] WebSocket cleanup failed while closing a tab, connection may still be open: ${

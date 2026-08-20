@@ -399,6 +399,19 @@ export const useWebSocketStore = defineStore("websocket", () => {
   }
 
   /**
+   * Takes ownership of an id whose holder is about to disappear.
+   *
+   * Closing a tab removes the tab object, and with it the only field naming
+   * this connection. When the teardown that was supposed to close it failed,
+   * the id has to move somewhere that outlives the tab before that happens.
+   */
+  function adoptOrphanConnection(connectionId: string) {
+    if (!orphanConnections.value.includes(connectionId)) {
+      orphanConnections.value = [...orphanConnections.value, connectionId]
+    }
+  }
+
+  /**
    * Retries every stranded connection, dropping only the ones that actually
    * closed. A retry that fails again stays on the list rather than blocking
    * the connect the user asked for.
@@ -548,6 +561,7 @@ export const useWebSocketStore = defineStore("websocket", () => {
     connections,
     pendingConnects,
     orphanConnections,
+    adoptOrphanConnection,
     connect,
     cancelOrDisconnect,
     send,
