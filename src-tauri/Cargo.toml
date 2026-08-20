@@ -54,6 +54,7 @@ keyring = { version = "3.6.3", default-features = false, features = ["windows-na
 keyring = { version = "3.6.3", default-features = false, features = ["linux-native-sync-persistent"] }
 
 [dev-dependencies]
+syn = { version = "2", features = ["full", "visit"] }
 tempfile = "3"
 wiremock = "0.5"
 tokio = { version = "1", features = ["test-util"] }

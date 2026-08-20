@@ -18,7 +18,7 @@ use reqwest::header::{
 };
 use reqwest::{Client, Method, Request as ReqwestRequest, RequestBuilder, Url};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -649,12 +649,13 @@ fn data_dir() -> Result<PathBuf, String> {
     fs::create_dir_all(&scratch_dir)
         .map_err(|error| format!("Failed to create scratch directory: {error}"))?;
 
-    let history_path = scratch_dir.join("history.jsonl");
-    if !history_path.exists() {
-        fs::write(&history_path, "")
-            .map_err(|error| format!("Failed to create history file: {error}"))?;
-    }
-
+    // The history file is deliberately not pre-created. It used to be, guarded
+    // by an exists() check, and that pairing was both a lost-update window and
+    // the one write in the data directory that did not go through write_atomic:
+    // a second caller could find the file missing, get descheduled while the
+    // first appended real entries, and then truncate them with an empty write.
+    // Nothing needs the file to exist - the reader treats "not there" as "no
+    // history", and the first append creates it atomically.
     Ok(root)
 }
 
@@ -800,42 +801,236 @@ fn io_checkpoint(tag: &'static str) {
     }
 }
 
-fn read_history_entries() -> Result<Vec<HistoryEntry>, String> {
-    io_checkpoint("read");
-    let history_path = history_file_path()?;
-    let file = fs::File::open(&history_path)
-        .map_err(|error| format!("Failed to open history file: {error}"))?;
-    let reader = BufReader::new(file);
-    let mut entries = Vec::new();
+/// Test-only rendezvous keyed by name, used by the lock tests to park a thread
+/// inside a critical section — *after* the guard is taken and *before* the
+/// first read — so the test thread can prove the lock was already held when the
+/// snapshot was about to be read. Compiles away entirely outside `cfg(test)`:
+/// an empty `#[inline(always)]` function emits no instructions, so this is a
+/// test fixture rather than a concession in the shipped product.
+#[cfg(not(test))]
+#[inline(always)]
+fn checkpoint(_name: &'static str) {}
 
-    for line in reader.lines() {
-        let line = line.map_err(|error| format!("Failed to read history file: {error}"))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let entry = serde_json::from_str::<HistoryEntry>(&line)
-            .map_err(|error| format!("Failed to parse history entry: {error}"))?;
-        entries.push(entry);
-    }
-
-    Ok(entries)
+#[cfg(test)]
+fn checkpoint(name: &'static str) {
+    tests::checkpoints::hit(name)
 }
 
-fn write_history_entries(entries: &[HistoryEntry]) -> Result<(), String> {
-    io_checkpoint("write");
-    let history_path = history_file_path()?;
-    let mut file = fs::File::create(&history_path)
-        .map_err(|error| format!("Failed to write history file: {error}"))?;
+#[cfg(test)]
+fn atomic_temp_paths() -> &'static StdMutex<Vec<PathBuf>> {
+    static PATHS: OnceLock<StdMutex<Vec<PathBuf>>> = OnceLock::new();
+    PATHS.get_or_init(|| StdMutex::new(Vec::new()))
+}
 
-    for entry in entries {
-        let line = serde_json::to_string(entry)
-            .map_err(|error| format!("Failed to serialize history entry: {error}"))?;
-        writeln!(file, "{line}")
-            .map_err(|error| format!("Failed to write history entry: {error}"))?;
+/// Records every temporary file `write_atomic` actually created. Asserting on
+/// the final file cannot show how many temp files existed — one file can only
+/// ever show one name — so the concurrency test reads this log instead.
+#[cfg(test)]
+fn record_atomic_temp_path(path: &Path) {
+    atomic_temp_paths()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(path.to_path_buf());
+}
+
+/// Writes `contents` to `path` by filling a uniquely named temporary file in
+/// the same directory and renaming it over the target. A reader therefore sees
+/// either the complete old contents or the complete new ones, never the
+/// truncation window that `fs::write` leaves open.
+///
+/// The temp name carries a uuid deliberately. A deterministic name lets two
+/// concurrent writers open the *same* inode and interleave their bytes, which
+/// is how an earlier draft produced `BBBBAAAA` in a target file. The cost of
+/// uniqueness is that a crash leaves the temp file behind instead of having it
+/// reused by the next write; those leftovers are inert (no scanner recognises
+/// them) and documented as user-removable.
+///
+/// Not promised: power-cut durability. The parent-directory sync below is best
+/// effort, so after a power cut the old contents may come back — but the file
+/// is never left corrupt.
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("Failed to write {}: no parent directory", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("Failed to write {}: invalid file name", path.display()))?;
+
+    // Leading dot + `.tmp` extension keeps these out of the collection tree
+    // (which filters on `extension == "json"`) and the environment list (which
+    // filters on `.env.json` / `.env.secrets.json` suffixes).
+    let temp_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            return Err(format!(
+                "Failed to create temporary file for {}: {error}",
+                path.display()
+            ))
+        }
+    };
+
+    #[cfg(test)]
+    record_atomic_temp_path(&temp_path);
+    checkpoint("atomic_temp_created");
+
+    let mut write_result = file.write_all(contents);
+    if write_result.is_ok() {
+        write_result = file.sync_all();
+    }
+    drop(file);
+
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!(
+            "Failed to write temporary file for {}: {error}",
+            path.display()
+        ));
+    }
+
+    if let Err(error) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("Failed to replace {}: {error}", path.display()));
+    }
+
+    if let Ok(dir) = fs::File::open(parent) {
+        if let Err(error) = dir.sync_all() {
+            eprintln!("Failed to sync directory {}: {error}", parent.display());
+        }
     }
 
     Ok(())
+}
+
+/// A parsed history file plus the raw bytes of every line that could not be
+/// parsed. Corrupt lines are carried as bytes, not text: a line can be invalid
+/// UTF-8, and the whole point of quarantine is that nothing is altered.
+#[derive(Default)]
+struct HistoryFile {
+    entries: Vec<HistoryEntry>,
+    corrupt_lines: Vec<Vec<u8>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryHealth {
+    skipped_lines: usize,
+    quarantined_lines: usize,
+}
+
+fn history_quarantine_path() -> Result<PathBuf, String> {
+    Ok(data_dir()?.join("scratch").join("history.corrupt.jsonl"))
+}
+
+/// Appends raw corrupt lines to the quarantine file and flushes them to disk.
+/// A failure here must abort the caller's write: dropping a bad line from
+/// history.jsonl when its quarantined copy never landed is silent data loss.
+fn quarantine_history_lines(lines: &[Vec<u8>]) -> Result<(), String> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+
+    let path = history_quarantine_path()?;
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .map_err(|error| format!("Failed to open history quarantine file: {error}"))?;
+
+    for line in lines {
+        // The only byte we add is the separating newline; CRLF endings and
+        // invalid UTF-8 go to disk exactly as they were read.
+        file.write_all(line)
+            .map_err(|error| format!("Failed to write history quarantine file: {error}"))?;
+        file.write_all(b"\n")
+            .map_err(|error| format!("Failed to write history quarantine file: {error}"))?;
+    }
+
+    file.sync_all()
+        .map_err(|error| format!("Failed to flush history quarantine file: {error}"))
+}
+
+fn read_history_entries() -> Result<HistoryFile, String> {
+    io_checkpoint("read");
+    let history_path = history_file_path()?;
+    let file = match fs::File::open(&history_path) {
+        Ok(file) => file,
+        // No file is not an error, it is an empty history. Reporting it as a
+        // failure is what forced the data directory to pre-create the file,
+        // and that pre-creation was itself a truncating write.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HistoryFile::default())
+        }
+        Err(error) => return Err(format!("Failed to open history file: {error}")),
+    };
+    let mut reader = BufReader::new(file);
+    let mut history = HistoryFile::default();
+
+    loop {
+        // read_until, not lines(): `lines()` fails the entire read on the first
+        // byte sequence that is not UTF-8, which is how one torn line used to
+        // brick the whole history panel.
+        let mut raw = Vec::new();
+        let read = reader
+            .read_until(b'\n', &mut raw)
+            .map_err(|error| format!("Failed to read history file: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        if raw.last() == Some(&b'\n') {
+            raw.pop();
+        }
+
+        // Blank lines were never data, so they are not corruption either.
+        if raw.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+
+        let Ok(text) = std::str::from_utf8(&raw) else {
+            history.corrupt_lines.push(raw);
+            continue;
+        };
+
+        match serde_json::from_str::<HistoryEntry>(text) {
+            Ok(entry) => history.entries.push(entry),
+            Err(_) => {
+                history.corrupt_lines.push(raw);
+                continue;
+            }
+        }
+    }
+
+    Ok(history)
+}
+
+fn write_history_entries(
+    entries: &[HistoryEntry],
+    corrupt_lines: &[Vec<u8>],
+) -> Result<(), String> {
+    io_checkpoint("write");
+
+    // Order matters and is not interchangeable: rewriting first would leave a
+    // state where the bad line is gone from history.jsonl and was never
+    // persisted anywhere else.
+    quarantine_history_lines(corrupt_lines)?;
+
+    let history_path = history_file_path()?;
+
+    let mut buffer = Vec::new();
+    for entry in entries {
+        let line = serde_json::to_string(entry)
+            .map_err(|error| format!("Failed to serialize history entry: {error}"))?;
+        buffer.extend_from_slice(line.as_bytes());
+        buffer.push(b'\n');
+    }
+
+    write_atomic(&history_path, &buffer)
 }
 
 fn validate_relative_path(raw: &str) -> Result<PathBuf, String> {
@@ -916,8 +1111,11 @@ fn read_project_meta(project_dir: &Path) -> Result<ProjectMeta, String> {
 }
 
 fn write_project_meta(project_dir: &Path, meta: &ProjectMeta) -> Result<(), String> {
-    fs::write(project_dir.join(PROJECT_META_FILE), pretty_json(meta)?)
-        .map_err(|error| format!("Failed to write project metadata: {error}"))
+    write_atomic(
+        &project_dir.join(PROJECT_META_FILE),
+        pretty_json(meta)?.as_bytes(),
+    )
+    .map_err(|error| format!("Failed to write project metadata: {error}"))
 }
 
 fn list_resolved_projects() -> Result<Vec<ResolvedProject>, String> {
@@ -1029,7 +1227,39 @@ fn read_env_variables(file_path: &Path, secret: bool) -> Result<Vec<EnvVariable>
     Ok(variables)
 }
 
+/// Escapes a vault-key component so the three-part key stays unambiguously
+/// splittable: afterwards ':' only ever occurs as "\\:" and '\\' only as
+/// "\\\\". The third component is base64url, which contains neither.
+fn escape_vault_component(value: &str) -> String {
+    value.replace('\\', "\\\\").replace(':', "\\:")
+}
+
+/// `project : environment-slug : base64url(variable name)`.
+///
+/// The previous scheme replaced every non-ASCII-alphanumeric character with
+/// '_', which collapsed 生产 and 测试 to the same "__". Two visibly separate
+/// environments then shared one vault slot: saving one overwrote the other's
+/// credential, and deleting one deleted both. Names now survive verbatim, and
+/// slugifying here removes the old three-way disagreement between the save,
+/// load and delete paths over which spelling of the name to hash.
 fn vault_key_for(project_dir: &Path, env_name: &str, variable_key: &str) -> String {
+    let project = project_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("project");
+    let encoded_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(variable_key);
+
+    format!(
+        "{}:{}:{}",
+        escape_vault_component(project),
+        escape_vault_component(&slugify(env_name)),
+        encoded_key
+    )
+}
+
+/// The pre-D03 key shape. Kept for one purpose only — finding an existing
+/// entry so it can be copied forward. Nothing writes with it.
+fn legacy_vault_key_for(project_dir: &Path, env_name: &str, variable_key: &str) -> String {
     let project = project_dir
         .file_name()
         .and_then(|value| value.to_str())
@@ -1082,7 +1312,7 @@ fn read_secret_storage_config() -> Result<Option<SecretStorageConfig>, String> {
 
 fn write_secret_storage_config(config: &SecretStorageConfig) -> Result<(), String> {
     let path = secret_storage_config_path()?;
-    fs::write(&path, pretty_json(config)?)
+    write_atomic(&path, pretty_json(config)?.as_bytes())
         .map_err(|error| format!("Failed to save secret storage config: {error}"))
 }
 
@@ -1232,15 +1462,59 @@ fn write_local_secret_map(
         ciphertext: encode_base64(&ciphertext),
     };
 
-    fs::write(local_secret_vault_path()?, pretty_json(&vault_file)?)
-        .map_err(|error| format!("Failed to save local secret vault: {error}"))
+    write_atomic(
+        &local_secret_vault_path()?,
+        pretty_json(&vault_file)?.as_bytes(),
+    )
+    .map_err(|error| format!("Failed to save local secret vault: {error}"))
 }
 
-fn unlock_local_secret_storage(master_password: &str) -> Result<(), String> {
-    if master_password.is_empty() {
-        return Err("Local secret vault master password is required".to_string());
-    }
+/// Serialises the local vault's read-decrypt-modify-encrypt-write cycle.
+///
+/// Atomic file replacement is not enough on its own: it stops half a file from
+/// reaching disk, but two savers that each read the same old snapshot will
+/// still have the later one erase the earlier one's entry. Every function that
+/// takes this lock takes it as its very first statement, before any read.
+///
+/// Never nested with VAULT_MAINTENANCE_TX or D01's history lock.
+fn local_vault_tx() -> &'static StdMutex<()> {
+    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| StdMutex::new(()))
+}
 
+fn lock_local_vault_tx() -> MutexGuard<'static, ()> {
+    local_vault_tx()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+fn vault_creations() -> &'static StdMutex<Vec<Vec<u8>>> {
+    static CREATIONS: OnceLock<StdMutex<Vec<Vec<u8>>>> = OnceLock::new();
+    CREATIONS.get_or_init(|| StdMutex::new(Vec::new()))
+}
+
+/// Records every vault that was actually created. Asserting that the finished
+/// file holds one salt proves nothing — a file can only ever show one salt.
+/// Counting creations is what distinguishes "created once" from "created,
+/// then silently recreated over the top".
+#[cfg(test)]
+fn record_vault_creation(salt: &[u8]) {
+    vault_creations()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(salt.to_vec());
+}
+
+/// Everything after the empty-password check, lifted verbatim so the guard can
+/// be the first statement. The decision of whether the vault exists has to sit
+/// inside the critical section: two callers that both read `None` outside it
+/// would both generate a fresh salt, and the later one would overwrite the
+/// vault the earlier one had just created and stored secrets in — with a salt
+/// that cannot decrypt them.
+fn unlock_local_secret_vault_locked(master_password: &str) -> Result<(), String> {
+    let _guard = lock_local_vault_tx();
+    checkpoint("vault_unlock_enter");
     match read_local_secret_vault_file()? {
         Some(vault_file) => {
             let (salt, _, _) = validate_local_secret_vault_file(&vault_file)?;
@@ -1256,6 +1530,8 @@ fn unlock_local_secret_storage(master_password: &str) -> Result<(), String> {
             OsRng.fill_bytes(&mut salt);
             let key = derive_local_secret_key(master_password, &salt)?;
             write_local_secret_map(&HashMap::new(), &key, &salt)?;
+            #[cfg(test)]
+            record_vault_creation(&salt);
             secret_vault_session()
                 .lock()
                 .map_err(|error| format!("Failed to lock secret vault session: {error}"))?
@@ -1264,6 +1540,14 @@ fn unlock_local_secret_storage(master_password: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn unlock_local_secret_storage(master_password: &str) -> Result<(), String> {
+    if master_password.is_empty() {
+        return Err("Local secret vault master password is required".to_string());
+    }
+
+    unlock_local_secret_vault_locked(master_password)
 }
 
 fn current_local_secret_key() -> Result<[u8; LOCAL_SECRET_VAULT_KEY_BYTES], String> {
@@ -1315,7 +1599,31 @@ fn load_system_secret_value(vault_key: &str) -> Result<String, String> {
 }
 
 #[cfg(test)]
+fn system_secret_vault_failure() -> &'static StdMutex<bool> {
+    static FAILING: OnceLock<StdMutex<bool>> = OnceLock::new();
+    FAILING.get_or_init(|| StdMutex::new(false))
+}
+
+/// Makes the keychain stub refuse deletions, so a backend that genuinely says
+/// no can be driven through the real production entry point instead of being
+/// simulated by making the whole scratch directory unwritable — which would
+/// also block the maintenance file and hide the very mutant under test.
+#[cfg(test)]
+fn set_system_secret_vault_failure(enabled: bool) {
+    *system_secret_vault_failure()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = enabled;
+}
+
+#[cfg(test)]
 fn delete_system_secret_value(vault_key: &str) -> Result<(), String> {
+    if *system_secret_vault_failure()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    {
+        return Err("Failed to delete secret from system vault: injected".to_string());
+    }
+
     test_system_secret_vault()
         .lock()
         .map_err(|error| format!("Failed to lock test system secret vault: {error}"))?
@@ -1355,18 +1663,36 @@ fn delete_system_secret_value(vault_key: &str) -> Result<(), String> {
     }
 }
 
+/// The LocalEncrypted branch of `save_secret_value`, lifted verbatim so the
+/// transaction guard can be the first statement of the function. The dispatch
+/// stays outside on purpose: LOCAL_VAULT_TX is a global lock, and holding it
+/// across the keychain path would serialise every keychain write and could
+/// cover a system authorisation prompt.
+fn save_local_secret_value(vault_key: &str, value: &str) -> Result<(), String> {
+    let _guard = lock_local_vault_tx();
+    checkpoint("vault_rmw_enter");
+    let Some((mut values, salt)) = load_local_secret_map()? else {
+        return Err("Local secret vault is missing. Reconfigure secret storage.".to_string());
+    };
+    let key = current_local_secret_key()?;
+    values.insert(vault_key.to_string(), value.to_string());
+    write_local_secret_map(&values, &key, &salt)
+}
+
+fn delete_local_secret_value(vault_key: &str) -> Result<(), String> {
+    let _guard = lock_local_vault_tx();
+    checkpoint("vault_rmw_enter");
+    let Some((mut values, salt)) = load_local_secret_map()? else {
+        return Ok(());
+    };
+    let key = current_local_secret_key()?;
+    values.remove(vault_key);
+    write_local_secret_map(&values, &key, &salt)
+}
+
 fn save_secret_value(vault_key: &str, value: &str) -> Result<(), String> {
     match require_secret_storage_backend()? {
-        SecretStorageBackend::LocalEncrypted => {
-            let Some((mut values, salt)) = load_local_secret_map()? else {
-                return Err(
-                    "Local secret vault is missing. Reconfigure secret storage.".to_string()
-                );
-            };
-            let key = current_local_secret_key()?;
-            values.insert(vault_key.to_string(), value.to_string());
-            write_local_secret_map(&values, &key, &salt)
-        }
+        SecretStorageBackend::LocalEncrypted => save_local_secret_value(vault_key, value),
         SecretStorageBackend::SystemKeychain => save_system_secret_value(vault_key, value),
     }
 }
@@ -1385,48 +1711,638 @@ fn load_secret_value(vault_key: &str) -> Result<String, String> {
 
 fn delete_secret_value(vault_key: &str) -> Result<(), String> {
     match require_secret_storage_backend()? {
-        SecretStorageBackend::LocalEncrypted => {
-            let Some((mut values, salt)) = load_local_secret_map()? else {
-                return Ok(());
-            };
-            let key = current_local_secret_key()?;
-            values.remove(vault_key);
-            write_local_secret_map(&values, &key, &salt)
-        }
+        SecretStorageBackend::LocalEncrypted => delete_local_secret_value(vault_key),
         SecretStorageBackend::SystemKeychain => delete_system_secret_value(vault_key),
     }
 }
 
-fn resolve_secret_variables(
+
+// ---------------------------------------------------------------------------
+// Vault maintenance: collision evidence and the deferred cleanup queue.
+//
+// One sidecar file, one reader, one lock, one read-modify-write. It holds
+// identifiers and failure classifications only — never a secret value, and
+// never a backend's raw error string.
+
+const MAINTENANCE_VERSION: u8 = 1;
+
+fn maintenance_version() -> u8 {
+    MAINTENANCE_VERSION
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnvironmentRef {
+    /// Project directory name.
+    project: String,
+    /// Environment file stem.
+    environment: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SecretKeyCollision {
+    legacy_vault_key: String,
+    variable_key: String,
+    environments: Vec<EnvironmentRef>,
+    detected_at: String,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum PruneFailureKind {
+    IndexUnreadable,
+    IndexIncomplete,
+    BackendDelete,
+}
+
+/// Exactly two fields, and that is a load-bearing property: a raw backend
+/// error can carry paths or key material, so there is nowhere here to put one.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PruneFailure {
+    at: String,
+    kind: PruneFailureKind,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MaintenanceSnapshot {
+    #[serde(default = "maintenance_version")]
+    version: u8,
+    #[serde(default)]
+    collisions: Vec<SecretKeyCollision>,
+    #[serde(default)]
+    pending_prune: Vec<String>,
+    #[serde(default)]
+    last_failure: Option<PruneFailure>,
+}
+
+impl Default for MaintenanceSnapshot {
+    fn default() -> Self {
+        Self {
+            version: MAINTENANCE_VERSION,
+            collisions: Vec::new(),
+            pending_prune: Vec::new(),
+            last_failure: None,
+        }
+    }
+}
+
+/// Guards a vault key's whole lifetime, which is the unit neither of the two
+/// locks below can express.
+///
+/// Writing a secret and publishing the metadata that names it are two separate
+/// writes, and so are scanning for references and deleting what nothing names.
+/// Each individual write is already safe; the damage comes from interleaving
+/// the two *pairs*. A key still queued from an interrupted round and typed in
+/// again by the user gets its new value deleted in the gap before the metadata
+/// naming it reaches disk, and the environment then points at an empty slot
+/// permanently - the exact data loss this slice exists to stop, re-entering
+/// through the cleanup that was supposed to prevent it.
+///
+/// Lock order: this one is outermost. Whoever holds it may go on to take the
+/// maintenance lock or the vault lock; nothing takes this one while holding
+/// either. Cleanup being maintenance rather than something the user asked for,
+/// the cost of waiting here is a deferred deletion, never a blocked save.
+fn vault_key_lifecycle_tx() -> &'static StdMutex<()> {
+    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| StdMutex::new(()))
+}
+
+fn lock_vault_key_lifecycle_tx() -> MutexGuard<'static, ()> {
+    vault_key_lifecycle_tx()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Guards the maintenance file's read-merge-write cycle. Atomic replacement
+/// alone is not enough: two loads that each discover a different collision
+/// would read the same old snapshot and each write back only their own, and
+/// once migration completes the lost evidence cannot be reconstructed.
+///
+/// Never held at the same time as LOCAL_VAULT_TX. Cleanup runs as: hold this,
+/// read the queue, release, delete through the vault lock, re-acquire this to
+/// record what finished.
+fn vault_maintenance_tx() -> &'static StdMutex<()> {
+    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| StdMutex::new(()))
+}
+
+fn lock_vault_maintenance_tx() -> MutexGuard<'static, ()> {
+    vault_maintenance_tx()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn vault_maintenance_path() -> Result<PathBuf, String> {
+    Ok(data_dir()?.join("scratch").join("vault-maintenance.json"))
+}
+
+fn read_maintenance_snapshot() -> Result<MaintenanceSnapshot, String> {
+    let path = vault_maintenance_path()?;
+    if !path.exists() {
+        return Ok(MaintenanceSnapshot::default());
+    }
+
+    let contents = fs::read_to_string(&path)
+        .map_err(|error| format!("Failed to read vault maintenance file: {error}"))?;
+    serde_json::from_str(&contents)
+        .map_err(|error| format!("Failed to parse vault maintenance file: {error}"))
+}
+
+/// Fails the collision record on demand, and nothing else.
+///
+/// The obvious injection - make the scratch directory unwritable - cannot test
+/// what it looks like it tests here. Recording the collision and queueing the
+/// cleanup write the *same* maintenance file, so an unwritable directory fails
+/// both, and a version that drops the record's error simply fails one line
+/// later with the same outcome: same error, same untouched vault, same
+/// unflipped pointer. Nothing distinguishes them. The spec wrote that warning
+/// down for a different test and then used the unwritable directory here
+/// anyway.
+#[cfg(not(test))]
+#[inline(always)]
+fn injected_collision_record_failure() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn collision_record_failure() -> &'static StdMutex<bool> {
+    static FAILURE: OnceLock<StdMutex<bool>> = OnceLock::new();
+    FAILURE.get_or_init(|| StdMutex::new(false))
+}
+
+#[cfg(test)]
+fn set_collision_record_failure(enabled: bool) {
+    *collision_record_failure()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = enabled;
+}
+
+#[cfg(test)]
+fn injected_collision_record_failure() -> Result<(), String> {
+    if *collision_record_failure()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    {
+        return Err("Failed to record vault key collisions: injected".to_string());
+    }
+    Ok(())
+}
+
+fn write_maintenance_snapshot(snapshot: &MaintenanceSnapshot) -> Result<(), String> {
+    write_atomic(
+        &vault_maintenance_path()?,
+        pretty_json(snapshot)?.as_bytes(),
+    )
+}
+
+/// Recovers the variable name from a vault key's third segment. Legacy keys
+/// sanitise their first two segments down to `[A-Za-z0-9_-]`, so the last ':'
+/// always separates the base64 name.
+fn variable_key_from_vault_key(vault_key: &str) -> String {
+    let Some((_, encoded)) = vault_key.rsplit_once(':') else {
+        return String::new();
+    };
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_default()
+}
+
+fn record_vault_key_collisions(
+    candidates: &[String],
+    index: &VaultKeyIndex,
+) -> Result<(), String> {
+    let _guard = lock_vault_maintenance_tx();
+    checkpoint("maintenance_enter");
+    injected_collision_record_failure()?;
+    let mut snapshot = read_maintenance_snapshot()?;
+
+    let mut changed = false;
+    for candidate in candidates {
+        let Some(references) = index.refs.get(candidate) else {
+            continue;
+        };
+
+        let mut distinct: Vec<EnvironmentRef> = Vec::new();
+        for reference in references {
+            if !distinct.contains(reference) {
+                distinct.push(reference.clone());
+            }
+        }
+        if distinct.len() < 2 {
+            continue;
+        }
+        if snapshot
+            .collisions
+            .iter()
+            .any(|collision| &collision.legacy_vault_key == candidate)
+        {
+            continue;
+        }
+
+        snapshot.collisions.push(SecretKeyCollision {
+            legacy_vault_key: candidate.clone(),
+            variable_key: variable_key_from_vault_key(candidate),
+            environments: distinct,
+            detected_at: now_iso(),
+        });
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(());
+    }
+
+    write_maintenance_snapshot(&snapshot)
+}
+
+fn enqueue_pending_prune(keys: &[String]) -> Result<(), String> {
+    let _guard = lock_vault_maintenance_tx();
+    checkpoint("maintenance_enter");
+    let mut snapshot = read_maintenance_snapshot()?;
+
+    let mut changed = false;
+    for key in keys {
+        if !snapshot.pending_prune.contains(key) {
+            snapshot.pending_prune.push(key.clone());
+            changed = true;
+        }
+    }
+
+    if !changed {
+        return Ok(());
+    }
+
+    write_maintenance_snapshot(&snapshot)
+}
+
+/// Read-only on purpose. An earlier design took the queue out of the file and
+/// wrote it back shortened; a crash between that and the actual deletion lost
+/// the cleanup intent permanently — the very defect this queue exists to fix.
+/// The queue only ever shrinks in `resolve_pending_prune`, for keys already
+/// confirmed done.
+fn read_pending_prune() -> Result<Vec<String>, String> {
+    let _guard = lock_vault_maintenance_tx();
+    checkpoint("maintenance_enter");
+    let snapshot = read_maintenance_snapshot()?;
+    Ok(snapshot.pending_prune)
+}
+
+fn resolve_pending_prune(done: &[String]) -> Result<(), String> {
+    let _guard = lock_vault_maintenance_tx();
+    checkpoint("maintenance_enter");
+    let mut snapshot = read_maintenance_snapshot()?;
+
+    let before = snapshot.pending_prune.len();
+    snapshot.pending_prune.retain(|key| !done.contains(key));
+    if snapshot.pending_prune.len() == before {
+        return Ok(());
+    }
+
+    write_maintenance_snapshot(&snapshot)
+}
+
+/// Records that a cleanup round did not finish. Not a checker target: it never
+/// branches on what it read, so there is no read-before-lock surface here.
+fn note_pending_prune_failure(kind: PruneFailureKind) -> Result<(), String> {
+    let _guard = lock_vault_maintenance_tx();
+    let mut snapshot = read_maintenance_snapshot()?;
+    snapshot.last_failure = Some(PruneFailure {
+        at: now_iso(),
+        kind,
+    });
+    write_maintenance_snapshot(&snapshot)
+}
+
+struct VaultKeyIndex {
+    refs: BTreeMap<String, Vec<EnvironmentRef>>,
+    /// False when any environment's metadata could not be read, or when some
+    /// row still has no key written down. An incomplete index may not be used
+    /// to conclude that anything is unreferenced.
+    complete: bool,
+}
+
+/// Scans every environment's secret metadata for the vault keys still in use.
+fn index_referenced_vault_keys() -> Result<VaultKeyIndex, String> {
+    let mut index = VaultKeyIndex {
+        refs: BTreeMap::new(),
+        complete: true,
+    };
+
+    let projects = projects_dir()?;
+    let Ok(project_entries) = fs::read_dir(&projects) else {
+        index.complete = false;
+        return Ok(index);
+    };
+
+    for project_entry in project_entries {
+        let Ok(project_entry) = project_entry else {
+            index.complete = false;
+            continue;
+        };
+        let project_dir = project_entry.path();
+        if !project_dir.is_dir() {
+            continue;
+        }
+        let Some(project_name) = project_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(ToOwned::to_owned)
+        else {
+            index.complete = false;
+            continue;
+        };
+
+        let env_dir = project_environments_dir(&project_dir);
+        if !env_dir.exists() {
+            continue;
+        }
+        let Ok(env_entries) = fs::read_dir(&env_dir) else {
+            index.complete = false;
+            continue;
+        };
+
+        for env_entry in env_entries {
+            let Ok(env_entry) = env_entry else {
+                index.complete = false;
+                continue;
+            };
+            let path = env_entry.path();
+            let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let Some(stem) = file_name.strip_suffix(".env.secrets.json") else {
+                continue;
+            };
+
+            let reference = EnvironmentRef {
+                project: project_name.clone(),
+                environment: stem.to_string(),
+            };
+
+            let Ok(variables) = read_env_variables(&path, true) else {
+                index.complete = false;
+                continue;
+            };
+
+            for variable in variables {
+                let recorded = variable.vault_key.trim();
+                if !recorded.is_empty() {
+                    index
+                        .refs
+                        .entry(recorded.to_string())
+                        .or_default()
+                        .push(reference.clone());
+                    continue;
+                }
+
+                // Old-format row with no key written down. The read path
+                // derives one, so the reference is implicit but real. The
+                // derivation is only a guess — the legacy key was built from
+                // whatever spelling of the name was passed in at the time, and
+                // disk only kept the slug — so the whole round is downgraded
+                // rather than risk deleting a key that is still in use.
+                index.complete = false;
+                for derived in [
+                    vault_key_for(&project_dir, stem, &variable.key),
+                    legacy_vault_key_for(&project_dir, stem, &variable.key),
+                ] {
+                    index
+                        .refs
+                        .entry(derived)
+                        .or_default()
+                        .push(reference.clone());
+                }
+            }
+        }
+    }
+
+    Ok(index)
+}
+
+/// Deletes vault entries nothing references any more, returning only the keys
+/// confirmed finished. The caller removes exactly those from the queue — a
+/// plain `Result<(), String>` could not say which, and an incomplete index
+/// would then look like "pruned everything" and drop the whole queue.
+fn prune_orphan_vault_keys(
+    candidates: &[String],
+    index: &VaultKeyIndex,
+) -> Result<Vec<String>, String> {
+    // Kept deliberately, and it is not dead code even though nothing reaches
+    // it today. The only caller checks index.complete before it dispatches
+    // here, so this branch is unreachable through that path - measured, not
+    // assumed: flipping this condition alone changes no observable behaviour
+    // and survives the whole suite. What the outer check cannot do is bind a
+    // caller that does not exist yet, and the cost of getting this wrong is
+    // deleting a live credential because one unrelated file happened to be
+    // unreadable. Deleting this line only looks safe while there is exactly
+    // one caller.
+    if !index.complete {
+        return Ok(Vec::new());
+    }
+
+    let mut done = Vec::new();
+    for candidate in candidates {
+        if index.refs.contains_key(candidate) {
+            continue;
+        }
+
+        // Already gone counts as finished; that is what makes a retry after a
+        // partial round idempotent.
+        if load_secret_value(candidate)?.is_empty() {
+            done.push(candidate.clone());
+            continue;
+        }
+
+        // One failure aborts the round and nothing is reported done, so the
+        // whole batch stays queued. Erring towards one more retry is always
+        // safer than erring towards deleting a live credential.
+        delete_secret_value(candidate)?;
+        done.push(candidate.clone());
+    }
+
+    Ok(done)
+}
+
+/// The single rule shared by collision detection and orphan cleanup.
+///
+/// A recorded key is what the previous version actually wrote on disk; a
+/// derived one is a guess. When a recorded key exists the guess is dropped,
+/// because it can coincide with a key another environment is genuinely using —
+/// and acting on that guess copies someone else's credential into this
+/// environment, or deletes theirs.
+fn legacy_vault_key_candidates(
+    project_dir: &Path,
+    env_name: &str,
+    variable: &EnvVariable,
+) -> Vec<String> {
+    let target = vault_key_for(project_dir, env_name, &variable.key);
+    let recorded = variable.vault_key.trim();
+
+    if !recorded.is_empty() {
+        if recorded == target {
+            return Vec::new();
+        }
+        return vec![recorded.to_string()];
+    }
+
+    let derived = legacy_vault_key_for(project_dir, env_name, &variable.key);
+    if derived == target {
+        return Vec::new();
+    }
+    vec![derived]
+}
+
+/// Runs the deferred cleanup queue and records failures without blocking the
+/// user. Cleanup is maintenance, not part of what the user asked for: refusing
+/// to open an environment because a stale prune never finished points exactly
+/// the wrong way. Failures are still never swallowed — they leave a dated,
+/// classified marker on disk.
+///
+/// Callers must already hold the lifecycle lock. There is deliberately no
+/// wrapper that takes it here: every entry point that reaches cleanup - load,
+/// save, delete - now holds the lock from before it reads the metadata, so a
+/// self-locking variant would only be reachable by deadlocking against a guard
+/// the caller already owns.
+fn retry_pending_prune_locked(pending: &[String]) {
+    if pending.is_empty() {
+        return;
+    }
+
+    let outcome = match index_referenced_vault_keys() {
+        Err(_) => Err(PruneFailureKind::IndexUnreadable),
+        Ok(index) if !index.complete => Err(PruneFailureKind::IndexIncomplete),
+        Ok(index) => prune_orphan_vault_keys(pending, &index)
+            .map_err(|_| PruneFailureKind::BackendDelete),
+    };
+
+    match outcome {
+        Ok(done) => {
+            // A failure here writes to the very file it would report to, so
+            // there is nowhere to record it but the log.
+            if resolve_pending_prune(&done).is_err() {
+                eprintln!(
+                    "[vault-maintenance] resolve failed kind=resolve-write pending={}",
+                    pending.len()
+                );
+            }
+        }
+        Err(kind) => {
+            // Fixed classification only. Backend error strings can carry paths
+            // or key material, and the log is the same boundary as the file.
+            eprintln!(
+                "[vault-maintenance] deferred cleanup failed kind={kind:?} pending={}",
+                pending.len()
+            );
+            if note_pending_prune_failure(kind).is_err() {
+                eprintln!("[vault-maintenance] failure marker not persisted kind={kind:?}");
+            }
+        }
+    }
+}
+
+#[tauri::command]
+fn get_secret_key_collisions() -> Result<Vec<SecretKeyCollision>, String> {
+    Ok(read_maintenance_snapshot()?.collisions)
+}
+
+/// Clears one collision record. Nothing else does — not completing the
+/// migration, not restarting, not loading the environment again. The user has
+/// to be told which credential to re-enter, and the record is what tells them.
+#[tauri::command]
+fn acknowledge_secret_key_collision(legacy_vault_key: String) -> Result<(), String> {
+    let _guard = lock_vault_maintenance_tx();
+    checkpoint("maintenance_enter");
+    let mut snapshot = read_maintenance_snapshot()?;
+    snapshot
+        .collisions
+        .retain(|collision| collision.legacy_vault_key != legacy_vault_key);
+    write_maintenance_snapshot(&snapshot)
+}
+
+/// Callers must already hold the lifecycle lock, and must have taken it
+/// *before* reading the `variables` passed in here.
+///
+/// Taking it inside this function was not enough, and the reason is worth
+/// keeping: the migration rewrites the metadata file from the list it was
+/// handed, so the read that produced that list is part of the critical section
+/// even though it happens in the caller. A save landing in the gap between the
+/// read and the lock is not merely raced - the rewrite erases whatever it
+/// added, and the save has already reported success.
+fn resolve_secret_variables_locked(
     project_dir: &Path,
     env_name: &str,
     variables: Vec<EnvVariable>,
     secrets_path: &Path,
 ) -> Result<Vec<EnvVariable>, String> {
-    let mut migrated = false;
+    // Step 0: pick up cleanup a previous run could not finish. Failures here
+    // never block the load.
+    retry_pending_prune_locked(&read_pending_prune()?);
+
+    let mut candidates: Vec<String> = Vec::new();
+    for variable in &variables {
+        for candidate in legacy_vault_key_candidates(project_dir, env_name, variable) {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    // Step 1: evidence before migration, and this one *does* block. Once the
+    // pointers flip, nothing on disk shows that two environments ever shared a
+    // slot — better to refuse to open than to erase the only proof.
+    if !candidates.is_empty() {
+        let index_before = index_referenced_vault_keys()?;
+        record_vault_key_collisions(&candidates, &index_before)?;
+        enqueue_pending_prune(&candidates)?;
+    }
+
+    let mut changed = false;
     let mut resolved = Vec::with_capacity(variables.len());
 
     for mut variable in variables {
         variable.secret = true;
-        let vault_key = if variable.vault_key.trim().is_empty() {
-            migrated = true;
-            vault_key_for(project_dir, env_name, &variable.key)
-        } else {
-            variable.vault_key.clone()
-        };
+        let target = vault_key_for(project_dir, env_name, &variable.key);
+        let recorded = variable.vault_key.trim().to_string();
 
         if !variable.value.is_empty() {
-            save_secret_value(&vault_key, &variable.value)?;
-            migrated = true;
+            // Plaintext left in the metadata file by an old version.
+            save_secret_value(&target, &variable.value)?;
+            changed = true;
+        } else if load_secret_value(&target)?.is_empty() {
+            // Copy forward only into an empty slot: that keeps the migration
+            // idempotent and stops it overwriting something the user has since
+            // typed in.
+            for candidate in legacy_vault_key_candidates(project_dir, env_name, &variable) {
+                let legacy_value = load_secret_value(&candidate)?;
+                if legacy_value.is_empty() {
+                    continue;
+                }
+                save_secret_value(&target, &legacy_value)?;
+                changed = true;
+                break;
+            }
         }
 
-        variable.value = load_secret_value(&vault_key)?;
-        variable.vault_key = vault_key;
+        if recorded != target {
+            changed = true;
+        }
+
+        variable.value = load_secret_value(&target)?;
+        variable.vault_key = target;
         resolved.push(variable);
     }
 
-    if migrated {
+    if changed {
+        // Step 3: the pointer flips here, and only then is the old key
+        // genuinely unreferenced. The queue was written before the flip, so an
+        // interrupted cleanup is retried on the next load rather than lost.
         write_secret_metadata(secrets_path, &resolved)?;
+        retry_pending_prune_locked(&candidates);
     }
 
     Ok(resolved)
@@ -1443,8 +2359,72 @@ fn write_secret_metadata(file_path: &Path, variables: &[EnvVariable]) -> Result<
         })
         .collect::<Vec<_>>();
 
-    fs::write(file_path, pretty_json(&metadata)?)
+    write_atomic(file_path, pretty_json(&metadata)?.as_bytes())
         .map_err(|error| format!("Failed to save environment secret metadata: {error}"))
+}
+
+/// Renames a file we could not parse, keeping its bytes byte-for-byte. The
+/// alternative — carrying on and overwriting it — destroys the only record of
+/// which vault entries the environment owned.
+fn quarantine_unreadable_file(path: &Path) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("Cannot quarantine {}: no parent directory", path.display()))?;
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("Cannot quarantine {}: invalid file name", path.display()))?;
+
+    let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+
+    // The timestamp only resolves to a second, and rename replaces whatever is
+    // already there. Two files quarantined inside the same second would leave
+    // the first one destroyed - and this file exists precisely because it is
+    // the only surviving record of which vault entries an environment owned.
+    // So the name is reserved with create_new first: whoever wins the
+    // reservation owns that name, and the loser moves to the next suffix
+    // instead of overwriting.
+    for attempt in 0..1000 {
+        let target = if attempt == 0 {
+            parent.join(format!("{stem}.corrupt-{timestamp}.json"))
+        } else {
+            parent.join(format!("{stem}.corrupt-{timestamp}-{attempt}.json"))
+        };
+
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+        {
+            Ok(_) => {
+                // Renaming over our own placeholder is the point: the name is
+                // ours from here on.
+                fs::rename(path, &target).map_err(|error| {
+                    format!("Failed to quarantine unreadable file: {error}")
+                })?;
+                return Ok(target);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!("Failed to quarantine unreadable file: {error}"))
+            }
+        }
+    }
+
+    Err(format!(
+        "Failed to quarantine {}: too many quarantined copies in the same second",
+        path.display()
+    ))
+}
+
+fn read_previous_secret_metadata(path: &Path) -> Result<Vec<EnvVariable>, String> {
+    match read_env_variables(path, true) {
+        Ok(variables) => Ok(variables),
+        Err(_) => {
+            quarantine_unreadable_file(path)?;
+            Ok(Vec::new())
+        }
+    }
 }
 
 fn merge_environment_variables(
@@ -1698,7 +2678,19 @@ fn build_collection_tree(dir: &Path, relative: PathBuf) -> Result<Vec<Collection
         }
 
         let child_relative = relative.join(&name);
-        let saved_request = read_saved_request(&entry_path)?;
+        // One foreign or half-written .json used to fail the whole tree, so a
+        // project with dozens of intact requests showed an empty sidebar. The
+        // file is left alone on disk; it simply is not a request.
+        let saved_request = match read_saved_request(&entry_path) {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!(
+                    "Skipping unreadable saved request {}: {error}",
+                    entry_path.display()
+                );
+                continue;
+            }
+        };
         requests.push(CollectionNode {
             name: saved_request.name,
             path: child_relative.to_string_lossy().replace('\\', "/"),
@@ -1846,7 +2838,7 @@ fn save_request(
 
     let request = sanitize_saved_request_for_persistence(request);
 
-    fs::write(&file_path, pretty_json(&request)?)
+    write_atomic(&file_path, pretty_json(&request)?.as_bytes())
         .map_err(|error| format!("Failed to save request: {error}"))?;
 
     if let Some(existing_file_path) = existing_file_path {
@@ -1960,7 +2952,7 @@ fn rename_request(project: String, path: String, new_name: String) -> Result<(),
             .map_err(|error| format!("Failed to rename request file: {error}"))?;
     }
 
-    fs::write(&target_file, pretty_json(&request)?)
+    write_atomic(&target_file, pretty_json(&request)?.as_bytes())
         .map_err(|error| format!("Failed to update request name: {error}"))?;
 
     touch_project(&resolved.dir)
@@ -2004,7 +2996,7 @@ fn move_request(project: String, from_path: String, to_collection: String) -> Re
 
     let contents =
         fs::read(&source_file).map_err(|error| format!("Failed to read request file: {error}"))?;
-    fs::write(&target_file, contents)
+    write_atomic(&target_file, &contents)
         .map_err(|error| format!("Failed to write moved request: {error}"))?;
     fs::remove_file(&source_file)
         .map_err(|error| format!("Failed to remove original request file: {error}"))?;
@@ -2062,19 +3054,27 @@ fn list_environments(project: String) -> Result<Vec<String>, String> {
 
 #[tauri::command]
 fn load_environment(project: String, name: String) -> Result<Environment, String> {
+    // Ahead of the reads below, not inside the migration they feed. Loading is
+    // a read-modify-write of the metadata file: what it rewrites is decided
+    // from the snapshot read here, so the snapshot is part of the critical
+    // section. A save that lands between the read and the rewrite loses every
+    // variable it added, and reports success while doing it.
+    let _guard = lock_vault_key_lifecycle_tx();
     let resolved = resolve_project(&project)?;
     let normal_path = environment_file_path(&resolved.dir, &name, false)?;
     let secrets_path = environment_file_path(&resolved.dir, &name, true)?;
     let env_name = slugify(&name);
 
+    // Both reads hoisted out of the call below, in their original order. As
+    // arguments they were evaluated before the callee could take any lock, so
+    // the metadata snapshot this load goes on to rewrite was read outside it.
+    let normal_variables = read_env_variables(&normal_path, false)?;
+    let secret_metadata = read_env_variables(&secrets_path, true)?;
+    checkpoint("environment_metadata_read");
+
     let variables = merge_environment_variables(
-        read_env_variables(&normal_path, false)?,
-        resolve_secret_variables(
-            &resolved.dir,
-            &env_name,
-            read_env_variables(&secrets_path, true)?,
-            &secrets_path,
-        )?,
+        normal_variables,
+        resolve_secret_variables_locked(&resolved.dir, &env_name, secret_metadata, &secrets_path)?,
     );
 
     Ok(Environment {
@@ -2083,8 +3083,18 @@ fn load_environment(project: String, name: String) -> Result<Environment, String
     })
 }
 
+/// `create` is the caller's statement of intent: true means "this name has
+/// never been saved before". Guessing it here is what let a typo silently
+/// overwrite an existing environment. Absent means the old behaviour, so a
+/// rollback of the frontend cannot break this.
 #[tauri::command]
-fn save_environment(project: String, env: Environment) -> Result<(), String> {
+fn save_environment(project: String, env: Environment, create: Option<bool>) -> Result<(), String> {
+    // Outermost statement, and deliberately ahead of the validation below: from
+    // here to the metadata write at the end, this call owns the lifetime of
+    // every vault key it touches. Quarantining the old metadata is inside that
+    // span too - while the file is renamed aside, the keys it named look
+    // unreferenced to a scan, which is a second way into the same deletion.
+    let _guard = lock_vault_key_lifecycle_tx();
     let resolved = resolve_project(&project)?;
     let env_dir = project_environments_dir(&resolved.dir);
     fs::create_dir_all(&env_dir)
@@ -2098,6 +3108,23 @@ fn save_environment(project: String, env: Environment) -> Result<(), String> {
     let normal_path = environment_file_path(&resolved.dir, name, false)?;
     let secrets_path = environment_file_path(&resolved.dir, name, true)?;
 
+    // First statement that touches disk state, deliberately. STAGING and
+    // staging normalise to one file, and creating the second used to overwrite
+    // the first and orphan its secrets. The guard sits ahead of every read,
+    // rename and write so a rejection leaves the directory byte-identical -
+    // including not quarantining a metadata file that happens to be corrupt.
+    if create.unwrap_or(false) && (normal_path.exists() || secrets_path.exists()) {
+        let existing = normal_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.strip_suffix(".env"))
+            .unwrap_or(name)
+            .to_string();
+        return Err(format!("Environment already exists: {existing}"));
+    }
+
+    let previous = read_previous_secret_metadata(&secrets_path)?;
+
     let mut normal_variables = Vec::new();
     let mut secret_variables = Vec::new();
 
@@ -2107,11 +3134,10 @@ fn save_environment(project: String, env: Environment) -> Result<(), String> {
         }
 
         if variable.secret {
-            let vault_key = if variable.vault_key.trim().is_empty() {
-                vault_key_for(&resolved.dir, name, &variable.key)
-            } else {
-                variable.vault_key
-            };
+            // Always recomputed. The frontend never round-trips a vault key,
+            // and trusting one it did send would reintroduce the three-way
+            // disagreement over which spelling addresses a secret.
+            let vault_key = vault_key_for(&resolved.dir, name, &variable.key);
 
             if variable.value.is_empty() {
                 delete_secret_value(&vault_key)?;
@@ -2135,33 +3161,123 @@ fn save_environment(project: String, env: Environment) -> Result<(), String> {
         }
     }
 
-    fs::write(&normal_path, pretty_json(&normal_variables)?)
+    // Keys this environment used to own and no longer lists: a deleted secret
+    // row, a renamed one, or one demoted to a plain variable. Their values
+    // stayed in the vault forever, invisible and unreachable from the UI.
+    let mut removed: Vec<String> = Vec::new();
+    for variable in &previous {
+        let recorded = variable.vault_key.trim();
+        if recorded.is_empty() {
+            continue;
+        }
+        if secret_variables
+            .iter()
+            .any(|kept| kept.vault_key == recorded)
+        {
+            continue;
+        }
+        if !removed.contains(&recorded.to_string()) {
+            removed.push(recorded.to_string());
+        }
+    }
+
+    if !removed.is_empty() {
+        let index_before = index_referenced_vault_keys()?;
+        record_vault_key_collisions(&removed, &index_before)?;
+        enqueue_pending_prune(&removed)?;
+    }
+
+    // Between the backend writes above and the metadata below, a value exists
+    // that nothing on disk names yet. That is the window the cleanup thread
+    // must not be allowed into.
+    checkpoint("secret_values_written");
+
+    write_atomic(&normal_path, pretty_json(&normal_variables)?.as_bytes())
         .map_err(|error| format!("Failed to save environment: {error}"))?;
+    // The pointer flips here; only now are the removed keys truly unreferenced.
     write_secret_metadata(&secrets_path, &secret_variables)?;
+
+    retry_pending_prune_locked(&removed);
     touch_project(&resolved.dir)
 }
 
 #[tauri::command]
 fn delete_environment(project: String, name: String) -> Result<(), String> {
+    // The third entry into the same window, and the one the review did not
+    // name: this reads the metadata to learn which vault entries the
+    // environment owned, then removes the files. Unlocked, a save landing in
+    // between makes the key list stale - the secret it added is never queued
+    // and stays in the vault with nothing naming it - and a save landing after
+    // the files are gone republishes them, bringing a deleted environment back
+    // into the list.
+    let _guard = lock_vault_key_lifecycle_tx();
     let resolved = resolve_project(&project)?;
+
+    // Ahead of the "does not exist" early return on purpose. A previous call
+    // may have removed the files and then failed to finish cleanup; this is the
+    // one entry point a user will trigger again, so if it bailed out early the
+    // queue would never find another taker.
+    retry_pending_prune_locked(&read_pending_prune()?);
+
     let normal_path = environment_file_path(&resolved.dir, &name, false)?;
     let secrets_path = environment_file_path(&resolved.dir, &name, true)?;
     let normal_exists = normal_path.exists();
     let secrets_exists = secrets_path.exists();
 
+    // An unreadable metadata file is quarantined rather than deleted, matching
+    // what saving does. Deleting it was the worst of the three options this
+    // slice uses: loading fails loudly because a half-shown environment is what
+    // makes users overwrite it, saving renames the file aside because its bytes
+    // are the only record of which vault entries the environment owned - and
+    // deleting threw those bytes away while the entries they name stayed in the
+    // vault, unreachable and undeletable. That is the defect this slice exists
+    // to fix, reappearing at the one entry point that destroys the evidence.
+    // It also made the recovery instructions in both READMEs false.
+    let mut candidates: Vec<String> = Vec::new();
+    let mut quarantined_metadata: Option<PathBuf> = None;
+    if secrets_exists {
+        let previous = match read_env_variables(&secrets_path, true) {
+            Ok(variables) => variables,
+            Err(_) => {
+                quarantined_metadata = Some(quarantine_unreadable_file(&secrets_path)?);
+                Vec::new()
+            }
+        };
+
+        for variable in previous {
+            let recorded = variable.vault_key.trim();
+            let owned = if recorded.is_empty() {
+                vault_key_for(&resolved.dir, &name, &variable.key)
+            } else {
+                recorded.to_string()
+            };
+            if !candidates.contains(&owned) {
+                candidates.push(owned);
+            }
+            for candidate in legacy_vault_key_candidates(&resolved.dir, &name, &variable) {
+                if !candidates.contains(&candidate) {
+                    candidates.push(candidate);
+                }
+            }
+        }
+    }
+
+    // Queue before deleting the files, not after. The old order deleted vault
+    // entries first, so a crash in the middle left the environment on disk with
+    // its secrets already gone.
+    if !candidates.is_empty() {
+        enqueue_pending_prune(&candidates)?;
+    }
+
     if normal_exists {
         fs::remove_file(&normal_path)
             .map_err(|error| format!("Failed to delete environment: {error}"))?;
     }
-    if secrets_exists {
-        for variable in read_env_variables(&secrets_path, true)? {
-            let vault_key = if variable.vault_key.trim().is_empty() {
-                vault_key_for(&resolved.dir, &name, &variable.key)
-            } else {
-                variable.vault_key
-            };
-            delete_secret_value(&vault_key)?;
-        }
+    // Quarantining already moved the file off this path, and the environment is
+    // gone from the list either way because the renamed file no longer matches
+    // the .env.secrets.json suffix. The user's delete is honoured; the bytes
+    // survive for whoever has to work out what was in the vault.
+    if secrets_exists && quarantined_metadata.is_none() {
         fs::remove_file(&secrets_path)
             .map_err(|error| format!("Failed to delete environment secrets: {error}"))?;
     }
@@ -2169,6 +3285,9 @@ fn delete_environment(project: String, name: String) -> Result<(), String> {
         return Err("Environment does not exist".to_string());
     }
 
+    // Prune only now: an entry another environment still names is kept, which
+    // is what stops deleting 测试 from taking 生产's token with it.
+    retry_pending_prune_locked(&candidates);
     touch_project(&resolved.dir)
 }
 
@@ -2185,37 +3304,55 @@ fn append_history(mut entry: HistoryEntry) -> Result<(), String> {
         entry.id = Uuid::new_v4().to_string();
     }
 
-    let mut entries = read_history_entries()?;
-    entries.push(entry);
+    let mut file = read_history_entries()?;
+    file.entries.push(entry);
 
-    if entries.len() > MAX_HISTORY_ENTRIES {
-        let overflow = entries.len() - MAX_HISTORY_ENTRIES;
-        entries.drain(0..overflow);
+    if file.entries.len() > MAX_HISTORY_ENTRIES {
+        let overflow = file.entries.len() - MAX_HISTORY_ENTRIES;
+        file.entries.drain(0..overflow);
     }
 
-    write_history_entries(&entries)
+    write_history_entries(&file.entries, &file.corrupt_lines)
 }
 
 #[tauri::command]
 fn load_history() -> Result<Vec<HistoryEntry>, String> {
     let _guard = lock_history();
-    let mut entries = read_history_entries()?;
-    entries.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
-    Ok(entries)
+    let mut file = read_history_entries()?;
+    if !file.corrupt_lines.is_empty() {
+        eprintln!(
+            "[history] skipped {} unreadable line(s)",
+            file.corrupt_lines.len()
+        );
+    }
+    file.entries
+        .sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
+    Ok(file.entries)
 }
 
 #[tauri::command]
 fn clear_history() -> Result<(), String> {
     let _guard = lock_history();
-    write_history_entries(&[])
+    write_history_entries(&[], &[])?;
+
+    // An explicit clear means no residue. Quarantined lines can hold
+    // credentials that older versions wrote in plaintext.
+    let quarantine_path = history_quarantine_path()?;
+    match fs::remove_file(&quarantine_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Failed to delete history quarantine file: {error}"
+        )),
+    }
 }
 
 #[tauri::command]
 fn delete_history_entry(id: String) -> Result<(), String> {
     let _guard = lock_history();
-    let mut entries = read_history_entries()?;
-    entries.retain(|entry| entry.id != id);
-    write_history_entries(&entries)
+    let mut file = read_history_entries()?;
+    file.entries.retain(|entry| entry.id != id);
+    write_history_entries(&file.entries, &file.corrupt_lines)
 }
 
 /// Replaces history rows by id. Rows the caller did not list are kept as they
@@ -2225,15 +3362,41 @@ fn delete_history_entry(id: String) -> Result<(), String> {
 #[tauri::command]
 fn update_history_entries(entries: Vec<HistoryEntry>) -> Result<(), String> {
     let _guard = lock_history();
-    let mut merged = read_history_entries()?;
+    let mut file = read_history_entries()?;
 
     for update in entries.iter() {
-        if let Some(existing) = merged.iter_mut().find(|entry| entry.id == update.id) {
+        if let Some(existing) = file.entries.iter_mut().find(|entry| entry.id == update.id) {
             *existing = update.clone();
         }
     }
 
-    write_history_entries(&merged)
+    // Passing &[] here would silently drop quarantine-bound lines that may
+    // carry plaintext credentials.
+    write_history_entries(&file.entries, &file.corrupt_lines)
+}
+
+/// Counts what the last read had to skip and what is sitting in quarantine, so
+/// the history panel can say so and re-enable its clear button. A new command
+/// rather than a wider `load_history`: the button's disabled condition lives in
+/// the panel, so the UI has to change either way.
+#[tauri::command]
+fn get_history_health() -> Result<HistoryHealth, String> {
+    let _guard = lock_history();
+    let file = read_history_entries()?;
+
+    let quarantine_path = history_quarantine_path()?;
+    let quarantined_lines = match fs::read(&quarantine_path) {
+        Ok(bytes) => bytes.iter().filter(|byte| **byte == b'\n').count(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => {
+            return Err(format!("Failed to read history quarantine file: {error}"))
+        }
+    };
+
+    Ok(HistoryHealth {
+        skipped_lines: file.corrupt_lines.len(),
+        quarantined_lines,
+    })
 }
 
 async fn ws_connect_inner(
@@ -3357,6 +4520,8 @@ struct EnvironmentNameArgs {
 struct SaveEnvironmentArgs {
     project: String,
     env: Environment,
+    #[serde(default)]
+    create: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -3514,7 +4679,7 @@ async fn api_load_environment(Json(args): Json<EnvironmentNameArgs>) -> impl Int
 }
 
 async fn api_save_environment(Json(args): Json<SaveEnvironmentArgs>) -> impl IntoResponse {
-    api_unit(save_environment(args.project, args.env))
+    api_unit(save_environment(args.project, args.env, args.create))
 }
 
 async fn api_delete_environment(Json(args): Json<EnvironmentNameArgs>) -> impl IntoResponse {
@@ -3572,6 +4737,10 @@ async fn api_delete_history_entry(Json(args): Json<DeleteHistoryEntryArgs>) -> i
     api_unit(delete_history_entry(args.id))
 }
 
+async fn api_get_history_health() -> impl IntoResponse {
+    api_response(get_history_health())
+}
+
 async fn api_update_history_entries(Json(args): Json<UpdateHistoryEntriesArgs>) -> impl IntoResponse {
     api_unit(update_history_entries(args.entries))
 }
@@ -3617,6 +4786,7 @@ async fn start_dev_server() {
         .route("/api/ws_drain_events", post(api_ws_drain_events))
         .route("/api/append_history", post(api_append_history))
         .route("/api/load_history", post(api_load_history))
+        .route("/api/get_history_health", post(api_get_history_health))
         .route("/api/clear_history", post(api_clear_history))
         .route("/api/delete_history_entry", post(api_delete_history_entry))
         .route(
@@ -3677,6 +4847,9 @@ pub fn run() {
             clear_history,
             delete_history_entry,
             update_history_entries,
+            get_history_health,
+            get_secret_key_collisions,
+            acknowledge_secret_key_collision,
             get_data_dir,
             get_secret_storage_state,
             configure_secret_storage,
@@ -3719,6 +4892,214 @@ mod tests {
         env_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Named, one-shot rendezvous points for the concurrency tests.
+    ///
+    /// A test installs a gate under one name; the code under test parks there
+    /// once; the test thread probes whatever it needs while the child is
+    /// pinned. `hit` removes the gate *before* it blocks, so a second arrival
+    /// at the same name passes straight through — a correct implementation
+    /// that writes twice must not deadlock against a test that releases once.
+    pub(super) mod checkpoints {
+        use std::collections::HashMap;
+        use std::sync::mpsc::{channel, Receiver, Sender};
+        use std::sync::{Mutex, OnceLock};
+
+        pub(crate) enum Event {
+            Arrived,
+            Returned(Result<(), String>),
+        }
+
+        struct Gate {
+            arrival: Sender<Event>,
+            release: Receiver<()>,
+        }
+
+        fn registry() -> &'static Mutex<HashMap<&'static str, Gate>> {
+            static REGISTRY: OnceLock<Mutex<HashMap<&'static str, Gate>>> = OnceLock::new();
+            REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+        }
+
+        pub(crate) fn hit(name: &'static str) {
+            // Take the gate out under the registry lock and release that lock
+            // before blocking, otherwise the test thread could not reach the
+            // registry to clean up.
+            let gate = {
+                registry()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(name)
+            };
+
+            if let Some(gate) = gate {
+                let _ = gate.arrival.send(Event::Arrived);
+                let _ = gate.release.recv();
+            }
+        }
+
+        pub(crate) fn install(name: &'static str, arrival: Sender<Event>) -> Sender<()> {
+            let (release_tx, release_rx) = channel();
+            registry()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(
+                    name,
+                    Gate {
+                        arrival,
+                        release: release_rx,
+                    },
+                );
+            release_tx
+        }
+
+        pub(crate) fn clear() {
+            registry()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+        }
+    }
+
+    /// How long the test thread waits for a child to reach its checkpoint.
+    /// A timeout means one thing only: the command never got there. It is
+    /// never evidence about the lock.
+    const NAMED_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Releases and joins the parked child no matter how the test thread
+    /// leaves the probe window. Without it a failing probe would panic while a
+    /// child still holds a production lock, stranding every later test.
+    struct NamedCheckpointCleanup {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        child: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl NamedCheckpointCleanup {
+        fn release_and_join(&mut self) -> bool {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            match self.child.take() {
+                Some(child) => child.join().is_ok(),
+                None => false,
+            }
+        }
+    }
+
+    impl Drop for NamedCheckpointCleanup {
+        fn drop(&mut self) {
+            self.release_and_join();
+            checkpoints::clear();
+        }
+    }
+
+    struct ParkedRun<T> {
+        probe: Option<T>,
+        child_ok: bool,
+        returned: Vec<Result<(), String>>,
+    }
+
+    /// Runs `body` on a child thread, waits for it to park at `name`, runs
+    /// `probe` on the test thread while it is pinned, then releases and joins.
+    /// Asserts nothing: the caller inspects the returned facts *after* cleanup
+    /// has already run.
+    fn with_thread_parked_at<T>(
+        name: &'static str,
+        body: impl FnOnce() -> Result<(), String> + Send + 'static,
+        probe: impl FnOnce() -> T,
+    ) -> ParkedRun<T> {
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<checkpoints::Event>();
+        let release = checkpoints::install(name, event_tx.clone());
+
+        let child = std::thread::spawn(move || {
+            let result = body();
+            let _ = event_tx.send(checkpoints::Event::Returned(result));
+        });
+
+        let mut cleanup = NamedCheckpointCleanup {
+            release: Some(release),
+            child: Some(child),
+        };
+
+        let mut returned = Vec::new();
+        let arrived = match event_rx.recv_timeout(NAMED_CHECKPOINT_TIMEOUT) {
+            Ok(checkpoints::Event::Arrived) => true,
+            Ok(checkpoints::Event::Returned(result)) => {
+                returned.push(result);
+                false
+            }
+            Err(_) => false,
+        };
+
+        // No assertion may run in this window — cleanup has to happen first.
+        let probe = if arrived { Some(probe()) } else { None };
+
+        let child_ok = cleanup.release_and_join();
+        drop(cleanup);
+
+        for event in event_rx.try_iter() {
+            if let checkpoints::Event::Returned(result) = event {
+                returned.push(result);
+            }
+        }
+
+        ParkedRun {
+            probe,
+            child_ok,
+            returned,
+        }
+    }
+
+    struct NamedLockProbe {
+        verdict: LockVerdict,
+        child_ok: bool,
+        returned: Vec<Result<(), String>>,
+    }
+
+    fn probe_lock_at_checkpoint(
+        name: &'static str,
+        lock: &'static StdMutex<()>,
+        body: impl FnOnce() -> Result<(), String> + Send + 'static,
+    ) -> NamedLockProbe {
+        let run = with_thread_parked_at(name, body, || match lock.try_lock() {
+            Err(std::sync::TryLockError::WouldBlock) => LockVerdict::LockHeld,
+            Ok(guard) => {
+                drop(guard);
+                LockVerdict::LockFree
+            }
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                // A poisoned result still carries an acquired guard. Dropping
+                // it keeps the lock usable for the rest of the file. It must
+                // not be folded into LockHeld, which would misreport the lock.
+                drop(error.into_inner());
+                LockVerdict::HarnessError
+            }
+        });
+
+        // Without this, one panicking child turns every later `try_lock` into
+        // `Poisoned` and the whole file reports infrastructure failure.
+        lock.clear_poison();
+
+        NamedLockProbe {
+            verdict: run.probe.unwrap_or(LockVerdict::NeverReachedIo),
+            child_ok: run.child_ok,
+            returned: run.returned,
+        }
+    }
+
+    /// The four facts of the checkpoint protocol, reported together. Checking
+    /// the verdict alone lets "held the lock, reached the checkpoint, then
+    /// panicked" pass as success; checking them apart makes a crashed child
+    /// read as a misplaced lock.
+    fn assert_named_lock_probe(label: &str, probe: &NamedLockProbe, expected: LockVerdict) {
+        let returned_ok = probe.returned.len() == 1 && probe.returned[0].is_ok();
+        assert!(
+            probe.verdict == expected && probe.child_ok && returned_ok,
+            "{label}: verdict={:?} (expected {expected:?}), child_ok={}, returned={:?}",
+            probe.verdict,
+            probe.child_ok,
+            probe.returned
+        );
     }
 
     struct HomeGuard {
@@ -4287,6 +5668,7 @@ mod tests {
                     sample_env_variable("apiKey", "secret-key-123", true),
                 ],
             },
+            None,
         )
         .unwrap();
 
@@ -4897,6 +6279,7 @@ mod tests {
                         },
                     ],
                 },
+                None,
             )
             .unwrap();
 
@@ -6412,7 +7795,7 @@ mod tests {
         ])
         .unwrap();
 
-        let entries = read_history_entries().unwrap();
+        let entries = read_history_entries().unwrap().entries;
         let ids: Vec<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
         assert_eq!(ids, vec!["keep-1", "rewrite", "keep-2"]);
         assert_eq!(entries[1].url, "https://api.example.com/sanitized");
@@ -6590,12 +7973,13 @@ mod tests {
             .enumerate()
             .map(|(index, id)| sample_history_entry(id, &format!("2026-03-27T10:0{index}:00Z")))
             .collect();
-        write_history_entries(&entries).unwrap();
+        write_history_entries(&entries, &[]).unwrap();
     }
 
     fn history_ids() -> Vec<String> {
         read_history_entries()
             .unwrap()
+            .entries
             .into_iter()
             .map(|entry| entry.id)
             .collect()
@@ -6634,7 +8018,7 @@ mod tests {
                 record("delete completed");
             }
             HistoryCommand::UnlockedRead => {
-                let entries = read_history_entries().unwrap();
+                let entries = read_history_entries().unwrap().entries;
                 record(&format!("unlocked read returned {} entries", entries.len()));
             }
             HistoryCommand::Update => {
@@ -6815,7 +8199,7 @@ mod tests {
 
         let probe = run_lock_probe(HistoryCommand::Update, std::time::Duration::ZERO);
         assert_lock_probe(&probe, "update completed", &["A", "B"]);
-        let entries = read_history_entries().unwrap();
+        let entries = read_history_entries().unwrap().entries;
         assert_eq!(entries[0].url, "https://api.example.com/updated");
         assert_eq!(entries[1].url, "http://example.com/api");
     }
@@ -6929,7 +8313,7 @@ mod tests {
             appender.join().unwrap();
             updater.join().unwrap();
 
-            let entries = read_history_entries().unwrap();
+            let entries = read_history_entries().unwrap().entries;
             let ids: Vec<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
             assert_eq!(ids, vec!["A", "N"], "round {round}");
             assert_eq!(
@@ -8278,4 +9662,3475 @@ mod tests {
         );
     }
 
+
+    // ---------------------------------------------------------------- D03 §六
+    // How files get written: atomic replacement, concurrent writers, no
+    // leftovers, and leftovers that are never mistaken for user data.
+
+    fn d03_reset_atomic_temp_log() {
+        atomic_temp_paths()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    fn d03_recorded_atomic_temp_paths() -> Vec<PathBuf> {
+        atomic_temp_paths()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn d03_dir_file_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn test_concurrent_writers_both_succeed_and_never_interleave() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        d03_reset_atomic_temp_log();
+
+        let dir = temp_home.path().to_path_buf();
+        let target = dir.join("contended.json");
+        let child_target = target.clone();
+        let probe_target = target.clone();
+
+        // (a) The child is pinned between `create_new` and `rename`, so its
+        // temp file provably exists while the test thread runs a whole
+        // `write_atomic` of its own. With a deterministic temp name the second
+        // `create_new` would hit EEXIST — that is what makes this deterministic
+        // rather than a race the mutant might win.
+        let run = with_thread_parked_at(
+            "atomic_temp_created",
+            move || write_atomic(&child_target, &[b'A'; 4096]),
+            move || write_atomic(&probe_target, &[b'B'; 4096]),
+        );
+
+        let probe = run
+            .probe
+            .expect("child never reached the temp-file checkpoint");
+        assert!(probe.is_ok(), "test-thread writer failed: {probe:?}");
+        assert!(run.child_ok, "child thread panicked");
+        assert_eq!(
+            run.returned.len(),
+            1,
+            "expected exactly one return event, got {:?}",
+            run.returned
+        );
+        assert!(
+            run.returned[0].is_ok(),
+            "child writer failed: {:?}",
+            run.returned[0]
+        );
+
+        let contents = std::fs::read(&target).unwrap();
+        assert_eq!(contents.len(), 4096, "target is not one complete write");
+        let all_a = contents.iter().all(|byte| *byte == b'A');
+        let all_b = contents.iter().all(|byte| *byte == b'B');
+        assert!(
+            all_a || all_b,
+            "target interleaved two writers: {} A bytes, {} B bytes",
+            contents.iter().filter(|byte| **byte == b'A').count(),
+            contents.iter().filter(|byte| **byte == b'B').count()
+        );
+
+        let temps = d03_recorded_atomic_temp_paths();
+        assert_eq!(temps.len(), 2, "expected two temp files, got {temps:?}");
+        assert_ne!(
+            temps[0], temps[1],
+            "both writers used the same temp path: {temps:?}"
+        );
+
+        // (b) The same property without threads: a leftover file sitting on the
+        // deterministic name must not be able to fail a fresh write.
+        let residue = dir.join(".contended.json.tmp");
+        std::fs::write(&residue, b"leftover from a crash").unwrap();
+        write_atomic(&target, b"fresh").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"fresh");
+    }
+
+    #[test]
+    fn test_write_atomic_leaves_no_temp_file() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        let dir = temp_home.path().join("atomic");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("state.json");
+
+        write_atomic(&target, b"first").unwrap();
+        write_atomic(&target, b"second").unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"second");
+        assert_eq!(
+            d03_dir_file_names(&dir),
+            vec!["state.json".to_string()],
+            "a temp file survived the write"
+        );
+    }
+
+    #[test]
+    fn test_temp_files_are_invisible_to_collection_tree_and_environment_list() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        create_project("Temp Vis".to_string(), String::new()).unwrap();
+        save_request(
+            "Temp Vis".to_string(),
+            String::new(),
+            sample_saved_request("Get Users", "GET", "http://example.com/users"),
+            None,
+        )
+        .unwrap();
+        save_environment(
+            "Temp Vis".to_string(),
+            Environment {
+                name: "staging".to_string(),
+                variables: vec![sample_env_variable("baseUrl", "http://localhost", false)],
+            },
+            None,
+        )
+        .unwrap();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/temp-vis");
+        let collections_dir = project_dir.join("collections");
+        let environments_dir = project_dir.join("environments");
+
+        // Park a real `write_atomic` between `create_new` and `rename` so a
+        // genuine in-flight temp file is on disk while the listings run. This
+        // is the crash-leftover shape, produced by production code rather than
+        // hand-rolled in the test.
+        let request_target = collections_dir.join("get-users.request.json");
+        let collections_probe_dir = collections_dir.clone();
+        let run = with_thread_parked_at(
+            "atomic_temp_created",
+            move || write_atomic(&request_target, b"{}"),
+            move || {
+                let tree = get_collection_tree("Temp Vis".to_string()).unwrap();
+                let names: Vec<String> = tree.iter().map(|node| node.name.clone()).collect();
+                let on_disk = d03_dir_file_names(&collections_probe_dir);
+                (names, on_disk)
+            },
+        );
+
+        let (tree_names, collection_files) = run
+            .probe
+            .expect("child never reached the temp-file checkpoint");
+        assert!(run.child_ok && run.returned.len() == 1 && run.returned[0].is_ok());
+        // Fixture self-check: the temp file really was on disk while we looked,
+        // otherwise "not listed" would be vacuously true.
+        assert_eq!(
+            collection_files.len(),
+            2,
+            "expected the target plus one in-flight temp file, saw {collection_files:?}"
+        );
+        assert_eq!(
+            tree_names,
+            vec!["Get Users".to_string()],
+            "an in-flight temp file showed up in the collection tree"
+        );
+
+        let env_target = environments_dir.join("staging.env.json");
+        let environments_probe_dir = environments_dir.clone();
+        let run = with_thread_parked_at(
+            "atomic_temp_created",
+            move || write_atomic(&env_target, b"[]"),
+            move || {
+                let names = list_environments("Temp Vis".to_string()).unwrap();
+                let on_disk = d03_dir_file_names(&environments_probe_dir);
+                (names, on_disk)
+            },
+        );
+
+        let (env_names, env_files) = run
+            .probe
+            .expect("child never reached the temp-file checkpoint");
+        assert!(run.child_ok && run.returned.len() == 1 && run.returned[0].is_ok());
+        assert_eq!(
+            env_files.len(),
+            3,
+            "expected two env files plus one in-flight temp file, saw {env_files:?}"
+        );
+        assert_eq!(
+            env_names,
+            vec!["staging".to_string()],
+            "an in-flight temp file showed up in the environment list"
+        );
+    }
+
+    // ---------------------------------------------------------------- D03 §五
+    // The history file: one bad line used to brick the whole panel, and the
+    // only in-app way out (Clear history) greyed itself out because the list
+    // was empty. Bad lines are now skipped, and their raw bytes are preserved.
+
+    fn d03_history_line(id: &str, timestamp: &str) -> Vec<u8> {
+        serde_json::to_vec(&sample_history_entry(id, timestamp)).unwrap()
+    }
+
+    fn d03_write_raw_history(bytes: &[u8]) {
+        std::fs::write(history_file_path().unwrap(), bytes).unwrap();
+    }
+
+    fn d03_read_raw_history() -> Vec<u8> {
+        std::fs::read(history_file_path().unwrap()).unwrap()
+    }
+
+    fn d03_read_quarantine() -> Vec<u8> {
+        std::fs::read(history_quarantine_path().unwrap()).unwrap_or_default()
+    }
+
+    /// One good line, one unparsable line, one good line — the shape a crash
+    /// mid-write leaves behind.
+    fn d03_seed_torn_history() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&d03_history_line("good-1", "2026-03-27T10:00:00Z"));
+        raw.push(b'\n');
+        raw.extend_from_slice(br#"{"id":"torn","method":"GET""#);
+        raw.push(b'\n');
+        raw.extend_from_slice(&d03_history_line("good-2", "2026-03-27T10:02:00Z"));
+        raw.push(b'\n');
+        d03_write_raw_history(&raw);
+    }
+
+    #[test]
+    fn test_load_history_skips_corrupt_lines() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        d03_seed_torn_history();
+
+        let entries = load_history().unwrap();
+        let ids: Vec<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+        assert_eq!(ids, vec!["good-2", "good-1"]);
+    }
+
+    #[test]
+    fn test_history_mutations_quarantine_corrupt_lines() {
+        for (label, mutate) in [
+            (
+                "append",
+                Box::new(|| {
+                    append_history(sample_history_entry("added", "2026-03-27T10:03:00Z")).unwrap()
+                }) as Box<dyn Fn()>,
+            ),
+            (
+                "delete",
+                Box::new(|| delete_history_entry("good-1".to_string()).unwrap()) as Box<dyn Fn()>,
+            ),
+            (
+                "update",
+                Box::new(|| {
+                    let mut updated = sample_history_entry("good-1", "2026-03-27T10:00:00Z");
+                    updated.url = "https://api.example.com/updated".to_string();
+                    update_history_entries(vec![updated]).unwrap()
+                }) as Box<dyn Fn()>,
+            ),
+        ] {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            d03_seed_torn_history();
+
+            mutate();
+
+            assert_eq!(
+                d03_read_quarantine(),
+                b"{\"id\":\"torn\",\"method\":\"GET\"\n".to_vec(),
+                "{label}: quarantine file does not hold the corrupt line verbatim"
+            );
+            let rewritten = d03_read_raw_history();
+            assert!(
+                !rewritten.windows(4).any(|window| window == b"torn"),
+                "{label}: the corrupt line is still in history.jsonl"
+            );
+        }
+    }
+
+    #[test]
+    fn test_invalid_utf8_line_is_isolated_not_fatal() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&d03_history_line("good-1", "2026-03-27T10:00:00Z"));
+        raw.push(b'\n');
+        raw.extend_from_slice(&[0xFF, 0xFE]);
+        raw.push(b'\n');
+        d03_write_raw_history(&raw);
+
+        let entries = load_history().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "good-1");
+
+        append_history(sample_history_entry("added", "2026-03-27T10:03:00Z")).unwrap();
+        assert_eq!(
+            d03_read_quarantine(),
+            vec![0xFF, 0xFE, b'\n'],
+            "invalid UTF-8 bytes were altered on the way to quarantine"
+        );
+    }
+
+    #[test]
+    fn test_quarantine_preserves_crlf_and_missing_final_newline() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&d03_history_line("good-1", "2026-03-27T10:00:00Z"));
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(b"not json\r\n");
+        // Final line with no trailing newline at all.
+        raw.extend_from_slice(b"also not json");
+        d03_write_raw_history(&raw);
+
+        append_history(sample_history_entry("added", "2026-03-27T10:03:00Z")).unwrap();
+
+        assert_eq!(
+            d03_read_quarantine(),
+            b"not json\r\nalso not json\n".to_vec(),
+            "quarantine normalised the bytes it was supposed to preserve"
+        );
+    }
+
+    #[test]
+    fn test_history_is_not_rewritten_until_quarantine_succeeds() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        d03_seed_torn_history();
+        let before = d03_read_raw_history();
+
+        // A directory where the quarantine file belongs: append/create fails,
+        // and nothing about history.jsonl may change as a result.
+        std::fs::create_dir_all(history_quarantine_path().unwrap()).unwrap();
+
+        let error = append_history(sample_history_entry("added", "2026-03-27T10:03:00Z"))
+            .expect_err("append must fail when the corrupt line cannot be quarantined");
+        assert!(error.contains("quarantine"), "unexpected error: {error}");
+        assert_eq!(
+            d03_read_raw_history(),
+            before,
+            "history.jsonl was rewritten even though quarantine failed"
+        );
+    }
+
+    #[test]
+    fn test_blank_history_lines_are_not_quarantined() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&d03_history_line("good-1", "2026-03-27T10:00:00Z"));
+        raw.extend_from_slice(b"\n\n   \n\t\n");
+        raw.extend_from_slice(&d03_history_line("good-2", "2026-03-27T10:02:00Z"));
+        raw.push(b'\n');
+        d03_write_raw_history(&raw);
+
+        assert_eq!(load_history().unwrap().len(), 2);
+
+        append_history(sample_history_entry("added", "2026-03-27T10:03:00Z")).unwrap();
+        assert!(
+            d03_read_quarantine().is_empty(),
+            "blank lines were treated as corruption"
+        );
+    }
+
+    #[test]
+    fn test_history_read_still_works_after_quarantine_failure() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        d03_seed_torn_history();
+        std::fs::create_dir_all(history_quarantine_path().unwrap()).unwrap();
+
+        assert!(append_history(sample_history_entry("added", "2026-03-27T10:03:00Z")).is_err());
+
+        // The panel must not brick a second time: reading is unaffected by a
+        // failed quarantine.
+        let entries = load_history().unwrap();
+        let ids: Vec<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+        assert_eq!(ids, vec!["good-2", "good-1"]);
+    }
+
+    #[test]
+    fn test_clear_history_removes_quarantine_file() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        d03_seed_torn_history();
+
+        append_history(sample_history_entry("added", "2026-03-27T10:03:00Z")).unwrap();
+        assert!(history_quarantine_path().unwrap().exists());
+
+        clear_history().unwrap();
+
+        assert!(
+            !history_quarantine_path().unwrap().exists(),
+            "an explicit clear left quarantined lines on disk"
+        );
+        assert!(load_history().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_get_history_health_reports_skipped_and_quarantined_counts() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&d03_history_line("good-1", "2026-03-27T10:00:00Z"));
+        raw.push(b'\n');
+        raw.extend_from_slice(b"first bad\n");
+        raw.extend_from_slice(b"second bad\n");
+        d03_write_raw_history(&raw);
+
+        let health = get_history_health().unwrap();
+        assert_eq!(health.skipped_lines, 2);
+        assert_eq!(health.quarantined_lines, 0);
+
+        append_history(sample_history_entry("added", "2026-03-27T10:03:00Z")).unwrap();
+
+        let health = get_history_health().unwrap();
+        assert_eq!(health.skipped_lines, 0);
+        assert_eq!(health.quarantined_lines, 2);
+    }
+
+    // ---------------------------------------------------------------- D03 §七
+    // The collection tree: one unparsable .json must cost only itself.
+
+    fn d03_collection_names(project: &str) -> Vec<String> {
+        get_collection_tree(project.to_string())
+            .unwrap()
+            .iter()
+            .map(|node| node.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn test_collection_tree_skips_unparsable_files() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        create_project("Tree Skip".to_string(), String::new()).unwrap();
+        save_request(
+            "Tree Skip".to_string(),
+            String::new(),
+            sample_saved_request("Get Users", "GET", "http://example.com/users"),
+            None,
+        )
+        .unwrap();
+
+        let collections_dir = temp_home
+            .path()
+            .join("ApiSolo/projects/tree-skip/collections");
+        // A foreign export and a half-written save, the two shapes users hit.
+        std::fs::write(
+            collections_dir.join("openapi.json"),
+            r#"{"openapi":"3.0.0","paths":{}}"#,
+        )
+        .unwrap();
+        std::fs::write(collections_dir.join("torn.request.json"), r#"{"name":"To"#).unwrap();
+
+        assert_eq!(d03_collection_names("Tree Skip"), vec!["Get Users"]);
+        assert!(
+            collections_dir.join("openapi.json").exists()
+                && collections_dir.join("torn.request.json").exists(),
+            "skipping a file must not delete or move it"
+        );
+    }
+
+    #[test]
+    fn test_collection_tree_skips_unparsable_files_in_subfolders() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        create_project("Tree Sub".to_string(), String::new()).unwrap();
+        create_collection("Tree Sub".to_string(), "users".to_string(), String::new()).unwrap();
+        save_request(
+            "Tree Sub".to_string(),
+            "users".to_string(),
+            sample_saved_request("List Users", "GET", "http://example.com/users"),
+            None,
+        )
+        .unwrap();
+        save_request(
+            "Tree Sub".to_string(),
+            String::new(),
+            sample_saved_request("Root Request", "GET", "http://example.com/"),
+            None,
+        )
+        .unwrap();
+
+        let collections_dir = temp_home
+            .path()
+            .join("ApiSolo/projects/tree-sub/collections");
+        std::fs::write(collections_dir.join("users/torn.request.json"), "{").unwrap();
+
+        let tree = get_collection_tree("Tree Sub".to_string()).unwrap();
+        let top: Vec<&str> = tree.iter().map(|node| node.name.as_str()).collect();
+        assert_eq!(top, vec!["users", "Root Request"]);
+
+        let folder = tree.iter().find(|node| node.name == "users").unwrap();
+        let children: Vec<&str> = folder
+            .children
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect();
+        assert_eq!(children, vec!["List Users"]);
+    }
+
+    // ---------------------------------------------------------------- D03 §一
+    // Secret identity. Two CJK-named environments used to share one vault slot.
+
+    fn d03_project_dir(slug: &str) -> PathBuf {
+        PathBuf::from("/tmp/ApiSolo/projects").join(slug)
+    }
+
+    #[test]
+    fn test_vault_keys_are_distinct_for_cjk_environment_names() {
+        let project = d03_project_dir("my-api");
+        let production = vault_key_for(&project, "生产", "token");
+        let staging = vault_key_for(&project, "测试", "token");
+
+        assert_ne!(
+            production, staging,
+            "两个中文环境名共用了同一个密钥槽: {production}"
+        );
+    }
+
+    #[test]
+    fn test_vault_keys_are_distinct_for_cjk_project_names() {
+        let orders = vault_key_for(&d03_project_dir("订单服务"), "dev", "token");
+        let users = vault_key_for(&d03_project_dir("用户服务"), "dev", "token");
+
+        assert_ne!(orders, users, "两个中文项目名共用了同一个密钥槽: {orders}");
+    }
+
+    #[test]
+    fn test_vault_key_keeps_readable_non_ascii_components() {
+        assert_eq!(
+            vault_key_for(&d03_project_dir("my-api"), "生产", "token"),
+            "my-api:生产:dG9rZW4"
+        );
+    }
+
+    #[test]
+    fn test_vault_key_is_derived_from_environment_slug() {
+        let project = d03_project_dir("my-api");
+        let canonical = vault_key_for(&project, "staging", "token");
+
+        for spelling in ["Staging", "STAGING", "  staging  "] {
+            assert_eq!(
+                vault_key_for(&project, spelling, "token"),
+                canonical,
+                "{spelling} should address the same secret as staging"
+            );
+        }
+
+        assert_eq!(
+            vault_key_for(&project, "my env", "token"),
+            vault_key_for(&project, "my_env", "token"),
+            "my env and my_env slugify to the same environment"
+        );
+    }
+
+    // ---------------------------------------------------------------- D03 §二
+    // Vault concurrency. These probes assert one thing precisely: the guard is
+    // already held at the moment the snapshot is about to be read. They do not
+    // stage a lost update — a correct implementation would block the second
+    // writer on the lock, which deadlocks against releasing the first one.
+
+    fn d03_reset_vault_creations() {
+        vault_creations()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    fn d03_vault_creation_count() -> usize {
+        vault_creations()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    #[test]
+    fn test_vault_rmw_lock_is_alive_at_the_checkpoint() {
+        for label in ["save_secret_value", "delete_secret_value"] {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            configure_local_secret_storage_for_test();
+            save_secret_value("K1", "v1").unwrap();
+            save_secret_value("K2", "v2").unwrap();
+
+            let probe = probe_lock_at_checkpoint("vault_rmw_enter", local_vault_tx(), move || {
+                if label == "save_secret_value" {
+                    save_secret_value("K3", "v3")
+                } else {
+                    delete_secret_value("K2")
+                }
+            });
+
+            assert_named_lock_probe(label, &probe, LockVerdict::LockHeld);
+
+            // Trailing state check. It carries no killing power - it passes
+            // under every mutant this test targets - and is here only to show
+            // the command did what it was asked.
+            assert_eq!(load_secret_value("K1").unwrap(), "v1");
+        }
+    }
+
+    #[test]
+    fn test_unlock_lock_is_held_before_the_existence_check() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        clear_secret_vault_session();
+        d03_reset_vault_creations();
+
+        // Brand new HOME: the vault does not exist, so the child is about to
+        // take the `None` branch. Holding the lock only around that branch is
+        // not enough - the decision to enter it is the TOCTOU.
+        let probe = probe_lock_at_checkpoint("vault_unlock_enter", local_vault_tx(), || {
+            unlock_local_secret_storage("test-passphrase")
+        });
+
+        assert_named_lock_probe("unlock", &probe, LockVerdict::LockHeld);
+
+        // Serial second unlock: proves the follow-up took the `Some` branch.
+        // Like the check above it carries no killing power for this invariant.
+        unlock_local_secret_storage("test-passphrase").unwrap();
+        assert_eq!(
+            d03_vault_creation_count(),
+            1,
+            "the vault was created more than once"
+        );
+    }
+
+    // ------------------------------------------------- D03 §一 (migration)
+    // Copying legacy vault entries forward, and recording the collisions the
+    // old key scheme already caused before erasing the evidence of them.
+
+    fn d03_env_file(home: &Path, project_slug: &str, env_stem: &str, secrets: bool) -> PathBuf {
+        let suffix = if secrets {
+            ".env.secrets.json"
+        } else {
+            ".env.json"
+        };
+        home.join("ApiSolo/projects")
+            .join(project_slug)
+            .join("environments")
+            .join(format!("{env_stem}{suffix}"))
+    }
+
+    /// Writes secret metadata the way an older version did: a recorded vault
+    /// key and no value.
+    fn d03_write_recorded_metadata(path: &Path, rows: &[(&str, &str)]) {
+        let variables: Vec<EnvVariable> = rows
+            .iter()
+            .map(|(key, vault_key)| EnvVariable {
+                key: key.to_string(),
+                value: String::new(),
+                secret: true,
+                vault_key: vault_key.to_string(),
+            })
+            .collect();
+        std::fs::write(path, pretty_json(&variables).unwrap()).unwrap();
+    }
+
+    fn d03_read_metadata(path: &Path) -> Vec<EnvVariable> {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn d03_maintenance_json() -> serde_json::Value {
+        match std::fs::read_to_string(vault_maintenance_path().unwrap()) {
+            Ok(text) => serde_json::from_str(&text).unwrap(),
+            Err(_) => serde_json::json!({}),
+        }
+    }
+
+    fn d03_pending_prune() -> Vec<String> {
+        d03_maintenance_json()
+            .get("pendingPrune")
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .map(|value| value.as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    fn d03_env_value(project: &str, env: &str, key: &str) -> String {
+        load_environment(project.to_string(), env.to_string())
+            .unwrap()
+            .variables
+            .into_iter()
+            .find(|variable| variable.key == key)
+            .map(|variable| variable.value)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn test_legacy_vault_entry_is_migrated_on_load() {
+        // Upper case, underscore, punctuation and CJK: four shapes whose old
+        // key differs from the new one.
+        for env_name in ["My Env", "my_env", "prod!", "生产"] {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            create_project("Legacy".to_string(), String::new()).unwrap();
+            configure_local_secret_storage_for_test();
+
+            let project_dir = temp_home.path().join("ApiSolo/projects/legacy");
+            let stem = slugify(env_name);
+            let legacy = legacy_vault_key_for(&project_dir, env_name, "token");
+            let target = vault_key_for(&project_dir, env_name, "token");
+            assert_ne!(legacy, target, "{env_name} needs no migration; bad fixture");
+
+            save_secret_value(&legacy, "PROD-SECRET").unwrap();
+            let secrets_path = d03_env_file(temp_home.path(), "legacy", &stem, true);
+            d03_write_recorded_metadata(&secrets_path, &[("token", &legacy)]);
+
+            assert_eq!(
+                d03_env_value("Legacy", env_name, "token"),
+                "PROD-SECRET",
+                "{env_name}: value did not survive migration"
+            );
+            let metadata = d03_read_metadata(&secrets_path);
+            assert_eq!(metadata[0].vault_key, target, "{env_name}: pointer not flipped");
+
+            // Opening again must be stable, not a second migration.
+            assert_eq!(d03_env_value("Legacy", env_name, "token"), "PROD-SECRET");
+
+            // Half-migrated state: the value already sits under the new key but
+            // the metadata still names the old one. Reopening self-heals.
+            d03_write_recorded_metadata(&secrets_path, &[("token", &legacy)]);
+            assert_eq!(
+                d03_env_value("Legacy", env_name, "token"),
+                "PROD-SECRET",
+                "{env_name}: half-migrated state lost the value"
+            );
+            assert_eq!(d03_read_metadata(&secrets_path)[0].vault_key, target);
+        }
+    }
+
+    #[test]
+    fn test_migration_does_not_overwrite_existing_new_key_value() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Legacy".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/legacy");
+        let legacy = legacy_vault_key_for(&project_dir, "My Env", "token");
+        let target = vault_key_for(&project_dir, "My Env", "token");
+        save_secret_value(&legacy, "old").unwrap();
+        save_secret_value(&target, "new").unwrap();
+
+        let secrets_path = d03_env_file(temp_home.path(), "legacy", "my-env", true);
+        d03_write_recorded_metadata(&secrets_path, &[("token", &legacy)]);
+
+        assert_eq!(
+            d03_env_value("Legacy", "My Env", "token"),
+            "new",
+            "migration overwrote a value the user had already entered"
+        );
+    }
+
+    #[test]
+    fn test_migration_prunes_unreferenced_legacy_vault_key() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Legacy".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/legacy");
+        let legacy = legacy_vault_key_for(&project_dir, "My Env", "token");
+        save_secret_value(&legacy, "PROD-SECRET").unwrap();
+        d03_write_recorded_metadata(
+            &d03_env_file(temp_home.path(), "legacy", "my-env", true),
+            &[("token", &legacy)],
+        );
+
+        assert_eq!(d03_env_value("Legacy", "My Env", "token"), "PROD-SECRET");
+        assert_eq!(
+            load_secret_value(&legacy).unwrap(),
+            "",
+            "the orphaned legacy entry is still in the vault"
+        );
+        assert!(d03_pending_prune().is_empty(), "queue was not resolved");
+    }
+
+    #[test]
+    fn test_migration_keeps_legacy_vault_key_referenced_by_another_environment() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Legacy".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/legacy");
+        // Two CJK names that the old scheme collapsed onto one slot.
+        let shared = legacy_vault_key_for(&project_dir, "生产", "token");
+        assert_eq!(shared, legacy_vault_key_for(&project_dir, "测试", "token"));
+        save_secret_value(&shared, "SURVIVOR").unwrap();
+
+        for stem in ["生产", "测试"] {
+            d03_write_recorded_metadata(
+                &d03_env_file(temp_home.path(), "legacy", stem, true),
+                &[("token", &shared)],
+            );
+        }
+
+        assert_eq!(d03_env_value("Legacy", "生产", "token"), "SURVIVOR");
+        assert_eq!(
+            load_secret_value(&shared).unwrap(),
+            "SURVIVOR",
+            "the shared legacy entry was deleted while 测试 still pointed at it"
+        );
+    }
+
+    #[test]
+    fn test_collided_environments_both_keep_the_surviving_secret() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Legacy".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/legacy");
+        let shared = legacy_vault_key_for(&project_dir, "生产", "token");
+        save_secret_value(&shared, "SURVIVOR").unwrap();
+        for stem in ["生产", "测试"] {
+            d03_write_recorded_metadata(
+                &d03_env_file(temp_home.path(), "legacy", stem, true),
+                &[("token", &shared)],
+            );
+        }
+
+        // Both environments end up holding a copy of the one value that
+        // survived the old overwrite. Neither is blanked: an empty box reads as
+        // "deleted", which misleads harder than a wrong value.
+        assert_eq!(d03_env_value("Legacy", "生产", "token"), "SURVIVOR");
+        assert_eq!(d03_env_value("Legacy", "测试", "token"), "SURVIVOR");
+
+        let production = vault_key_for(&project_dir, "生产", "token");
+        let staging = vault_key_for(&project_dir, "测试", "token");
+        assert_ne!(production, staging);
+        assert_eq!(load_secret_value(&production).unwrap(), "SURVIVOR");
+        assert_eq!(load_secret_value(&staging).unwrap(), "SURVIVOR");
+
+        // From now on they are independent.
+        save_secret_value(&production, "REAL-PROD").unwrap();
+        assert_eq!(load_secret_value(&staging).unwrap(), "SURVIVOR");
+    }
+
+    #[test]
+    fn test_prune_is_skipped_when_a_secrets_metadata_file_is_unreadable() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Legacy".to_string(), String::new()).unwrap();
+        create_project("Unrelated".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/legacy");
+        let legacy = legacy_vault_key_for(&project_dir, "My Env", "token");
+        save_secret_value(&legacy, "PROD-SECRET").unwrap();
+        d03_write_recorded_metadata(
+            &d03_env_file(temp_home.path(), "legacy", "my-env", true),
+            &[("token", &legacy)],
+        );
+
+        // A broken file in a completely different project must stop the whole
+        // round: better an orphan than a wrong deletion.
+        std::fs::write(
+            d03_env_file(temp_home.path(), "unrelated", "dev", true),
+            "{ not json",
+        )
+        .unwrap();
+
+        assert_eq!(d03_env_value("Legacy", "My Env", "token"), "PROD-SECRET");
+        assert_eq!(
+            load_secret_value(&legacy).unwrap(),
+            "PROD-SECRET",
+            "pruned against an index that was known to be incomplete"
+        );
+        assert_eq!(d03_pending_prune(), vec![legacy]);
+    }
+
+    #[test]
+    fn test_prune_respects_implicit_reference_from_empty_vault_key() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Legacy".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/legacy");
+        let shared = legacy_vault_key_for(&project_dir, "生产", "token");
+        save_secret_value(&shared, "SHARED").unwrap();
+
+        // 生产 records the key explicitly; 测试 is older still and records
+        // nothing, so its reference exists only by derivation.
+        d03_write_recorded_metadata(
+            &d03_env_file(temp_home.path(), "legacy", "生产", true),
+            &[("token", &shared)],
+        );
+        std::fs::write(
+            d03_env_file(temp_home.path(), "legacy", "测试", true),
+            r#"[{"key":"token","value":"","secret":true,"vault_key":""}]"#,
+        )
+        .unwrap();
+
+        assert_eq!(d03_env_value("Legacy", "生产", "token"), "SHARED");
+        assert_eq!(
+            load_secret_value(&shared).unwrap(),
+            "SHARED",
+            "deleted a key that an old-format row still referenced implicitly"
+        );
+        assert_eq!(
+            d03_env_value("Legacy", "测试", "token"),
+            "SHARED",
+            "测试 lost its value"
+        );
+    }
+
+    #[test]
+    fn test_collision_candidates_come_from_recorded_keys_only() {
+        // (a) Two environments whose files differ but whose metadata names the
+        // same old key. Recomputing a candidate from the file stem finds
+        // neither, so the collision would go unrecorded and migration would
+        // then erase the only evidence it ever happened.
+        {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            create_project("Rec".to_string(), String::new()).unwrap();
+            configure_local_secret_storage_for_test();
+
+            let project_dir = temp_home.path().join("ApiSolo/projects/rec");
+            let recorded = legacy_vault_key_for(&project_dir, "a_b", "token");
+            // Fixture self-check: the two names really do land on different
+            // files while sharing one recorded key.
+            assert_eq!(slugify("a.b"), "ab");
+            assert_eq!(slugify("a_b"), "a-b");
+            assert_eq!(recorded, legacy_vault_key_for(&project_dir, "a.b", "token"));
+            save_secret_value(&recorded, "SHARED").unwrap();
+
+            for stem in ["ab", "a-b"] {
+                d03_write_recorded_metadata(
+                    &d03_env_file(temp_home.path(), "rec", stem, true),
+                    &[("token", &recorded)],
+                );
+            }
+
+            load_environment("Rec".to_string(), "a.b".to_string()).unwrap();
+
+            let collisions = get_secret_key_collisions().unwrap();
+            assert_eq!(collisions.len(), 1, "collision was not recorded");
+            assert_eq!(
+                collisions[0].legacy_vault_key, recorded,
+                "recorded the recomputed guess instead of the key that really existed"
+            );
+            assert_eq!(collisions[0].variable_key, "token");
+            assert_eq!(collisions[0].environments.len(), 2);
+        }
+
+        // (b) The recorded key points at something the vault no longer has,
+        // while the *derived* key is one another environment genuinely uses.
+        // Falling back to the derived candidate would copy that environment's
+        // credential into this one - and sub-case (a) cannot see that at all.
+        {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            create_project("Rec".to_string(), String::new()).unwrap();
+            configure_local_secret_storage_for_test();
+
+            let project_dir = temp_home.path().join("ApiSolo/projects/rec");
+            let gone = format!(
+                "rec:GONE:{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("token")
+            );
+            let derived = legacy_vault_key_for(&project_dir, "生产", "token");
+            assert_eq!(derived, legacy_vault_key_for(&project_dir, "测试", "token"));
+            save_secret_value(&derived, "TEST-SECRET").unwrap();
+
+            d03_write_recorded_metadata(
+                &d03_env_file(temp_home.path(), "rec", "生产", true),
+                &[("token", &gone)],
+            );
+            d03_write_recorded_metadata(
+                &d03_env_file(temp_home.path(), "rec", "测试", true),
+                &[("token", &derived)],
+            );
+
+            assert_eq!(
+                d03_env_value("Rec", "生产", "token"),
+                "",
+                "生产 was handed 测试's credential"
+            );
+            assert!(
+                get_secret_key_collisions().unwrap().is_empty(),
+                "invented a collision from a guessed key"
+            );
+            assert!(
+                !d03_pending_prune().contains(&derived),
+                "queued another environment's live key for deletion"
+            );
+            assert_eq!(load_secret_value(&derived).unwrap(), "TEST-SECRET");
+        }
+    }
+
+    #[test]
+    fn test_migration_aborts_when_collision_record_cannot_be_persisted() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Legacy".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/legacy");
+        let shared = legacy_vault_key_for(&project_dir, "生产", "token");
+        save_secret_value(&shared, "SURVIVOR").unwrap();
+        let secrets_path = d03_env_file(temp_home.path(), "legacy", "生产", true);
+        for stem in ["生产", "测试"] {
+            d03_write_recorded_metadata(
+                &d03_env_file(temp_home.path(), "legacy", stem, true),
+                &[("token", &shared)],
+            );
+        }
+
+        // Only the record fails; scratch stays writable on purpose. An
+        // unwritable scratch would also stop the queue write on the next line,
+        // and then a version that drops the record's error would fail there
+        // instead - same error, same intact vault, same unflipped pointer, so
+        // nothing would distinguish it. Measured: under an unwritable scratch
+        // that mutant survived the whole suite.
+        let outcome = {
+            let _failure = CollisionRecordFailure::on();
+            load_environment("Legacy".to_string(), "生产".to_string())
+        };
+
+        assert!(
+            outcome.is_err(),
+            "load must fail when the collision record cannot land"
+        );
+        assert_eq!(
+            load_secret_value(&shared).unwrap(),
+            "SURVIVOR",
+            "cleaned up the legacy key without recording the collision"
+        );
+        assert_eq!(
+            d03_read_metadata(&secrets_path)[0].vault_key, shared,
+            "flipped the pointer without recording the collision"
+        );
+    }
+
+    #[test]
+    fn test_collision_record_survives_reload_until_acknowledged() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Legacy".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/legacy");
+        let shared = legacy_vault_key_for(&project_dir, "生产", "token");
+        save_secret_value(&shared, "SURVIVOR").unwrap();
+        for stem in ["生产", "测试"] {
+            d03_write_recorded_metadata(
+                &d03_env_file(temp_home.path(), "legacy", stem, true),
+                &[("token", &shared)],
+            );
+        }
+
+        load_environment("Legacy".to_string(), "生产".to_string()).unwrap();
+        assert_eq!(get_secret_key_collisions().unwrap().len(), 1);
+
+        // Completing the migration, reloading either environment, and reading
+        // the file again must all leave the record alone.
+        for _ in 0..2 {
+            load_environment("Legacy".to_string(), "生产".to_string()).unwrap();
+            load_environment("Legacy".to_string(), "测试".to_string()).unwrap();
+        }
+        assert_eq!(
+            get_secret_key_collisions().unwrap().len(),
+            1,
+            "the collision record was quietly dropped"
+        );
+        assert_eq!(
+            d03_maintenance_json()["collisions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        acknowledge_secret_key_collision(shared).unwrap();
+        assert!(get_secret_key_collisions().unwrap().is_empty());
+    }
+
+    // ---------------------------------------------------------------- D03 §四
+    // Creating, saving and deleting environments.
+
+    fn d03_env_dir_names(home: &Path, project_slug: &str) -> Vec<String> {
+        d03_dir_file_names(
+            &home
+                .join("ApiSolo/projects")
+                .join(project_slug)
+                .join("environments"),
+        )
+    }
+
+    fn d03_env(name: &str, variables: Vec<EnvVariable>) -> Environment {
+        Environment {
+            name: name.to_string(),
+            variables,
+        }
+    }
+
+    #[test]
+    fn test_save_environment_rejects_conflicting_slug() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Slug".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        save_environment(
+            "Slug".to_string(),
+            d03_env("staging", vec![sample_env_variable("baseUrl", "http://a", false)]),
+            Some(true),
+        )
+        .unwrap();
+
+        for conflicting in ["STAGING", "Staging"] {
+            let error = save_environment(
+                "Slug".to_string(),
+                d03_env(conflicting, vec![sample_env_variable("baseUrl", "http://b", false)]),
+                Some(true),
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("staging"),
+                "the error must name the environment it collides with: {error}"
+            );
+        }
+
+        // The original is untouched.
+        let variables = load_environment("Slug".to_string(), "staging".to_string())
+            .unwrap()
+            .variables;
+        assert_eq!(variables[0].value, "http://a");
+    }
+
+    #[test]
+    fn test_conflicting_slug_rejection_touches_no_disk_state() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Slug".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        save_environment(
+            "Slug".to_string(),
+            d03_env("staging", vec![sample_env_variable("token", "secret", true)]),
+            Some(true),
+        )
+        .unwrap();
+
+        // Corrupt the metadata deliberately: rejecting must not "helpfully"
+        // quarantine it on the way out, which would leave a renamed backup
+        // behind and make the rejection visible on disk.
+        let secrets_path = d03_env_file(temp_home.path(), "slug", "staging", true);
+        let normal_path = d03_env_file(temp_home.path(), "slug", "staging", false);
+        std::fs::write(&secrets_path, "{ not json").unwrap();
+
+        let before_secrets = std::fs::read(&secrets_path).unwrap();
+        let before_normal = std::fs::read(&normal_path).unwrap();
+        let before_names = d03_env_dir_names(temp_home.path(), "slug");
+
+        assert!(save_environment(
+            "Slug".to_string(),
+            d03_env("STAGING", vec![sample_env_variable("token", "other", true)]),
+            Some(true),
+        )
+        .is_err());
+
+        assert_eq!(std::fs::read(&secrets_path).unwrap(), before_secrets);
+        assert_eq!(std::fs::read(&normal_path).unwrap(), before_normal);
+        assert_eq!(
+            d03_env_dir_names(temp_home.path(), "slug"),
+            before_names,
+            "the rejected save left a new file behind"
+        );
+    }
+
+    #[test]
+    fn test_save_environment_updates_existing_environment() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Slug".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        save_environment(
+            "Slug".to_string(),
+            d03_env("staging", vec![sample_env_variable("baseUrl", "http://a", false)]),
+            Some(true),
+        )
+        .unwrap();
+
+        // create=Some(false) and create=None are both updates and must pass
+        // straight through the guard.
+        for (label, create) in [("explicit-false", Some(false)), ("absent", None)] {
+            save_environment(
+                "Slug".to_string(),
+                d03_env(
+                    "staging",
+                    vec![sample_env_variable("baseUrl", &format!("http://{label}"), false)],
+                ),
+                create,
+            )
+            .unwrap_or_else(|error| panic!("{label}: update was rejected: {error}"));
+
+            let variables = load_environment("Slug".to_string(), "staging".to_string())
+                .unwrap()
+                .variables;
+            assert_eq!(variables[0].value, format!("http://{label}"));
+        }
+    }
+
+    #[test]
+    fn test_save_environment_removes_vault_value_for_deleted_secret() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Del".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        save_environment(
+            "Del".to_string(),
+            d03_env(
+                "dev",
+                vec![
+                    sample_env_variable("keep", "keep-value", true),
+                    sample_env_variable("drop", "drop-value", true),
+                ],
+            ),
+            Some(true),
+        )
+        .unwrap();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/del");
+        let dropped = vault_key_for(&project_dir, "dev", "drop");
+        let kept = vault_key_for(&project_dir, "dev", "keep");
+        assert_eq!(load_secret_value(&dropped).unwrap(), "drop-value");
+
+        save_environment(
+            "Del".to_string(),
+            d03_env("dev", vec![sample_env_variable("keep", "keep-value", true)]),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_secret_value(&dropped).unwrap(),
+            "",
+            "the removed secret's value is still in the backend"
+        );
+        assert_eq!(load_secret_value(&kept).unwrap(), "keep-value");
+    }
+
+    #[test]
+    fn test_save_environment_removes_vault_value_for_renamed_or_demoted_secret() {
+        for (label, replacement) in [
+            ("renamed", sample_env_variable("tokenV2", "token-value", true)),
+            ("demoted", sample_env_variable("token", "token-value", false)),
+        ] {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            create_project("Ren".to_string(), String::new()).unwrap();
+            configure_local_secret_storage_for_test();
+
+            save_environment(
+                "Ren".to_string(),
+                d03_env("dev", vec![sample_env_variable("token", "token-value", true)]),
+                Some(true),
+            )
+            .unwrap();
+
+            let project_dir = temp_home.path().join("ApiSolo/projects/ren");
+            let original = vault_key_for(&project_dir, "dev", "token");
+            assert_eq!(load_secret_value(&original).unwrap(), "token-value");
+
+            save_environment("Ren".to_string(), d03_env("dev", vec![replacement]), None).unwrap();
+
+            assert_eq!(
+                load_secret_value(&original).unwrap(),
+                "",
+                "{label}: the old vault entry outlived the variable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_save_environment_quarantines_unreadable_secret_metadata() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Quar".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        let secrets_path = d03_env_file(temp_home.path(), "quar", "dev", true);
+        std::fs::create_dir_all(secrets_path.parent().unwrap()).unwrap();
+        let original = br#"[{"key":"token","value":"","secret":true,"vault_key":"#.to_vec();
+        std::fs::write(&secrets_path, &original).unwrap();
+
+        // Update path: no `create` flag, so the guard does not fire.
+        save_environment(
+            "Quar".to_string(),
+            d03_env("dev", vec![sample_env_variable("token", "fresh", true)]),
+            None,
+        )
+        .unwrap();
+
+        let quarantined: Vec<String> = d03_env_dir_names(temp_home.path(), "quar")
+            .into_iter()
+            .filter(|name| name.contains(".corrupt-"))
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "expected exactly one quarantined file, saw {quarantined:?}"
+        );
+        assert!(quarantined[0].starts_with("dev.env.secrets.corrupt-"));
+        assert_eq!(
+            std::fs::read(
+                temp_home
+                    .path()
+                    .join("ApiSolo/projects/quar/environments")
+                    .join(&quarantined[0])
+            )
+            .unwrap(),
+            original,
+            "the quarantined file's bytes were modified"
+        );
+    }
+
+    #[test]
+    fn test_load_environment_fails_loudly_on_unreadable_environment_file() {
+        for secrets in [false, true] {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            create_project("Loud".to_string(), String::new()).unwrap();
+            configure_local_secret_storage_for_test();
+
+            save_environment(
+                "Loud".to_string(),
+                d03_env("dev", vec![sample_env_variable("baseUrl", "http://a", false)]),
+                Some(true),
+            )
+            .unwrap();
+
+            let path = d03_env_file(temp_home.path(), "loud", "dev", secrets);
+            std::fs::write(&path, "{ not json").unwrap();
+
+            // Rendering an unreadable environment as empty is the lie that
+            // makes the next save wipe it.
+            assert!(
+                load_environment("Loud".to_string(), "dev".to_string()).is_err(),
+                "secrets={secrets}: an unreadable environment loaded as empty"
+            );
+        }
+    }
+
+    #[test]
+    fn test_delete_environment_keeps_secrets_another_environment_still_uses() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Legacy".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        // Un-migrated collided pair: both name the same old key.
+        let project_dir = temp_home.path().join("ApiSolo/projects/legacy");
+        let shared = legacy_vault_key_for(&project_dir, "生产", "token");
+        save_secret_value(&shared, "SURVIVOR").unwrap();
+        for stem in ["生产", "测试"] {
+            d03_write_recorded_metadata(
+                &d03_env_file(temp_home.path(), "legacy", stem, true),
+                &[("token", &shared)],
+            );
+        }
+
+        delete_environment("Legacy".to_string(), "测试".to_string()).unwrap();
+
+        assert_eq!(
+            load_secret_value(&shared).unwrap(),
+            "SURVIVOR",
+            "deleting 测试 took 生产's token with it"
+        );
+        assert_eq!(d03_env_value("Legacy", "生产", "token"), "SURVIVOR");
+    }
+
+    // ------------------------------------------- D03 §一/§三 (maintenance)
+    // The maintenance file's lock, and the cleanup queue's survival across
+    // every way a round can fail to finish.
+
+    fn d03_seed_maintenance(collisions: &[&str], pending: &[&str]) {
+        let snapshot = MaintenanceSnapshot {
+            version: MAINTENANCE_VERSION,
+            collisions: collisions
+                .iter()
+                .map(|key| SecretKeyCollision {
+                    legacy_vault_key: (*key).to_string(),
+                    variable_key: "token".to_string(),
+                    environments: vec![
+                        EnvironmentRef {
+                            project: "legacy".to_string(),
+                            environment: "生产".to_string(),
+                        },
+                        EnvironmentRef {
+                            project: "legacy".to_string(),
+                            environment: "测试".to_string(),
+                        },
+                    ],
+                    detected_at: "2026-08-18T00:00:00Z".to_string(),
+                })
+                .collect(),
+            pending_prune: pending.iter().map(|key| (*key).to_string()).collect(),
+            last_failure: None,
+        };
+        write_maintenance_snapshot(&snapshot).unwrap();
+    }
+
+    fn d03_last_failure() -> Option<serde_json::Value> {
+        d03_maintenance_json()
+            .get("lastFailure")
+            .filter(|value| !value.is_null())
+            .cloned()
+    }
+
+    /// Asserts the failure marker records a classification and nothing else.
+    /// A structural check, not a search for a particular error string: a
+    /// negative assertion would pass simply because the injected sentinel never
+    /// appeared in serde's message.
+    fn d03_assert_failure_marker(kind: &str) {
+        let failure = d03_last_failure().expect("no failure marker was written");
+        let object = failure.as_object().expect("lastFailure is not an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["at", "kind"],
+            "the failure marker carries fields beyond the classification"
+        );
+        assert_eq!(object["kind"], serde_json::json!(kind));
+        assert!(
+            !object["at"].as_str().unwrap_or_default().is_empty(),
+            "failure marker has no timestamp"
+        );
+    }
+
+    struct CollisionRecordFailure;
+
+    impl CollisionRecordFailure {
+        fn on() -> Self {
+            set_collision_record_failure(true);
+            Self
+        }
+    }
+
+    impl Drop for CollisionRecordFailure {
+        fn drop(&mut self) {
+            set_collision_record_failure(false);
+        }
+    }
+
+    struct SystemVaultFailure;
+
+    impl SystemVaultFailure {
+        fn on() -> Self {
+            set_system_secret_vault_failure(true);
+            Self
+        }
+    }
+
+    impl Drop for SystemVaultFailure {
+        fn drop(&mut self) {
+            set_system_secret_vault_failure(false);
+        }
+    }
+
+    fn d03_reset_system_vault() {
+        test_system_secret_vault()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        set_system_secret_vault_failure(false);
+    }
+
+    #[test]
+    fn test_maintenance_lock_is_alive_at_the_checkpoint() {
+        for function in [
+            "record_vault_key_collisions",
+            "acknowledge_secret_key_collision",
+            "enqueue_pending_prune",
+            "read_pending_prune",
+            "resolve_pending_prune",
+        ] {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            d03_seed_maintenance(&["GROUP-A", "GROUP-B"], &["queued"]);
+
+            let probe =
+                probe_lock_at_checkpoint("maintenance_enter", vault_maintenance_tx(), move || {
+                    match function {
+                        "record_vault_key_collisions" => {
+                            let index = VaultKeyIndex {
+                                refs: BTreeMap::new(),
+                                complete: true,
+                            };
+                            record_vault_key_collisions(&["queued".to_string()], &index)
+                        }
+                        "acknowledge_secret_key_collision" => {
+                            acknowledge_secret_key_collision("GROUP-A".to_string())
+                        }
+                        "enqueue_pending_prune" => enqueue_pending_prune(&["other".to_string()]),
+                        "read_pending_prune" => read_pending_prune().map(|_| ()),
+                        _ => resolve_pending_prune(&["queued".to_string()]),
+                    }
+                });
+
+            assert_named_lock_probe(function, &probe, LockVerdict::LockHeld);
+        }
+
+        // One installed gate, two arrivals: the second must pass straight
+        // through. Otherwise any correct implementation that touches the file
+        // twice deadlocks against a test that releases once.
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        d03_seed_maintenance(&["GROUP-A", "GROUP-B"], &[]);
+
+        let probe = probe_lock_at_checkpoint("maintenance_enter", vault_maintenance_tx(), || {
+            enqueue_pending_prune(&["queued-by-child".to_string()])?;
+            acknowledge_secret_key_collision("GROUP-A".to_string())
+        });
+        assert_named_lock_probe("two arrivals", &probe, LockVerdict::LockHeld);
+
+        let remaining = get_secret_key_collisions().unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "the second call never completed: {remaining:?}",
+            remaining = remaining
+                .iter()
+                .map(|collision| collision.legacy_vault_key.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(remaining[0].legacy_vault_key, "GROUP-B");
+        assert_eq!(d03_pending_prune(), vec!["queued-by-child".to_string()]);
+    }
+
+    #[test]
+    fn test_pending_prune_survives_every_interruption_point() {
+        // (a) Reading the queue is non-destructive. An earlier design took the
+        // queue out of the file first; a crash before the deletion then lost
+        // the cleanup intent for good.
+        {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            d03_seed_maintenance(&[], &["orphan-key"]);
+            let before = std::fs::read(vault_maintenance_path().unwrap()).unwrap();
+
+            assert_eq!(read_pending_prune().unwrap(), vec!["orphan-key".to_string()]);
+
+            assert_eq!(
+                std::fs::read(vault_maintenance_path().unwrap()).unwrap(),
+                before,
+                "reading the queue rewrote the file"
+            );
+        }
+
+        // (b) Interrupted between the delete and the resolve: the entry is
+        // already gone from the backend, so the retry confirms it and clears
+        // the queue rather than blocking on it forever.
+        {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            create_project("Retry".to_string(), String::new()).unwrap();
+            configure_local_secret_storage_for_test();
+            save_environment(
+                "Retry".to_string(),
+                d03_env("dev", vec![sample_env_variable("token", "value", true)]),
+                Some(true),
+            )
+            .unwrap();
+            d03_seed_maintenance(&[], &["already-deleted-key"]);
+
+            load_environment("Retry".to_string(), "dev".to_string()).unwrap();
+
+            assert!(
+                d03_pending_prune().is_empty(),
+                "a key confirmed absent stayed queued forever"
+            );
+        }
+
+        // (c) The index could not be trusted because of an unrelated broken
+        // file. Nothing is deleted and nothing leaves the queue.
+        {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            create_project("Retry".to_string(), String::new()).unwrap();
+            create_project("Unrelated".to_string(), String::new()).unwrap();
+            configure_local_secret_storage_for_test();
+            save_environment(
+                "Retry".to_string(),
+                d03_env("dev", vec![sample_env_variable("token", "value", true)]),
+                Some(true),
+            )
+            .unwrap();
+            save_secret_value("orphan-key", "orphan-value").unwrap();
+            d03_seed_maintenance(&[], &["orphan-key"]);
+            std::fs::write(
+                d03_env_file(temp_home.path(), "unrelated", "dev", true),
+                "{ not json",
+            )
+            .unwrap();
+
+            load_environment("Retry".to_string(), "dev".to_string()).unwrap();
+
+            assert_eq!(d03_pending_prune(), vec!["orphan-key".to_string()]);
+            assert_eq!(load_secret_value("orphan-key").unwrap(), "orphan-value");
+            d03_assert_failure_marker("index-incomplete");
+        }
+
+        // (d) Still referenced by another environment: it stays queued while
+        // the rest of the batch completes.
+        {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            create_project("Retry".to_string(), String::new()).unwrap();
+            configure_local_secret_storage_for_test();
+            save_environment(
+                "Retry".to_string(),
+                d03_env("dev", vec![sample_env_variable("token", "value", true)]),
+                Some(true),
+            )
+            .unwrap();
+            save_environment(
+                "Retry".to_string(),
+                d03_env("other", vec![sample_env_variable("token", "other", true)]),
+                Some(true),
+            )
+            .unwrap();
+
+            let project_dir = temp_home.path().join("ApiSolo/projects/retry");
+            let referenced = vault_key_for(&project_dir, "other", "token");
+            save_secret_value("free-orphan", "gone-soon").unwrap();
+            d03_seed_maintenance(&[], &[&referenced, "free-orphan"]);
+
+            load_environment("Retry".to_string(), "dev".to_string()).unwrap();
+
+            assert_eq!(
+                d03_pending_prune(),
+                vec![referenced.clone()],
+                "the referenced key left the queue, or the free one did not"
+            );
+            assert_eq!(load_secret_value(&referenced).unwrap(), "other");
+            assert_eq!(load_secret_value("free-orphan").unwrap(), "");
+        }
+
+        // (e) The backend genuinely refuses. Driven through load_environment,
+        // not through the helper: the mutant this kills lives in the caller,
+        // and calling the helper directly leaves pending unchanged either way.
+        //
+        // The refusal is injected in the keychain stub rather than by making
+        // scratch read-only, because an unwritable scratch would also stop the
+        // wrong-resolve mutant from shortening the queue and the test would
+        // pass under it.
+        {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            d03_reset_system_vault();
+            create_project("Retry".to_string(), String::new()).unwrap();
+            configure_secret_storage("system-keychain".to_string(), None).unwrap();
+
+            let project_dir = temp_home.path().join("ApiSolo/projects/retry");
+            let legacy = legacy_vault_key_for(&project_dir, "My Env", "token");
+            let target = vault_key_for(&project_dir, "My Env", "token");
+            save_secret_value(&legacy, "LEGACY-SECRET").unwrap();
+            d03_write_recorded_metadata(
+                &d03_env_file(temp_home.path(), "retry", "my-env", true),
+                &[("token", &legacy)],
+            );
+
+            {
+                let _failure = SystemVaultFailure::on();
+                // Cleanup failure must not block the user.
+                assert_eq!(
+                    d03_env_value("Retry", "My Env", "token"),
+                    "LEGACY-SECRET",
+                    "a failed cleanup blocked the load"
+                );
+                assert_eq!(
+                    d03_pending_prune(),
+                    vec![legacy.clone()],
+                    "the queue was cleared even though the delete failed"
+                );
+                assert_eq!(load_secret_value(&legacy).unwrap(), "LEGACY-SECRET");
+                d03_assert_failure_marker("backend-delete");
+            }
+
+            // Fault cleared: the retry finishes on the next load.
+            assert_eq!(d03_env_value("Retry", "My Env", "token"), "LEGACY-SECRET");
+            assert_eq!(load_secret_value(&legacy).unwrap(), "");
+            assert_eq!(load_secret_value(&target).unwrap(), "LEGACY-SECRET");
+            assert!(d03_pending_prune().is_empty());
+            d03_reset_system_vault();
+        }
+
+        // (f) delete_environment drains the queue before its "does not exist"
+        // early return. A previous call may have removed the files without
+        // finishing cleanup, and this is the only entry point a user retries.
+        {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            create_project("Retry".to_string(), String::new()).unwrap();
+            configure_local_secret_storage_for_test();
+            save_secret_value("left-behind", "still-here").unwrap();
+            d03_seed_maintenance(&[], &["left-behind"]);
+
+            let outcome = delete_environment("Retry".to_string(), "gone".to_string());
+
+            assert!(outcome.is_err(), "the environment really is absent");
+            assert_eq!(
+                load_secret_value("left-behind").unwrap(),
+                "",
+                "the early return skipped the queue"
+            );
+            assert!(d03_pending_prune().is_empty());
+        }
+    }
+
+    /// Saving a secret writes its value into the backend first and publishes
+    /// the metadata that names it afterwards. In between, the value exists and
+    /// nothing on disk references it - and the cleanup thread's own composite,
+    /// "scan for references, then delete what nothing names", straddles exactly
+    /// that gap. A key left in the queue by an earlier round and then typed in
+    /// again by the user is deleted between the two writes, after which the
+    /// environment points at an empty vault slot for good.
+    ///
+    /// Driven through `delete_environment`, which drains the queue ahead of its
+    /// "does not exist" early return: the deletion this reproduces happens
+    /// inside a production entry point, not in a helper called by hand.
+    ///
+    /// The wait below is not what makes the outcome deterministic. Without the
+    /// exclusion the cleanup runs to completion on local files in milliseconds;
+    /// with it the cleanup cannot proceed until the parked save is released, so
+    /// the scan that follows sees the published metadata. The assertion reads
+    /// the same either way - the value that was saved is still there, or it is
+    /// not.
+    #[test]
+    fn test_a_queued_key_is_not_pruned_while_it_is_being_saved() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Race".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/race");
+        let key = vault_key_for(&project_dir, "dev", "token");
+
+        // The state an interrupted cleanup round leaves behind: the key is
+        // queued for deletion and nothing on disk names it.
+        d03_seed_maintenance(&[], &[&key]);
+        assert_eq!(
+            d03_pending_prune(),
+            vec![key.clone()],
+            "fixture: the queue was not seeded, so nothing here could prune"
+        );
+
+        let saved_key = key.clone();
+        let run = with_thread_parked_at(
+            "secret_values_written",
+            move || {
+                save_environment(
+                    "Race".to_string(),
+                    d03_env("dev", vec![sample_env_variable("token", "RESTORED", true)]),
+                    Some(true),
+                )
+            },
+            || {
+                let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+                let cleanup = std::thread::spawn(move || {
+                    let outcome = delete_environment("Race".to_string(), "gone".to_string());
+                    let _ = finished_tx.send(());
+                    outcome
+                });
+                let finished = finished_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .is_ok();
+                (cleanup, finished)
+            },
+        );
+
+        let (cleanup, cleanup_finished_while_parked) = run
+            .probe
+            .expect("the save never reached the checkpoint, so no interleaving was tested");
+        let cleanup_outcome = match cleanup.join() {
+            Ok(outcome) => format!("{outcome:?}"),
+            Err(_) => "panicked".to_string(),
+        };
+
+        assert_eq!(
+            load_secret_value(&saved_key).unwrap(),
+            "RESTORED",
+            "the cleanup deleted the value this save had just written \
+             (cleanup finished while the save was parked: {cleanup_finished_while_parked}, \
+             cleanup returned {cleanup_outcome}, save returned {returned:?}, child_ok={child_ok})",
+            returned = run.returned,
+            child_ok = run.child_ok
+        );
+    }
+
+    /// The second half of the same window, on the other side of the pair.
+    /// R2 closed the gap between writing a secret and publishing the metadata
+    /// naming it; this one is the gap between *reading* that metadata and
+    /// rewriting it. A load reads the file, migration decides what the file
+    /// should say, and the file is rewritten from that decision - so a save
+    /// that lands in between is not merely raced, it is erased: the load
+    /// rewrites the metadata from a list that predates the new variable, and
+    /// the value saved for it stays in the vault with nothing naming it.
+    ///
+    /// The save reports success, which is what makes this worse than a lost
+    /// update. Nothing at any layer says the variable did not survive.
+    #[test]
+    fn test_a_stale_load_cannot_erase_a_secret_saved_while_it_was_reading() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Race".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        // Old-format metadata, so the load has migration work to do and really
+        // does reach the rewrite. Without that `changed` stays false and the
+        // load never writes, which would make this test pass for a reason that
+        // has nothing to do with the lock.
+        let project_dir = temp_home.path().join("ApiSolo/projects/race");
+        let legacy = legacy_vault_key_for(&project_dir, "My Env", "token");
+        save_secret_value(&legacy, "LEGACY-A").unwrap();
+        d03_write_recorded_metadata(
+            &d03_env_file(temp_home.path(), "race", "my-env", true),
+            &[("token", &legacy)],
+        );
+
+        let run = with_thread_parked_at(
+            "environment_metadata_read",
+            || load_environment("Race".to_string(), "My Env".to_string()).map(|_| ()),
+            || {
+                let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+                let save = std::thread::spawn(move || {
+                    let outcome = save_environment(
+                        "Race".to_string(),
+                        d03_env(
+                            "My Env",
+                            vec![
+                                sample_env_variable("token", "LEGACY-A", true),
+                                sample_env_variable("added", "NEW-B", true),
+                            ],
+                        ),
+                        None,
+                    );
+                    let _ = finished_tx.send(());
+                    outcome
+                });
+                let finished = finished_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+                (save, finished)
+            },
+        );
+
+        let (save, save_finished_while_parked) = run
+            .probe
+            .expect("the load never reached the checkpoint, so no interleaving was tested");
+        let save_outcome = match save.join() {
+            Ok(outcome) => format!("{outcome:?}"),
+            Err(_) => "panicked".to_string(),
+        };
+
+        assert_eq!(
+            d03_env_value("Race", "My Env", "added"),
+            "NEW-B",
+            "a load that had already read the old metadata rewrote it and dropped the \
+             variable this save added (save finished while the load was parked: \
+             {save_finished_while_parked}, save returned {save_outcome}, load returned \
+             {returned:?}, child_ok={child_ok})",
+            returned = run.returned,
+            child_ok = run.child_ok
+        );
+    }
+
+    // ------------------------------------------------ D03 §六 (every writer)
+    // Each of the nine production writers, driven through its own command with
+    // its target directory read-only. Testing write_atomic alone proves nothing
+    // about whether a given call site actually uses it.
+    //
+    // Why a read-only directory: it stops `create_new` from making a temp file,
+    // but it does NOT stop `fs::write` from opening an existing file and
+    // truncating it. So a call site reverted to fs::write shows up as a changed
+    // target, which is exactly the damage this invariant is about.
+
+    fn d03_with_readonly_dir<T>(dir: &Path, body: impl FnOnce() -> T) -> T {
+        let restore = std::fs::metadata(dir).unwrap().permissions();
+        let mut readonly = restore.clone();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut readonly, 0o555);
+        std::fs::set_permissions(dir, readonly).unwrap();
+        let outcome = body();
+        std::fs::set_permissions(dir, restore).unwrap();
+        outcome
+    }
+
+    /// The list below is derived from the producing side, not copied from the
+    /// plan. Copying the plan is how it went wrong the first time: the table
+    /// was the spec's nine-row survey of the writes that existed when the spec
+    /// was written, so `write_maintenance_snapshot` - added by this same slice,
+    /// after that survey - was never in it and nothing noticed.
+    ///
+    /// Regenerate with, over the production half of this file:
+    ///   grep -n 'write_atomic(' src-tauri/src/lib.rs
+    ///   grep -n 'fs::write(\|File::create(' src-tauri/src/lib.rs
+    ///
+    /// Ten call sites, all covered below: write_history_entries,
+    /// write_project_meta, write_secret_storage_config, write_local_secret_map,
+    /// write_maintenance_snapshot, write_secret_metadata, save_request,
+    /// rename_request, move_request, and save_environment's plain file.
+    ///
+    /// One `fs::write` survives on purpose, for window-state.json, which
+    /// PRODUCT lists as a non-goal: it is regenerated from scratch on every
+    /// launch and losing it costs a window size. The history file's
+    /// pre-creation used to be the second one and is now gone entirely.
+    #[test]
+    fn test_every_production_writer_leaves_target_intact_on_failure() {
+        for writer in [
+            "write_history_entries",
+            "write_project_meta",
+            "write_secret_storage_config",
+            "write_local_secret_map",
+            "write_maintenance_snapshot",
+            "write_secret_metadata",
+            "save_request",
+            "rename_request",
+            "move_request",
+            "save_environment_normal_file",
+        ] {
+            let _guard = lock_env();
+            let temp_home = tempdir().unwrap();
+            let _home_guard = HomeGuard::set(temp_home.path());
+            d03_reset_system_vault();
+
+            let scratch = temp_home.path().join("ApiSolo/scratch");
+            let project_dir = temp_home.path().join("ApiSolo/projects/writers");
+            let collections = project_dir.join("collections");
+            let environments = project_dir.join("environments");
+
+            // Every case needs the target to already exist with known bytes;
+            // otherwise `fs::write` would fail too and the mutant would hide
+            // behind the same error.
+            let (target, dir, action): (PathBuf, PathBuf, Box<dyn Fn() -> Result<(), String>>) =
+                match writer {
+                    "write_history_entries" => {
+                        append_history(sample_history_entry("A", "2026-03-27T10:00:00Z")).unwrap();
+                        (
+                            history_file_path().unwrap(),
+                            scratch.clone(),
+                            Box::new(|| {
+                                append_history(sample_history_entry("B", "2026-03-27T10:01:00Z"))
+                            }),
+                        )
+                    }
+                    "write_project_meta" => {
+                        create_project("Writers".to_string(), String::new()).unwrap();
+                        save_request(
+                            "Writers".to_string(),
+                            String::new(),
+                            sample_saved_request("Req", "GET", "http://example.com/"),
+                            None,
+                        )
+                        .unwrap();
+                        (
+                            project_dir.join(PROJECT_META_FILE),
+                            project_dir.clone(),
+                            Box::new(|| {
+                                // Ends in touch_project; collections/ is still
+                                // writable, so only the meta write can fail.
+                                save_request(
+                                    "Writers".to_string(),
+                                    String::new(),
+                                    sample_saved_request("Req", "POST", "http://example.com/"),
+                                    Some("req.request.json".to_string()),
+                                )
+                            }),
+                        )
+                    }
+                    "write_secret_storage_config" => {
+                        configure_secret_storage("system-keychain".to_string(), None).unwrap();
+                        (
+                            secret_storage_config_path().unwrap(),
+                            scratch.clone(),
+                            Box::new(|| {
+                                configure_secret_storage("system-keychain".to_string(), None)
+                                    .map(|_| ())
+                            }),
+                        )
+                    }
+                    "write_local_secret_map" => {
+                        configure_local_secret_storage_for_test();
+                        save_secret_value("K1", "v1").unwrap();
+                        (
+                            local_secret_vault_path().unwrap(),
+                            scratch.clone(),
+                            Box::new(|| save_secret_value("K2", "v2")),
+                        )
+                    }
+                    "write_maintenance_snapshot" => {
+                        // Seeded so the target already holds bytes. Without
+                        // that the read-only directory would fail an
+                        // fs::write too, for want of a file to truncate, and
+                        // the two spellings would be indistinguishable.
+                        let key = "writers:dev:dG9rZW4".to_string();
+                        enqueue_pending_prune(std::slice::from_ref(&key)).unwrap();
+                        (
+                            vault_maintenance_path().unwrap(),
+                            scratch.clone(),
+                            // Rewrites the file whether or not the key matches
+                            // anything, so the write is reached unconditionally.
+                            Box::new(move || acknowledge_secret_key_collision(key.clone())),
+                        )
+                    }
+                    "write_secret_metadata" => {
+                        create_project("Writers".to_string(), String::new()).unwrap();
+                        configure_local_secret_storage_for_test();
+                        let legacy = legacy_vault_key_for(&project_dir, "My Env", "token");
+                        save_secret_value(&legacy, "LEGACY").unwrap();
+                        let path = d03_env_file(temp_home.path(), "writers", "my-env", true);
+                        d03_write_recorded_metadata(&path, &[("token", &legacy)]);
+                        (
+                            path,
+                            environments.clone(),
+                            // A pending migration reaches write_secret_metadata
+                            // without writing the plain .env.json first.
+                            Box::new(|| {
+                                load_environment("Writers".to_string(), "My Env".to_string())
+                                    .map(|_| ())
+                            }),
+                        )
+                    }
+                    "save_request" => {
+                        create_project("Writers".to_string(), String::new()).unwrap();
+                        save_request(
+                            "Writers".to_string(),
+                            String::new(),
+                            sample_saved_request("Req", "GET", "http://example.com/"),
+                            None,
+                        )
+                        .unwrap();
+                        (
+                            collections.join("req.request.json"),
+                            collections.clone(),
+                            Box::new(|| {
+                                save_request(
+                                    "Writers".to_string(),
+                                    String::new(),
+                                    sample_saved_request("Req", "POST", "http://example.com/"),
+                                    Some("req.request.json".to_string()),
+                                )
+                            }),
+                        )
+                    }
+                    "rename_request" => {
+                        create_project("Writers".to_string(), String::new()).unwrap();
+                        save_request(
+                            "Writers".to_string(),
+                            String::new(),
+                            sample_saved_request("Req", "GET", "http://example.com/"),
+                            None,
+                        )
+                        .unwrap();
+                        (
+                            collections.join("req.request.json"),
+                            collections.clone(),
+                            // Same slug, so no fs::rename happens and the
+                            // rewrite is the only thing that can fail.
+                            Box::new(|| {
+                                rename_request(
+                                    "Writers".to_string(),
+                                    "req.request.json".to_string(),
+                                    "REQ".to_string(),
+                                )
+                            }),
+                        )
+                    }
+                    "move_request" => {
+                        create_project("Writers".to_string(), String::new()).unwrap();
+                        create_collection(
+                            "Writers".to_string(),
+                            "archive".to_string(),
+                            String::new(),
+                        )
+                        .unwrap();
+                        save_request(
+                            "Writers".to_string(),
+                            String::new(),
+                            sample_saved_request("Req", "GET", "http://example.com/"),
+                            None,
+                        )
+                        .unwrap();
+                        (
+                            collections.join("req.request.json"),
+                            collections.join("archive"),
+                            Box::new(|| {
+                                move_request(
+                                    "Writers".to_string(),
+                                    "req.request.json".to_string(),
+                                    "archive".to_string(),
+                                )
+                            }),
+                        )
+                    }
+                    _ => {
+                        create_project("Writers".to_string(), String::new()).unwrap();
+                        configure_local_secret_storage_for_test();
+                        save_environment(
+                            "Writers".to_string(),
+                            d03_env(
+                                "dev",
+                                vec![sample_env_variable("baseUrl", "http://a", false)],
+                            ),
+                            Some(true),
+                        )
+                        .unwrap();
+                        (
+                            d03_env_file(temp_home.path(), "writers", "dev", false),
+                            environments.clone(),
+                            Box::new(|| {
+                                save_environment(
+                                    "Writers".to_string(),
+                                    d03_env(
+                                        "dev",
+                                        vec![sample_env_variable("baseUrl", "http://b", false)],
+                                    ),
+                                    None,
+                                )
+                            }),
+                        )
+                    }
+                };
+
+            let before = std::fs::read(&target).unwrap_or_else(|error| {
+                panic!("{writer}: fixture target {} missing: {error}", target.display())
+            });
+
+            let outcome = d03_with_readonly_dir(&dir, action);
+
+            assert!(
+                outcome.is_err(),
+                "{writer}: the command reported success although its directory was read-only"
+            );
+            assert_eq!(
+                std::fs::read(&target).unwrap(),
+                before,
+                "{writer}: the target was modified by a write that failed"
+            );
+
+            // move_request is the one call site the read-only probe cannot
+            // speak about. Its destination is guaranteed not to exist — the
+            // command rejects an occupied target before it writes anything —
+            // so there is no old content for a truncating write to destroy,
+            // and `fs::write` fails on a read-only directory for exactly the
+            // same reason `create_new` does. Measured, not assumed: reverting
+            // this call site to `fs::write` left all 183 tests green, while
+            // the other eight sites each turned this test red.
+            //
+            // What stays observable is whether the destination goes through
+            // write_atomic at all, so run the move for real and look for the
+            // temp file it must have left in the destination directory.
+            if writer == "move_request" {
+                d03_reset_atomic_temp_log();
+                move_request(
+                    "Writers".to_string(),
+                    "req.request.json".to_string(),
+                    "archive".to_string(),
+                )
+                .unwrap();
+                let temps = d03_recorded_atomic_temp_paths();
+                assert!(
+                    temps.iter().any(|temp| temp.parent() == Some(dir.as_path())),
+                    "move_request wrote its destination without write_atomic; \
+                     temp files recorded: {temps:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_setting_up_the_data_directory_never_touches_the_history_file() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        // Preparing the data directory used to create an empty history file
+        // behind an exists() check. Two callers could both find it missing,
+        // and the one that resumed second would blank whatever the first had
+        // written in between - a truncating write, on user data, and the only
+        // one in the directory that never went through write_atomic.
+        let history_path = data_dir().unwrap().join("scratch").join("history.jsonl");
+        assert!(
+            !history_path.exists(),
+            "preparing the data directory created the history file"
+        );
+
+        // Absent is not broken; it means no history yet.
+        assert!(load_history().unwrap().is_empty());
+        assert_eq!(get_history_health().unwrap().skipped_lines, 0);
+
+        append_history(sample_history_entry("A", "2026-03-27T10:00:00Z")).unwrap();
+        let after_first = std::fs::read(&history_path).unwrap();
+        assert!(!after_first.is_empty());
+
+        // Every command prepares the directory first, so this runs constantly
+        // against a file that already holds entries.
+        data_dir().unwrap();
+        assert_eq!(
+            std::fs::read(&history_path).unwrap(),
+            after_first,
+            "preparing the data directory rewrote an existing history file"
+        );
+        assert_eq!(load_history().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_delete_environment_quarantines_unreadable_secret_metadata() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        create_project("Legacy".to_string(), String::new()).unwrap();
+        configure_local_secret_storage_for_test();
+
+        let project_dir = temp_home.path().join("ApiSolo/projects/legacy");
+        let owned = vault_key_for(&project_dir, "dev", "token");
+        save_secret_value(&owned, "STILL-IN-THE-VAULT").unwrap();
+
+        let normal_path = d03_env_file(temp_home.path(), "legacy", "dev", false);
+        std::fs::write(&normal_path, "[]").unwrap();
+        let secrets_path = d03_env_file(temp_home.path(), "legacy", "dev", true);
+        let corrupt = b"{ this is not the metadata it used to be".to_vec();
+        std::fs::write(&secrets_path, &corrupt).unwrap();
+
+        delete_environment("Legacy".to_string(), "dev".to_string()).unwrap();
+
+        // The user asked for the environment to go, and it is gone.
+        assert!(!normal_path.exists());
+        assert!(!secrets_path.exists());
+        assert!(!list_environments("Legacy".to_string())
+            .unwrap()
+            .contains(&"dev".to_string()));
+
+        // But its bytes are not gone. They are the only surviving record of
+        // which vault entries this environment owned, and deleting them left
+        // those entries in the vault with nothing left on disk naming them -
+        // unreachable and undeletable, which is the defect this slice exists
+        // to fix. Loading refuses outright and saving renames the file aside;
+        // deleting now matches saving.
+        let env_dir = temp_home.path().join("ApiSolo/projects/legacy/environments");
+        let quarantined: Vec<PathBuf> = std::fs::read_dir(&env_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(".corrupt-"))
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1, "expected one quarantined file");
+        assert_eq!(
+            std::fs::read(&quarantined[0]).unwrap(),
+            corrupt,
+            "the quarantined bytes were not preserved"
+        );
+
+        // Renaming a file back is what both READMEs tell the user to do, so
+        // the name has to be one the environment list ignores until then.
+        assert_eq!(load_secret_value(&owned).unwrap(), "STILL-IN-THE-VAULT");
+    }
+
+    #[test]
+    fn test_quarantine_never_overwrites_an_earlier_copy_from_the_same_second() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+        let dir = temp_home.path();
+
+        // The name carries a timestamp that only resolves to a second, and
+        // rename replaces silently. Two quarantines inside one second used to
+        // leave the first destroyed - the file whose entire purpose is to be
+        // the last surviving copy.
+        //
+        // Both candidate seconds are occupied up front so the collision does
+        // not depend on which side of a tick the call lands.
+        let source = dir.join("dev.env.secrets.json");
+        std::fs::write(&source, b"the corrupt bytes").unwrap();
+
+        let mut blocked = Vec::new();
+        for offset in [0_i64, 1] {
+            let stamp = (Utc::now() + chrono::Duration::seconds(offset))
+                .format("%Y%m%dT%H%M%SZ")
+                .to_string();
+            let path = dir.join(format!("dev.env.secrets.corrupt-{stamp}.json"));
+            std::fs::write(&path, format!("earlier copy {offset}")).unwrap();
+            blocked.push(path);
+        }
+
+        let target = quarantine_unreadable_file(&source).unwrap();
+
+        assert!(
+            !blocked.contains(&target),
+            "quarantine landed on a name that was already taken: {}",
+            target.display()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"the corrupt bytes");
+        for (offset, path) in blocked.iter().enumerate() {
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                format!("earlier copy {offset}").into_bytes(),
+                "an earlier quarantined copy was overwritten: {}",
+                path.display()
+            );
+        }
+        assert!(!source.exists());
+    }
+
+    // --------------------------------------- the harness checking itself (P9)
+    // The probe protocol was validated on a standalone model before it was
+    // written here, and the model is not the harness. These two fixtures drive
+    // the real one through the branches the model covered: a child that panics
+    // while holding the lock, and a lock that is already poisoned when the
+    // probe looks at it. Both are infrastructure failures that must not be
+    // reported as lock verdicts - a poisoned result carries an acquired guard,
+    // so folding it into "held" would state the opposite of the truth.
+
+    fn d03_without_panic_output<T>(body: impl FnOnce() -> T) -> T {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = body();
+        std::panic::set_hook(previous);
+        outcome
+    }
+
+    #[test]
+    fn test_the_probe_reports_a_child_that_panics_and_leaves_the_lock_usable() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        let probe = d03_without_panic_output(|| {
+            probe_lock_at_checkpoint("maintenance_enter", vault_maintenance_tx(), || {
+                let _held = lock_vault_maintenance_tx();
+                checkpoint("maintenance_enter");
+                panic!("child panics after arriving at the checkpoint");
+            })
+        });
+
+        // The lock really was held, so the verdict alone looks like a pass.
+        // That is the point of checking the other three: a child that arrives
+        // holding the lock and then dies never did the work the test believes
+        // it observed.
+        assert_eq!(probe.verdict, LockVerdict::LockHeld);
+        assert!(
+            !probe.child_ok,
+            "a child that panicked was reported as having finished"
+        );
+        assert!(
+            probe.returned.is_empty(),
+            "a child that panicked reported a return value: {:?}",
+            probe.returned
+        );
+
+        // And the next probe has to be unaffected. Without the harness clearing
+        // the poison, one panicking child turns every later try_lock in the
+        // file into Poisoned, and a whole run reports infrastructure failures
+        // that read exactly like real ones.
+        let after = probe_lock_at_checkpoint("maintenance_enter", vault_maintenance_tx(), || {
+            let _held = lock_vault_maintenance_tx();
+            checkpoint("maintenance_enter");
+            Ok(())
+        });
+        assert_eq!(
+            after.verdict,
+            LockVerdict::LockHeld,
+            "a previous panic leaked into the next probe"
+        );
+        assert!(after.child_ok);
+    }
+
+    #[test]
+    fn test_the_probe_calls_an_already_poisoned_lock_a_harness_failure() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        // Poison it from outside, then park the child *without* taking it, so
+        // try_lock succeeds and reports the poison rather than WouldBlock.
+        d03_without_panic_output(|| {
+            let _ = std::thread::spawn(|| {
+                let _held = vault_maintenance_tx().lock().unwrap();
+                panic!("poisoning the maintenance lock on purpose");
+            })
+            .join();
+        });
+
+        let probe = probe_lock_at_checkpoint("maintenance_enter", vault_maintenance_tx(), || {
+            checkpoint("maintenance_enter");
+            Ok(())
+        });
+
+        assert_eq!(
+            probe.verdict,
+            LockVerdict::HarnessError,
+            "a poisoned lock was reported as a lock verdict"
+        );
+        assert!(probe.child_ok);
+
+        // The guard that came with the poisoned result has to have been
+        // dropped, and the poison cleared, or the rest of the file is ruined.
+        assert!(
+            vault_maintenance_tx().try_lock().is_ok(),
+            "the poisoned guard was never released"
+        );
+        enqueue_pending_prune(&["probe:after:poison".to_string()]).unwrap();
+        assert_eq!(read_pending_prune().unwrap(), vec!["probe:after:poison"]);
+    }
+
+    // ------------------------------------------------- cross-slice (D01+D03)
+    // Named so nobody has to guess: this one spans two slices and is not one of
+    // the 43 invariants. It exists because the two defects compound. A user
+    // whose history had one torn line could never reach the legacy-credential
+    // sanitiser at all - the read failed outright, the panel came up empty, and
+    // the clear button was greyed out because the list was empty. The
+    // credentials this user most wanted scrubbed were the ones the scrub could
+    // not see.
+    //
+    // Where the halves live: skipping and quarantining is Rust, the redaction
+    // itself is the frontend history store, and Rust is deliberately a pipe for
+    // history content. So this proves reachability and the write-back contract;
+    // that the sanitiser blanks a given field is the store's own tests' job,
+    // and the redaction step below is a stand-in for it, not a copy of it.
+    #[test]
+    fn test_cross_slice_d01_scrub_runs_after_d03_read_resilience() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        let clean = sample_history_entry("clean", "2026-03-27T10:00:00Z");
+        let mut legacy = sample_history_entry("legacy", "2026-03-27T10:05:00Z");
+        legacy.request_headers = vec![KeyValuePair {
+            enabled: true,
+            key: "Authorization".to_string(),
+            value: "Bearer super-secret-token".to_string(),
+            description: String::new(),
+        }];
+
+        // A line an earlier crash cut in half, sitting between two good rows.
+        let torn = "{\"id\":\"torn\",\"method\":\"GET\",\"url\":\"http://exa";
+        let history_path = history_file_path().unwrap();
+        std::fs::create_dir_all(history_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &history_path,
+            format!(
+                "{}\n{torn}\n{}\n",
+                serde_json::to_string(&clean).unwrap(),
+                serde_json::to_string(&legacy).unwrap()
+            ),
+        )
+        .unwrap();
+
+        // D03's half: the torn line costs only itself, so both good rows arrive.
+        let loaded = load_history().unwrap();
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["legacy", "clean"],
+            "a torn line still cost the whole read"
+        );
+
+        // The credential arrives verbatim. That is the contract the sanitiser
+        // depends on: if Rust altered it here there would be two redaction
+        // implementations disagreeing about what counts as sensitive.
+        let delivered = loaded.iter().find(|entry| entry.id == "legacy").unwrap();
+        assert_eq!(
+            delivered.request_headers[0].value, "Bearer super-secret-token",
+            "the legacy credential did not reach the caller intact"
+        );
+
+        // D01's half, driven the way the store drives it: sanitise what came
+        // back, then write back only the rows that changed.
+        let mut scrubbed = delivered.clone();
+        scrubbed.request_headers[0].value = "[redacted]".to_string();
+        update_history_entries(vec![scrubbed]).unwrap();
+
+        // The rewrite must not swallow the torn line. Its bytes can hold a
+        // credential of their own, so they go to quarantine unchanged rather
+        // than disappearing with the file that was replaced.
+        let quarantined =
+            std::fs::read_to_string(history_quarantine_path().unwrap()).unwrap();
+        assert_eq!(
+            quarantined,
+            format!("{torn}\n"),
+            "the torn line was not preserved byte for byte"
+        );
+
+        let after = load_history().unwrap();
+        assert_eq!(after.len(), 2);
+        let stored = after.iter().find(|entry| entry.id == "legacy").unwrap();
+        assert_eq!(
+            stored.request_headers[0].value, "[redacted]",
+            "the scrubbed row did not survive the write-back"
+        );
+    }
+
+    // ----------------------------------------- D03 §2.11 (lock structure)
+    // A syntax check, deliberately not a behaviour check. The dynamic probes
+    // prove a lock is alive at a checkpoint, but only for functions that have
+    // one: they cannot see a function that forgot its checkpoint, and they
+    // cannot see a guard taken inside an inner block that ends before the read.
+    // This reads lib.rs back and answers the other half - in each function the
+    // lock rules cover, is the guard the first thing that happens?
+    //
+    // Three text-based versions of this check came before it and all three
+    // passed on code that was wrong: counting braces per line, then lexical
+    // masking, then masking plus self-checks. Every failure was the same shape,
+    // approximating a syntax question. Parsing removes the question instead of
+    // producing one more instance of it.
+    mod lock_structure {
+        use syn::visit::Visit;
+        use syn::{Expr, File, ItemFn, Pat, PathArguments, Stmt};
+
+        pub struct Target {
+            pub function: &'static str,
+            pub accessor: &'static str,
+            pub read: &'static str,
+            /// Declared per function, never a blanket allowance. A macro is
+            /// rejected rather than expanded, so every name listed here marks a
+            /// place this check stops looking.
+            pub allowed_macros: &'static [&'static str],
+            /// Same rule one level up. An attribute macro replaces the item it
+            /// is written on, so trusting attributes by default means checking
+            /// a function the compiler may never build. Listing them per target
+            /// keeps `#[tauri::command]` - which every command here carries -
+            /// from becoming a licence for any attribute at all.
+            pub allowed_attributes: &'static [&'static str],
+        }
+
+        /// The list is part of what gets reviewed. Deleting a row silently
+        /// removes the guarantee for that function, and no machine can notice
+        /// that - which is why the test asserts the row count as well.
+        pub const TARGETS: &[Target] = &[
+            Target {
+                function: "save_local_secret_value",
+                accessor: "lock_local_vault_tx",
+                read: "load_local_secret_map",
+                allowed_macros: &[],
+                allowed_attributes: &[],
+            },
+            Target {
+                function: "delete_local_secret_value",
+                accessor: "lock_local_vault_tx",
+                read: "load_local_secret_map",
+                allowed_macros: &[],
+                allowed_attributes: &[],
+            },
+            Target {
+                function: "unlock_local_secret_vault_locked",
+                accessor: "lock_local_vault_tx",
+                read: "read_local_secret_vault_file",
+                // The session-key error path formats a message. Listed rather
+                // than waved through: the token stream is still swept for the
+                // two names below, so a read cannot hide inside it.
+                allowed_macros: &["format"],
+                allowed_attributes: &[],
+            },
+            Target {
+                function: "record_vault_key_collisions",
+                accessor: "lock_vault_maintenance_tx",
+                read: "read_maintenance_snapshot",
+                allowed_macros: &[],
+                allowed_attributes: &[],
+            },
+            Target {
+                function: "acknowledge_secret_key_collision",
+                accessor: "lock_vault_maintenance_tx",
+                read: "read_maintenance_snapshot",
+                allowed_macros: &[],
+                allowed_attributes: &["tauri::command"],
+            },
+            Target {
+                function: "enqueue_pending_prune",
+                accessor: "lock_vault_maintenance_tx",
+                read: "read_maintenance_snapshot",
+                allowed_macros: &[],
+                allowed_attributes: &[],
+            },
+            Target {
+                function: "read_pending_prune",
+                accessor: "lock_vault_maintenance_tx",
+                read: "read_maintenance_snapshot",
+                allowed_macros: &[],
+                allowed_attributes: &[],
+            },
+            Target {
+                function: "resolve_pending_prune",
+                accessor: "lock_vault_maintenance_tx",
+                read: "read_maintenance_snapshot",
+                allowed_macros: &[],
+                allowed_attributes: &[],
+            },
+            // The lifecycle rows: the three commands that touch an
+            // environment's secret metadata. Appended rather than slotted in
+            // beside their relatives, because the self-test above addresses two
+            // rows by index and renumbering them would move the probe silently.
+            //
+            // Each names as its `read` the call that must not happen first. For
+            // all three that is a *read of the metadata*, not the cleanup at the
+            // end - which is the correction R4 forced. The guard used to be
+            // taken inside the migration helper, after the caller had already
+            // read the file the migration goes on to rewrite; a save landing in
+            // that gap was erased. Binding the row to the read makes the
+            // boundary of the critical section the thing that gets checked.
+            Target {
+                function: "load_environment",
+                accessor: "lock_vault_key_lifecycle_tx",
+                read: "read_env_variables",
+                allowed_macros: &[],
+                allowed_attributes: &["tauri::command"],
+            },
+            Target {
+                function: "save_environment",
+                accessor: "lock_vault_key_lifecycle_tx",
+                read: "read_previous_secret_metadata",
+                allowed_macros: &["format"],
+                allowed_attributes: &["tauri::command"],
+            },
+            Target {
+                function: "delete_environment",
+                accessor: "lock_vault_key_lifecycle_tx",
+                read: "read_env_variables",
+                allowed_macros: &["format"],
+                allowed_attributes: &["tauri::command"],
+            },
+        ];
+
+        /// Anything unreadable fails rather than passes, and "unreadable" is
+        /// decided by what this function can expand rather than by a list of
+        /// shapes known to be dangerous. It expands nothing, so **every** item
+        /// macro at this level is rejected, not just `include!`.
+        ///
+        /// The earlier version named `include!` specifically, which read as
+        /// thorough and was not: any other item macro walked through, and
+        /// `check` below only ever collects functions spelled out in the
+        /// source. A macro expanding to a read-before-lock `read_pending_prune`
+        /// under `#[cfg(test)]`, sitting beside a compliant `#[cfg(not(test))]`
+        /// one, is what the compiler builds while the check reads only the
+        /// compliant copy and reports nothing. Enumerating which macros can
+        /// hide a function has no fixed point - the same reason the guard rule
+        /// stopped enumerating ways to drop a guard.
+        ///
+        /// The crate root is the whole scope on purpose: it is exactly where
+        /// `check` collects its targets from, and a macro nested inside a module
+        /// cannot declare an item out here.
+        pub fn unanalysable(file: &File) -> Vec<String> {
+            let mut problems = Vec::new();
+            for item in &file.items {
+                match item {
+                    syn::Item::Mod(item) if item.content.is_none() => problems.push(format!(
+                        "module {} is not inline, so its contents are not analysable",
+                        item.ident
+                    )),
+                    syn::Item::Macro(item) => {
+                        let name = item
+                            .mac
+                            .path
+                            .segments
+                            .last()
+                            .map(|segment| segment.ident.to_string())
+                            .unwrap_or_else(|| "<unnamed>".to_string());
+                        problems.push(format!(
+                            "the item macro {name}! is not expanded here, so anything it \
+                             declares is invisible to this check"
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            problems
+        }
+
+        /// Walks a `use` tree for anything that could bind `name` at the crate
+        /// root. Visits every branch rather than short-circuiting, because a
+        /// glob further along the same group still has to be reported.
+        fn use_tree_binds(tree: &syn::UseTree, name: &str, glob: &mut bool) -> bool {
+            match tree {
+                syn::UseTree::Path(path) => use_tree_binds(&path.tree, name, glob),
+                syn::UseTree::Name(leaf) => leaf.ident == name,
+                syn::UseTree::Rename(leaf) => leaf.rename == name,
+                syn::UseTree::Glob(_) => {
+                    *glob = true;
+                    false
+                }
+                syn::UseTree::Group(group) => {
+                    let mut binds = false;
+                    for item in &group.items {
+                        binds |= use_tree_binds(item, name, glob);
+                    }
+                    binds
+                }
+            }
+        }
+
+        pub fn check(file: &File, target: &Target) -> Vec<String> {
+            // A `use` at the crate root can bind this name to an item declared
+            // somewhere the collection below never looks - a function generated
+            // inside a module and re-exported out, with a compliant explicit
+            // one left beside it under the opposite cfg. The compiler calls the
+            // re-export; this check would read only the compliant copy.
+            let mut problems = Vec::new();
+            for item in &file.items {
+                if let syn::Item::Use(item) = item {
+                    let mut glob = false;
+                    if use_tree_binds(&item.tree, target.function, &mut glob) {
+                        problems.push(format!(
+                            "{}: the name is bound by a use declaration at the crate root, so \
+                             the item the compiler builds under this name is not necessarily \
+                             the function checked here",
+                            target.function
+                        ));
+                    }
+                    if glob {
+                        problems.push(format!(
+                            "{}: a glob import at the crate root can bind this name from a \
+                             module this check does not read",
+                            target.function
+                        ));
+                    }
+                }
+            }
+
+            let definitions: Vec<&ItemFn> = file
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    syn::Item::Fn(function) if function.sig.ident == target.function => {
+                        Some(function)
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            if definitions.is_empty() {
+                problems.push(format!("{}: not found at the crate root", target.function));
+                return problems;
+            }
+
+            // Every #[cfg] variant is judged on its own. syn does not evaluate
+            // conditional compilation and sees both, so a bad variant sitting
+            // next to a good one must not be covered by it.
+            problems.extend(
+                definitions
+                    .into_iter()
+                    .flat_map(|definition| check_one(definition, target)),
+            );
+            problems
+        }
+
+        fn check_one(function: &ItemFn, target: &Target) -> Vec<String> {
+            let name = target.function;
+
+            // Before anything about the body is worth reading: an attribute
+            // macro receives this item and returns whatever it likes, so an
+            // undeclared attribute means the statements below may describe a
+            // function that is never built. Reported on its own and returned
+            // early - continuing would attach conclusions to the wrong item.
+            let undeclared: Vec<String> = function
+                .attrs
+                .iter()
+                .map(|attribute| {
+                    attribute
+                        .path()
+                        .segments
+                        .iter()
+                        .map(|segment| segment.ident.to_string())
+                        .collect::<Vec<_>>()
+                        .join("::")
+                })
+                // Two built-in exemptions, both narrow on purpose. `cfg` can
+                // only include or exclude the item as written, never rewrite
+                // it, and both variants are judged separately just below;
+                // `doc` is what a /// comment parses to and attaches no code
+                // at all. Neither can substitute an item, which is the whole
+                // risk being guarded against.
+                //
+                // `cfg_attr` is deliberately NOT exempt despite the name: it
+                // applies an arbitrary attribute conditionally, which is
+                // exactly the substitution this list exists to catch.
+                .filter(|rendered| rendered != "cfg" && rendered != "doc")
+                .filter(|rendered| !target.allowed_attributes.contains(&rendered.as_str()))
+                .map(|rendered| {
+                    format!(
+                        "{name}: attribute #[{rendered}] is not on this function's attribute \
+                         allow list, so the item the compiler builds may not be this one"
+                    )
+                })
+                .collect();
+            if !undeclared.is_empty() {
+                return undeclared;
+            }
+
+            // The guard is statement 0 and nothing may precede it: no call, no
+            // method call, no macro, no block, no `use`. That is the whole
+            // design. With nothing before the guard there is nowhere to put an
+            // unlocked read, so the bypass shapes do not each have to be
+            // recognised - and recognising shapes has no fixed point, since the
+            // set of equivalent ways to spell one in Rust is unbounded.
+            let Some(Stmt::Local(local)) = function.block.stmts.first() else {
+                return vec![format!("{name}: guard is not the first statement")];
+            };
+            let Some(init) = &local.init else {
+                return vec![format!("{name}: guard is not the first statement")];
+            };
+            if init.diverge.is_some() {
+                return vec![format!("{name}: unsupported wrapper around the guard")];
+            }
+            if let Some(complaint) = classify_guard_init(&init.expr, target.accessor) {
+                return vec![format!("{name}: {complaint}")];
+            }
+
+            let Pat::Ident(binding) = &local.pat else {
+                return vec![format!("{name}: unsupported wrapper around the guard")];
+            };
+            if binding.subpat.is_some() {
+                return vec![format!("{name}: unsupported wrapper around the guard")];
+            }
+            let guard = binding.ident.to_string();
+
+            let mut scan = BodyScan {
+                accessor: target.accessor,
+                read: target.read,
+                guard: &guard,
+                allowed_macros: target.allowed_macros,
+                reads: 0,
+                problems: Vec::new(),
+            };
+            for statement in function.block.stmts.iter().skip(1) {
+                scan.visit_stmt(statement);
+            }
+            // The guard statement itself is re-examined for everything except
+            // its own accessor call, which was just accepted above.
+            for argument in guard_init_arguments(&init.expr) {
+                scan.visit_expr(argument);
+            }
+
+            let mut problems: Vec<String> = scan
+                .problems
+                .into_iter()
+                .map(|problem| format!("{name}: {problem}"))
+                .collect();
+            if scan.reads == 0 {
+                problems.push(format!(
+                    "{name}: never calls {}, so this check proves nothing here",
+                    target.read
+                ));
+            }
+            problems
+        }
+
+        /// `None` means accepted. The three complaints stay distinct because
+        /// they send a reader to different places: a foreign statement sitting
+        /// in front of the guard, a lock taken on some other mutex that wears
+        /// the right name, and a wrapper that moves when the guard is released.
+        fn classify_guard_init(expr: &Expr, accessor: &str) -> Option<&'static str> {
+            if let Expr::Call(call) = expr {
+                if call.args.is_empty() {
+                    if let Some(called) = plain_call_name(call) {
+                        if called == accessor {
+                            return None;
+                        }
+                    }
+                }
+                // Names the accessor in its last segment but fails the
+                // full-form comparison, so it locks something else.
+                if last_segment_is(&call.func, accessor) {
+                    return Some("accessor mismatch");
+                }
+            }
+            if mentions(expr, accessor) {
+                return Some("unsupported wrapper around the guard");
+            }
+            Some("guard is not the first statement")
+        }
+
+        fn last_segment_is(expr: &Expr, name: &str) -> bool {
+            match expr {
+                Expr::Path(path) => path
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|segment| segment.ident == name),
+                _ => false,
+            }
+        }
+
+        fn mentions(expr: &Expr, name: &str) -> bool {
+            struct Probe<'a> {
+                name: &'a str,
+                found: bool,
+            }
+            impl<'ast, 'a> Visit<'ast> for Probe<'a> {
+                fn visit_path(&mut self, path: &'ast syn::Path) {
+                    if path.segments.iter().any(|segment| segment.ident == self.name) {
+                        self.found = true;
+                    }
+                    syn::visit::visit_path(self, path);
+                }
+            }
+
+            let mut probe = Probe { name, found: false };
+            probe.visit_expr(expr);
+            probe.found
+        }
+
+        fn guard_init_arguments(expr: &Expr) -> Vec<&Expr> {
+            match expr {
+                Expr::Call(call) => call.args.iter().collect(),
+                _ => Vec::new(),
+            }
+        }
+
+        /// Full-form comparison: no qualified self, no leading `::`, exactly one
+        /// segment, no generic arguments. Matching on the last segment would
+        /// accept `unrelated::lock_vault_maintenance_tx()` and destroy the claim
+        /// that the guard locks the mutex this row names.
+        fn plain_call_name(call: &syn::ExprCall) -> Option<String> {
+            let Expr::Path(path) = &*call.func else {
+                return None;
+            };
+            if path.qself.is_some() || path.path.leading_colon.is_some() {
+                return None;
+            }
+            if path.path.segments.len() != 1 {
+                return None;
+            }
+            let segment = &path.path.segments[0];
+            if !matches!(segment.arguments, PathArguments::None) {
+                return None;
+            }
+            Some(segment.ident.to_string())
+        }
+
+        struct BodyScan<'a> {
+            accessor: &'a str,
+            read: &'a str,
+            guard: &'a str,
+            allowed_macros: &'a [&'static str],
+            reads: usize,
+            problems: Vec<String>,
+        }
+
+        impl<'a> BodyScan<'a> {
+            fn watched(&self, ident: &syn::Ident) -> bool {
+                ident == self.accessor || ident == self.read
+            }
+        }
+
+        impl<'ast, 'a> Visit<'ast> for BodyScan<'a> {
+            fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+                match plain_call_name(call) {
+                    Some(called) if called == self.read || called == self.accessor => {
+                        if called == self.read {
+                            self.reads += 1;
+                        }
+                        // Accepted as a direct named call, so the callee path is
+                        // not walked. Every remaining mention of these two names
+                        // is therefore something other than a direct call.
+                        for argument in &call.args {
+                            self.visit_expr(argument);
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+                syn::visit::visit_expr_call(self, call);
+            }
+
+            fn visit_path(&mut self, path: &'ast syn::Path) {
+                for segment in &path.segments {
+                    if self.watched(&segment.ident) {
+                        self.problems.push(format!(
+                            "{} appears somewhere other than a direct named call",
+                            segment.ident
+                        ));
+                    }
+                    // Naming the guard again is the only way to end its life
+                    // early, so the rule is that it is never named again -
+                    // rather than a list of the ways one could do it. An
+                    // earlier version looked for a call to `drop`, which said
+                    // nothing at all about `std::mem::drop(guard)` or about
+                    // `let _ = guard;`. Enumerating spellings loses here for
+                    // the same reason it lost in front of the guard.
+                    if segment.ident == self.guard {
+                        self.problems.push(format!(
+                            "the guard {} is named again after it is bound, so it may be \
+                             released before the function ends",
+                            self.guard
+                        ));
+                    }
+                }
+                syn::visit::visit_path(self, path);
+            }
+
+            fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+                let called = mac
+                    .path
+                    .segments
+                    .last()
+                    .map(|segment| segment.ident.to_string())
+                    .unwrap_or_default();
+                if !self.allowed_macros.contains(&called.as_str()) {
+                    self.problems
+                        .push(format!("macro {called}! is not on this function's allow list"));
+                    return;
+                }
+                // Being on the list means the check does not expand it, not that
+                // it goes unread: a read hidden in the token stream would
+                // otherwise walk straight through.
+                //
+                // The guard is swept for here as well, and the reason is the
+                // same one that put the read on this list. Macro tokens are
+                // never parsed, so `visit_path` never sees them: a
+                // `format!("{}", { drop(_guard); "" })` ends the lock in the
+                // middle of the function while every rule above stays satisfied
+                // and this check says nothing at all. Sweeping for the read
+                // alone left that open, which is the shape an earlier version
+                // of this same check was already caught in - an allow list has
+                // to cover everything the rules outside it cover, or it is a
+                // hole with a name.
+                let rendered = mac.tokens.to_string();
+                for word in rendered.split(|character: char| !character.is_alphanumeric() && character != '_') {
+                    if word == self.accessor || word == self.read {
+                        self.problems.push(format!(
+                            "{word} appears inside the allowed macro {called}!"
+                        ));
+                    }
+                    if word == self.guard {
+                        self.problems.push(format!(
+                            "the guard {word} is named inside the allowed macro {called}!, so it \
+                             may be released before the function ends"
+                        ));
+                    }
+                }
+            }
+
+            fn visit_stmt(&mut self, stmt: &'ast Stmt) {
+                if let Stmt::Item(_) = stmt {
+                    self.problems.push(
+                        "an item declared inside the body is not analysable here".to_string(),
+                    );
+                    return;
+                }
+                syn::visit::visit_stmt(self, stmt);
+            }
+        }
+    }
+
+    /// Fixtures the checker must reject, each paired with the phrase it has to
+    /// say. Silence is this check's evidence, so it has to be shown to speak
+    /// before the silence counts for anything - and the last row is the
+    /// positive control, because a checker that rejects everything would pass
+    /// all the rows above while proving nothing.
+    const LOCK_STRUCTURE_FIXTURES: &[(&str, &str, &str)] = &[
+        (
+            "a read reached through a helper before the guard",
+            r#"fn read_pending_prune() -> u8 {
+                let stale = peek();
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "guard is not the first statement",
+        ),
+        (
+            "a macro standing before the guard",
+            r#"fn read_pending_prune() -> u8 {
+                println!("about to lock");
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "guard is not the first statement",
+        ),
+        (
+            "the guard taken inside a block that ends before the read",
+            r#"fn read_pending_prune() -> u8 {
+                { let _guard = lock_vault_maintenance_tx(); }
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "guard is not the first statement",
+        ),
+        (
+            "an aliasing use before the guard",
+            r#"fn read_pending_prune() -> u8 {
+                use other::lock as lock_vault_maintenance_tx;
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "guard is not the first statement",
+        ),
+        (
+            "a same-named accessor from somewhere else",
+            r#"fn read_pending_prune() -> u8 {
+                let _guard = unrelated::lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "accessor mismatch",
+        ),
+        (
+            "the guard wrapped so its lifetime is no longer the function",
+            r#"fn read_pending_prune() -> u8 {
+                let _guard = Box::new(lock_vault_maintenance_tx());
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "unsupported wrapper around the guard",
+        ),
+        (
+            "the guard dropped before the read",
+            r#"fn read_pending_prune() -> u8 {
+                let guard = lock_vault_maintenance_tx();
+                drop(guard);
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "released before the function ends",
+        ),
+        (
+            "the guard dropped through a fully qualified path",
+            r#"fn read_pending_prune() -> u8 {
+                let guard = lock_vault_maintenance_tx();
+                std::mem::drop(guard);
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "released before the function ends",
+        ),
+        (
+            "the guard dropped by binding it to a wildcard",
+            r#"fn read_pending_prune() -> u8 {
+                let guard = lock_vault_maintenance_tx();
+                let _ = guard;
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "released before the function ends",
+        ),
+        (
+            "the guard never bound at all, so it dies on the spot",
+            r#"fn read_pending_prune() -> u8 {
+                let _ = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "unsupported wrapper around the guard",
+        ),
+        (
+            "the accessor handed around as a value",
+            r#"fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                let deferred = lock_vault_maintenance_tx;
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "appears somewhere other than a direct named call",
+        ),
+        (
+            "a read hidden inside an allowed macro",
+            r#"fn unlock_local_secret_vault_locked() -> u8 {
+                let _guard = lock_local_vault_tx();
+                let vault = read_local_secret_vault_file();
+                let _ = format!("{}", read_local_secret_vault_file());
+                vault
+            }"#,
+            "appears inside the allowed macro",
+        ),
+        (
+            "the guard released inside an allowed macro",
+            r#"fn unlock_local_secret_vault_locked() -> u8 {
+                let _guard = lock_local_vault_tx();
+                let vault = read_local_secret_vault_file();
+                let _ = format!("{}", { drop(_guard); "" });
+                vault
+            }"#,
+            "named inside the allowed macro",
+        ),
+        (
+            "a re-export that can bind the target name to something else",
+            r#"#[cfg(test)]
+            pub use hidden::read_pending_prune;
+            #[cfg(not(test))]
+            fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "bound by a use declaration",
+        ),
+        (
+            "a glob import that could bind the target name",
+            r#"use hidden::*;
+            fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "glob import",
+        ),
+        (
+            "an attribute that can replace the whole item",
+            r#"#[some_attribute_macro]
+            fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "attribute allow list",
+        ),
+        (
+            "an attribute applied conditionally, which cfg does not cover",
+            r#"#[cfg_attr(test, some_attribute_macro)]
+            fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "attribute allow list",
+        ),
+        (
+            "a macro nobody declared",
+            r#"fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                assert!(snapshot > 0);
+                snapshot
+            }"#,
+            "is not on this function's allow list",
+        ),
+        (
+            "a function that no longer reads anything",
+            r#"fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                0
+            }"#,
+            "never calls read_maintenance_snapshot",
+        ),
+        (
+            "a bad cfg variant standing beside a good one",
+            r#"#[cfg(test)]
+            fn read_pending_prune() -> u8 {
+                let snapshot = read_maintenance_snapshot();
+                let _guard = lock_vault_maintenance_tx();
+                snapshot
+            }
+            #[cfg(not(test))]
+            fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "guard is not the first statement",
+        ),
+        (
+            "the shape the rules actually ask for",
+            r#"fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "",
+        ),
+    ];
+
+    /// Fixtures for the other half of the check - "code I cannot read fails" -
+    /// which none of the rows above can reach. They all go through `check`, and
+    /// `check` only ever sees functions spelled out in the source; anything that
+    /// would *produce* a function is judged before that point or not at all.
+    ///
+    /// The first row is the bypass this pair exists for: a macro that could be
+    /// declaring the target function next to a compliant explicit one. The
+    /// compiler runs whatever the macro expands to, `check` reads only the
+    /// spelled-out copy, and every row above stays green.
+    const LOCK_STRUCTURE_UNANALYSABLE_FIXTURES: &[(&str, &str, &str)] = &[
+        (
+            "an item macro that could be declaring the target function",
+            r#"declare_reader!{}
+            #[cfg(not(test))]
+            fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "is not expanded here",
+        ),
+        (
+            "a module whose body lives in another file",
+            r#"mod elsewhere;
+            fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "is not inline",
+        ),
+        (
+            "nothing hidden from the parse at all",
+            r#"fn read_pending_prune() -> u8 {
+                let _guard = lock_vault_maintenance_tx();
+                let snapshot = read_maintenance_snapshot();
+                snapshot
+            }"#,
+            "",
+        ),
+    ];
+
+    #[test]
+    fn test_every_lock_protected_function_takes_its_guard_first() {
+        // Self-test before the real run. A harness whose quiet output is the
+        // evidence has to be shown to say something on input already known to
+        // be bad; otherwise "no problems" and "never looked" are the same
+        // sentence.
+        let probe = &lock_structure::TARGETS[6];
+        assert_eq!(probe.function, "read_pending_prune");
+        let macro_probe = &lock_structure::TARGETS[2];
+        assert_eq!(macro_probe.function, "unlock_local_secret_vault_locked");
+
+        for (label, source, expected) in LOCK_STRUCTURE_FIXTURES {
+            let file = syn::parse_file(source).unwrap_or_else(|error| {
+                panic!("fixture {label} does not parse: {error}");
+            });
+            let target = if source.contains("unlock_local_secret_vault_locked") {
+                macro_probe
+            } else {
+                probe
+            };
+            let problems = lock_structure::check(&file, target);
+
+            if expected.is_empty() {
+                assert!(
+                    problems.is_empty(),
+                    "fixture {label} should have been accepted, got {problems:?}"
+                );
+            } else {
+                assert!(
+                    problems.iter().any(|problem| problem.contains(expected)),
+                    "fixture {label} should have been rejected with {expected:?}, got {problems:?}"
+                );
+            }
+        }
+
+        for (label, source, expected) in LOCK_STRUCTURE_UNANALYSABLE_FIXTURES {
+            let file = syn::parse_file(source).unwrap_or_else(|error| {
+                panic!("fixture {label} does not parse: {error}");
+            });
+            let problems = lock_structure::unanalysable(&file);
+
+            if expected.is_empty() {
+                assert!(
+                    problems.is_empty(),
+                    "fixture {label} should have been accepted, got {problems:?}"
+                );
+            } else {
+                assert!(
+                    problems.iter().any(|problem| problem.contains(expected)),
+                    "fixture {label} should have been rejected with {expected:?}, got {problems:?}"
+                );
+            }
+        }
+
+        // Now the file that ships.
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs")).unwrap();
+        let file = syn::parse_file(&source).expect("lib.rs does not parse");
+
+        assert!(
+            lock_structure::unanalysable(&file).is_empty(),
+            "lib.rs contains code this check cannot read: {:?}",
+            lock_structure::unanalysable(&file)
+        );
+
+        // The row count is asserted because the list is the check's own weak
+        // point: removing a row removes a guarantee and nothing else changes.
+        assert_eq!(lock_structure::TARGETS.len(), 11);
+
+        let mut problems = Vec::new();
+        for target in lock_structure::TARGETS {
+            problems.extend(lock_structure::check(&file, target));
+        }
+        assert!(problems.is_empty(), "{problems:#?}");
+
+        // The three outer dispatchers stay out of TARGETS on purpose. They open
+        // with a backend match, so requiring a guard first would mean holding a
+        // global vault lock across every keychain call - a real behaviour
+        // change to satisfy a checker, which is the trade this project refuses.
+        for outer in [
+            "save_secret_value",
+            "delete_secret_value",
+            "unlock_local_secret_storage",
+        ] {
+            assert!(
+                !lock_structure::TARGETS
+                    .iter()
+                    .any(|target| target.function == outer),
+                "{outer} is covered by the outer-dispatcher exclusion and must not be a target"
+            );
+        }
+    }
 }

@@ -18,6 +18,7 @@ export default {
     noActiveProject: "未选择活动项目。",
     noActiveEnvironment: "未选择活动环境。",
     environmentNameRequired: "环境名称不能为空。",
+    environmentAlreadyExists: "同名环境已存在。请换一个名字，或直接从列表里选择它。",
     binaryBodyUnsupported: "暂不支持二进制请求体。",
     fileSelectionRequired: "发送上传请求前请重新选择文件。",
     redactionSentinelOnWire:
