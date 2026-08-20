@@ -57,6 +57,16 @@ export const useWebSocketStore = defineStore("websocket", () => {
   const connections = ref<Record<string, WsConnectionState>>({})
   /** Keyed by tab id — see PendingConnect. */
   const pendingConnects = ref<Record<string, PendingConnect>>({})
+  /**
+   * Connections the backend may still hold that no tab can name.
+   *
+   * A tab is not a durable owner: it can be closed while a connect is parked
+   * in ws_prepare, and if the hand-back then fails there is no tab left to
+   * write the id onto and no state record either — the id would simply cease
+   * to exist anywhere in the frontend. This list is where such an id lives
+   * until a later connect manages to close it.
+   */
+  const orphanConnections = ref<string[]>([])
 
   const getMessages = computed(() => (connectionId: string) => messages.value[connectionId] ?? [])
   const getDroppedCount = computed(() => (connectionId: string) =>
@@ -240,6 +250,11 @@ export const useWebSocketStore = defineStore("websocket", () => {
     let reconnectAborted = false
 
     try {
+      // Anything previously stranded gets another chance before this tab does
+      // anything new — the same "retry the leftover id first" rule the
+      // reconnect path below uses, applied to ids no tab can name any more.
+      await drainOrphanConnections()
+
       // Reconnecting on this tab: the previous connection's store state and its
       // buffered messages are reachable only through the old id, and the line
       // below is about to overwrite it. Releasing it here is what stops N
@@ -340,12 +355,18 @@ export const useWebSocketStore = defineStore("websocket", () => {
         // cancel that silently leaves a socket open is exactly what the caller
         // needs to hear about.
         //
-        // The id is written onto the tab rather than cleared, even when it was
-        // never stored there: it is the only remaining route to that
-        // connection, and the next connect on this tab retries teardown before
-        // doing anything else. Clearing it here would be the same mistake
-        // teardown used to make, one layer up.
-        tabsStore.updateTab(tabId, { wsStatus: "disconnected", wsConnectionId: id })
+        // The id needs an owner that outlives this attempt. A live tab is the
+        // natural one — writing the id there even when it was never stored
+        // gives the user a visible route and makes the next connect retry it.
+        //
+        // But updateTab on a closed tab silently does nothing, and in that case
+        // no state record exists either, so the id would vanish entirely. The
+        // orphan list is the owner that does not depend on the tab surviving.
+        if (tabsStore.tabs.some((item) => item.id === tabId)) {
+          tabsStore.updateTab(tabId, { wsStatus: "disconnected", wsConnectionId: id })
+        } else if (!orphanConnections.value.includes(id)) {
+          orphanConnections.value = [...orphanConnections.value, id]
+        }
         recordConsoleEntry(
           "error",
           `[network] WebSocket cleanup failed, connection may still be open: ${describeError(cleanupError)}`,
@@ -371,6 +392,30 @@ export const useWebSocketStore = defineStore("websocket", () => {
       throw error
     } finally {
       delete pendingConnects.value[tabId]
+    }
+  }
+
+  /**
+   * Retries every stranded connection, dropping only the ones that actually
+   * closed. A retry that fails again stays on the list rather than blocking
+   * the connect the user asked for.
+   */
+  async function drainOrphanConnections() {
+    if (orphanConnections.value.length === 0) {
+      return
+    }
+
+    for (const id of [...orphanConnections.value]) {
+      try {
+        await teardown(id)
+        orphanConnections.value = orphanConnections.value.filter((item) => item !== id)
+      } catch (error) {
+        recordConsoleEntry(
+          "error",
+          `[network] WebSocket cleanup retry failed, connection may still be open: ${describeError(error)}`,
+          "network",
+        )
+      }
     }
   }
 
@@ -499,6 +544,7 @@ export const useWebSocketStore = defineStore("websocket", () => {
     messages,
     connections,
     pendingConnects,
+    orphanConnections,
     connect,
     cancelOrDisconnect,
     send,

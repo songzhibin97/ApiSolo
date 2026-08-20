@@ -629,6 +629,66 @@ describe("websocket connect lifecycle", () => {
     expect(afterwards[0]).toBe("ws_disconnect")
   })
 
+  /** The branch a live tab cannot cover: the tab is gone before the id exists. */
+  async function tabClosedDuringPrepareWithFailingCleanup() {
+    const { tabsStore, wsStore, tab } = setup()
+    const deferred = backend.makeDeferred()
+    backend.state.deferPrepare = deferred as never
+
+    const connecting = wsStore.connect(tab.id, tab.url, [])
+    await deferred.entered
+    // The tab is closed while prepare is still in flight, so there is no tab
+    // left to write the id onto and no state record has been created yet.
+    tabsStore.tabs = tabsStore.tabs.filter((item) => item.id !== tab.id)
+    backend.state.disconnectRejection = new Error("backend refused to close")
+    deferred.release()
+    await connecting.catch(() => undefined)
+
+    return { tabsStore, wsStore }
+  }
+
+  it("keeps a stranded id when the tab is closed before it exists", async () => {
+    const { wsStore } = await tabClosedDuringPrepareWithFailingCleanup()
+
+    // Nothing else in the frontend knows this id: no tab holds it and no
+    // connection state was ever created for it.
+    expect(wsStore.orphanConnections).toContain("ws-1")
+  })
+
+  it("retries a stranded id on the next connect from any tab", async () => {
+    const { tabsStore, wsStore } = await tabClosedDuringPrepareWithFailingCleanup()
+    backend.state.disconnectRejection = undefined
+    backend.state.preparedId = "ws-2"
+
+    const other = tabsStore.addWsTab()
+    const callsBefore = backend.state.calls.length
+    await wsStore.connect(other.id, "wss://example.test/socket", [])
+
+    expect(backend.state.calls.slice(callsBefore)[0]).toBe("ws_disconnect")
+  })
+
+  it("forgets a stranded id once it finally closes", async () => {
+    const { tabsStore, wsStore } = await tabClosedDuringPrepareWithFailingCleanup()
+    backend.state.disconnectRejection = undefined
+    backend.state.preparedId = "ws-2"
+
+    const other = tabsStore.addWsTab()
+    await wsStore.connect(other.id, "wss://example.test/socket", [])
+
+    expect(wsStore.orphanConnections).toHaveLength(0)
+  })
+
+  it("keeps a stranded id listed when the retry fails again", async () => {
+    const { tabsStore, wsStore } = await tabClosedDuringPrepareWithFailingCleanup()
+    backend.state.preparedId = "ws-2"
+
+    const other = tabsStore.addWsTab()
+    await wsStore.connect(other.id, "wss://example.test/socket", []).catch(() => undefined)
+
+    // Still unreachable, so it must stay owned rather than be dropped.
+    expect(wsStore.orphanConnections).toContain("ws-1")
+  })
+
   it("does not recreate the message map when a parked disconnect resumes after teardown", async () => {
     const { wsStore, tab } = setup()
     const connectionId = (await wsStore.connect(tab.id, tab.url, []))!
