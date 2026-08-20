@@ -80,12 +80,8 @@ import type { WsEventPayload } from "../../types"
 
 const T = (key: string) => i18n.global.t(key)
 
-function emit(connectionId: string, payload: Partial<WsEventPayload>) {
-  const handler = backend.state.handlers.get(`ws-event-${connectionId}`)
-  if (!handler) {
-    throw new Error(`no listener registered for ${connectionId}`)
-  }
-  handler({
+function payloadFor(connectionId: string, payload: Partial<WsEventPayload>) {
+  return {
     payload: {
       connectionId,
       eventType: "message",
@@ -93,7 +89,40 @@ function emit(connectionId: string, payload: Partial<WsEventPayload>) {
       timestamp: "2026-08-20T00:00:00.000Z",
       ...payload,
     },
-  })
+  }
+}
+
+function emit(connectionId: string, payload: Partial<WsEventPayload>) {
+  const handler = backend.state.handlers.get(`ws-event-${connectionId}`)
+  if (!handler) {
+    throw new Error(`no listener registered for ${connectionId}`)
+  }
+  handler(payloadFor(connectionId, payload))
+}
+
+/**
+ * Delivers an event without requiring a listener, dropping it when none is
+ * registered — which is what the real runtime does, since Tauri has no event
+ * replay.
+ *
+ * Using the strict `emit` for the in-flight-frame case would make that test go
+ * red because the *harness* threw, not because the frame was lost, and the
+ * assertion about the message would never be what decides the result.
+ */
+function emitLossy(connectionId: string, payload: Partial<WsEventPayload>) {
+  backend.state.handlers
+    .get(`ws-event-${connectionId}`)
+    ?.(payloadFor(connectionId, payload))
+}
+
+async function connectAndCaptureConsole() {
+  const { wsStore, tab } = setup()
+  const environments = useEnvironmentsStore()
+  environments.variables = [{ key: "token", value: "s3cr3t", secret: true }]
+
+  await wsStore.connect(tab.id, "wss://example.test/?t={{token}}", [])
+
+  return consoleMock.mock.calls.map((call) => String(call[1])).join("\n")
 }
 
 function setup() {
@@ -144,7 +173,9 @@ describe("websocket connect lifecycle", () => {
   it("keeps frames that arrive while ws_connect is still pending", async () => {
     const { wsStore, tab } = setup()
     backend.state.onConnect = (connectionId) => {
-      emit(connectionId, { eventType: "message", content: "hello" })
+      // Lossy on purpose: if the listener is not up yet the frame is simply
+      // gone, exactly as it would be in the app.
+      emitLossy(connectionId, { eventType: "message", content: "hello" })
     }
 
     const connectionId = await wsStore.connect(tab.id, tab.url, [])
@@ -279,16 +310,18 @@ describe("websocket connect lifecycle", () => {
     expect(tabsStore.tabs.find((item) => item.id === tab.id)?.url).toBe(template)
   })
 
-  it("logs the template url, never the resolved secret", async () => {
-    const { wsStore, tab } = setup()
-    const environments = useEnvironmentsStore()
-    environments.variables = [{ key: "token", value: "s3cr3t", secret: true }]
-    const template = "wss://example.test/?t={{token}}"
+  // Split into two single-assertion cases on purpose. Held together, both
+  // assertions flip on the same mutation, and a fixture where two assertions
+  // fail at once cannot show that either one of them is carrying weight.
+  it("logs the template url", async () => {
+    const logged = await connectAndCaptureConsole()
 
-    await wsStore.connect(tab.id, template, [])
-
-    const logged = consoleMock.mock.calls.map((call) => String(call[1])).join("\n")
     expect(logged).toContain("{{token}}")
+  })
+
+  it("never logs the resolved secret", async () => {
+    const logged = await connectAndCaptureConsole()
+
     expect(logged).not.toContain("s3cr3t")
   })
 

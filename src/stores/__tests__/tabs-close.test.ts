@@ -149,6 +149,19 @@ describe("useTabsStore websocket cleanup", () => {
     expect(store.tabs[0].response).toBeNull()
   })
 
+  // Deliberately one assertion. The longer close-to-the-right case above also
+  // goes red when the reset branch is removed, but it fails on several
+  // assertions at once, so it cannot show that any single one of them decides
+  // the outcome.
+  it("replaces the last tab rather than leaving the list empty", async () => {
+    const store = useTabsStore()
+    const only = store.tabs[0]
+
+    await store.removeTab(only.id)
+
+    expect(store.tabs).toHaveLength(1)
+  })
+
   it("leaves non-websocket tabs alone", async () => {
     const store = useTabsStore()
     const httpTab = store.addTab()
