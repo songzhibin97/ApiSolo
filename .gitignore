@@ -92,3 +92,6 @@ templates
 # Rust / Tauri
 src-tauri/target/
 # ai-clean:end
+# Process docs stay local (owner decision 2026-08-20): never commit these
+specs/
+docs/review/
