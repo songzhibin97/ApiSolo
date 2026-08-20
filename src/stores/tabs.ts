@@ -2,6 +2,7 @@ import { computed, nextTick, ref } from "vue";
 import { defineStore } from "pinia";
 
 import i18n from "../i18n";
+import { recordConsoleEntry } from "./console"
 import { useWebSocketStore } from "./websocket"
 import {
   bodyKindFromBodyType,
@@ -89,16 +90,25 @@ async function cleanupWebSocketTab(tab: Tab) {
     return
   }
 
-  const connectionId = tab.wsConnectionId
   const websocketStore = useWebSocketStore()
 
   try {
-    await websocketStore.disconnect(connectionId)
-  } catch {
-    // Keep tab cleanup best-effort even if the socket is already gone.
+    await websocketStore.teardown(tab.wsConnectionId)
+  } catch (error) {
+    // The tab still closes — refusing to close it would leave the user stuck.
+    // But this tab is the only thing naming that connection, and it is about to
+    // be removed from the list, so the id moves to an owner that survives the
+    // tab. Without this the handle would vanish along with the tab it was
+    // stored on.
+    websocketStore.adoptOrphanConnection(tab.wsConnectionId)
+    recordConsoleEntry(
+      "error",
+      `[network] WebSocket cleanup failed while closing a tab, connection may still be open: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      "network",
+    )
   }
-
-  websocketStore.clearMessages(connectionId)
 }
 
 function createEditablePairs<T extends KeyValuePair>(items: T[]): T[] {
@@ -208,13 +218,20 @@ export const useTabsStore = defineStore("tabs", () => {
   }
 
   async function removeTab(id: string) {
-    const index = tabs.value.findIndex((tab) => tab.id === id);
-    if (index === -1) {
+    const target = tabs.value.find((tab) => tab.id === id)
+    if (!target) {
       return;
     }
 
-    const target = tabs.value[index]
     await cleanupWebSocketTab(target)
+
+    // Re-resolved after the await. The list can change while the socket is
+    // closing, and splicing a pre-await index would remove whichever tab
+    // happens to sit there now.
+    const index = tabs.value.findIndex((tab) => tab.id === id)
+    if (index === -1) {
+      return;
+    }
 
     if (tabs.value.length === 1) {
       const replacement = createEmptyTab(1)
@@ -485,11 +502,14 @@ export const useTabsStore = defineStore("tabs", () => {
     }
 
     const closingTabs = tabs.value.filter((tab) => tab.id !== id)
+    const closingIds = new Set(closingTabs.map((tab) => tab.id))
     for (const tab of closingTabs) {
       await cleanupWebSocketTab(tab)
     }
 
-    tabs.value = [target]
+    // Filter by id rather than assigning the pre-await snapshot: tabs created
+    // while the sockets were closing must survive.
+    tabs.value = tabs.value.filter((tab) => tab.id === id || !closingIds.has(tab.id))
     activeTabId.value = id
   }
 
@@ -500,11 +520,14 @@ export const useTabsStore = defineStore("tabs", () => {
     }
 
     const closingTabs = tabs.value.slice(index + 1)
+    const closingIds = new Set(closingTabs.map((tab) => tab.id))
     for (const tab of closingTabs) {
       await cleanupWebSocketTab(tab)
     }
 
-    tabs.value = tabs.value.slice(0, index + 1)
+    // Same reason as closeOtherTabs: filter by id, never re-slice a stale
+    // snapshot.
+    tabs.value = tabs.value.filter((tab) => !closingIds.has(tab.id))
     if (!tabs.value.some((tab) => tab.id === activeTabId.value)) {
       activeTabId.value = id
     }

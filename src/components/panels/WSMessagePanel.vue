@@ -16,11 +16,16 @@ const { t } = useI18n()
 
 const listRef = ref<HTMLDivElement | null>(null)
 const activeFilter = ref<MessageFilter>("all")
-const expandedIds = ref<string[]>([])
+// A Set, not an array: `isExpanded` runs once per rendered row, so an
+// `includes` scan would make rendering O(rows x expanded).
+const expandedIds = ref(new Set<string>())
 
 const connectionId = computed(() => activeTab.value.wsConnectionId ?? "")
 const allMessages = computed(() =>
   connectionId.value ? websocketStore.getMessages(connectionId.value) : [],
+)
+const droppedCount = computed(() =>
+  connectionId.value ? websocketStore.getDroppedCount(connectionId.value) : 0,
 )
 
 const filteredMessages = computed(() => {
@@ -31,20 +36,20 @@ const filteredMessages = computed(() => {
   return allMessages.value.filter((message) => message.direction === activeFilter.value)
 })
 
-watch(
-  filteredMessages,
-  async () => {
-    await nextTick()
-    if (listRef.value) {
-      listRef.value.scrollTop = listRef.value.scrollHeight
-    }
-  },
-  { deep: true },
-)
+// No `deep: true`. The store replaces the array wholesale on every push and
+// never mutates a stored message in place, so shallow comparison already fires
+// on every change — while a deep watcher would walk the entire history on each
+// arriving frame.
+watch(filteredMessages, async () => {
+  await nextTick()
+  if (listRef.value) {
+    listRef.value.scrollTop = listRef.value.scrollHeight
+  }
+})
 
 watch(connectionId, () => {
   activeFilter.value = "all"
-  expandedIds.value = []
+  expandedIds.value = new Set()
 })
 
 function clearMessages() {
@@ -56,13 +61,17 @@ function clearMessages() {
 }
 
 function toggleExpanded(id: string) {
-  expandedIds.value = expandedIds.value.includes(id)
-    ? expandedIds.value.filter((item) => item !== id)
-    : [...expandedIds.value, id]
+  const next = new Set(expandedIds.value)
+
+  if (!next.delete(id)) {
+    next.add(id)
+  }
+
+  expandedIds.value = next
 }
 
 function isExpanded(id: string) {
-  return expandedIds.value.includes(id)
+  return expandedIds.value.has(id)
 }
 
 function directionGlyph(direction: WsMessage["direction"]) {
@@ -114,8 +123,16 @@ function formatContent(content: string) {
 <template>
   <section class="flex h-full min-h-0 flex-col bg-[color-mix(in_srgb,var(--bg-primary)_88%,black)]">
     <div class="flex items-center justify-between gap-3 border-b border-[var(--border)] px-4 py-3">
-      <div class="text-sm font-medium text-[var(--text-primary)]">
-        {{ t("ws.messages") }} ({{ allMessages.length }})
+      <div class="flex items-center gap-2">
+        <div class="text-sm font-medium text-[var(--text-primary)]">
+          {{ t("ws.messages") }} ({{ allMessages.length }})
+        </div>
+        <span
+          v-if="droppedCount > 0"
+          class="rounded border border-amber-400/40 bg-amber-400/10 px-1.5 py-0.5 text-[11px] text-amber-300"
+        >
+          {{ t("ws.droppedMessages", { count: droppedCount }) }}
+        </span>
       </div>
 
       <div class="flex items-center gap-2">
@@ -189,6 +206,12 @@ function formatContent(content: string) {
             :class="isExpanded(message.id) ? '' : 'line-clamp-1'"
           >
             {{ isExpanded(message.id) ? formatContent(message.content) : message.content }}
+          </span>
+          <span
+            v-if="message.truncated"
+            class="shrink-0 rounded border border-amber-400/40 bg-amber-400/10 px-1.5 py-0.5 text-[11px] text-amber-300"
+          >
+            {{ t("ws.truncated") }}
           </span>
         </div>
       </button>

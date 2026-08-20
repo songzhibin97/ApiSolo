@@ -1,6 +1,9 @@
-import { describe, expect, it } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
+import { createPinia, setActivePinia } from "pinia"
 
-import { shouldIgnoreEvent } from "../useKeyboard"
+import { shouldIgnoreEvent, useKeyboard } from "../useKeyboard"
+import { useRequestStore } from "../../stores/request"
+import { useTabsStore } from "../../stores/tabs"
 
 function makeTarget(overrides: Partial<{
   tagName: string
@@ -39,5 +42,93 @@ describe("shouldIgnoreEvent", () => {
 
   it("allows shortcuts outside editables", () => {
     expect(shouldIgnoreEvent(makeEvent(makeTarget()))).toBe(false)
+  })
+})
+
+describe("Cmd/Ctrl+Enter routing", () => {
+  let dispatched: string[]
+
+  function keyEvent(target = makeTarget()) {
+    return {
+      key: "Enter",
+      metaKey: true,
+      ctrlKey: false,
+      target,
+      preventDefault: vi.fn(),
+    } as unknown as KeyboardEvent
+  }
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    dispatched = []
+    vi.stubGlobal("window", {
+      dispatchEvent: (event: { type: string }) => {
+        dispatched.push(event.type)
+        return true
+      },
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    vi.stubGlobal(
+      "CustomEvent",
+      class CustomEventMock {
+        constructor(public type: string) {}
+      },
+    )
+  })
+
+  it("sends the ws draft instead of an http request on a websocket tab", async () => {
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+    const sendRequest = vi.spyOn(requestStore, "sendRequest").mockResolvedValue(undefined as never)
+
+    const wsTab = tabsStore.addWsTab()
+    tabsStore.setActiveTab(wsTab.id)
+    tabsStore.updateTab(wsTab.id, { url: "wss://example.test/socket" })
+
+    const { handleKeydown } = useKeyboard()
+    dispatched = []
+    await handleKeydown(keyEvent())
+
+    // Membership, not exact equality: addTab schedules an unrelated
+    // "apisolo:focus-url" on nextTick, which the await above flushes.
+    expect(dispatched).toContain("apisolo:ws-send")
+    expect(sendRequest).not.toHaveBeenCalled()
+  })
+
+  it("still sends an http request on an http tab", async () => {
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+    const sendRequest = vi.spyOn(requestStore, "sendRequest").mockResolvedValue(undefined as never)
+
+    const httpTab = tabsStore.tabs[0]
+    tabsStore.setActiveTab(httpTab.id)
+    // No in-flight request: sendRequest bails out early on a loading tab, which
+    // would make this pass for the wrong reason.
+    tabsStore.updateTab(httpTab.id, { url: "https://example.test/api", isLoading: false })
+
+    const { handleKeydown } = useKeyboard()
+    dispatched = []
+    await handleKeydown(keyEvent())
+
+    expect(sendRequest).toHaveBeenCalledTimes(1)
+    expect(dispatched).not.toContain("apisolo:ws-send")
+  })
+
+  it("ignores Cmd+Enter fired from a textarea", async () => {
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+    const sendRequest = vi.spyOn(requestStore, "sendRequest").mockResolvedValue(undefined as never)
+
+    const httpTab = tabsStore.tabs[0]
+    tabsStore.setActiveTab(httpTab.id)
+    tabsStore.updateTab(httpTab.id, { url: "https://example.test/api" })
+
+    const { handleKeydown } = useKeyboard()
+    dispatched = []
+    await handleKeydown(keyEvent(makeTarget({ tagName: "TEXTAREA" })))
+
+    expect(sendRequest).not.toHaveBeenCalled()
+    expect(dispatched).not.toContain("apisolo:ws-send")
   })
 })

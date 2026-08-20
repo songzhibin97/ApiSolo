@@ -1,4 +1,4 @@
-import { onMounted, onUnmounted } from "vue";
+import { getCurrentInstance, onMounted, onUnmounted } from "vue";
 
 import i18n from "../i18n";
 import { useProjectsStore } from "../stores/projects";
@@ -27,6 +27,14 @@ export function useKeyboard() {
 
     if (key === "enter") {
       event.preventDefault();
+
+      // A websocket tab has no HTTP request to send. Firing one here would be
+      // an invisible request the user never asked for.
+      if (tabsStore.activeTab.protocol === "websocket") {
+        window.dispatchEvent(new CustomEvent("apisolo:ws-send"));
+        return;
+      }
+
       if (!tabsStore.activeTab.url.trim()) {
         tabsStore.updateTab(tabsStore.activeTab.id, {
           responseError: i18n.global.t("request.urlRequired"),
@@ -82,13 +90,21 @@ export function useKeyboard() {
     }
   }
 
-  onMounted(() => {
-    window.addEventListener("keydown", handleKeydown, true);
-  });
+  // Returning the handler lets tests drive the real production branch instead
+  // of a copy of it. The instance check has no runtime effect — onMounted
+  // already requires a component instance — it just stops the lifecycle hooks
+  // from warning when the composable is called outside one.
+  if (getCurrentInstance()) {
+    onMounted(() => {
+      window.addEventListener("keydown", handleKeydown, true);
+    });
 
-  onUnmounted(() => {
-    window.removeEventListener("keydown", handleKeydown, true);
-  });
+    onUnmounted(() => {
+      window.removeEventListener("keydown", handleKeydown, true);
+    });
+  }
+
+  return { handleKeydown };
 }
 
 export function shouldIgnoreEvent(event: Pick<KeyboardEvent, "target">) {
