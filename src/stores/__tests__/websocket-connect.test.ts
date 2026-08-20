@@ -591,6 +591,44 @@ describe("websocket connect lifecycle", () => {
     await expect(connecting).rejects.toThrow("backend refused to close")
   })
 
+  async function cancelWithFailingCleanup() {
+    const { tabsStore, wsStore, tab } = setup()
+    const deferred = backend.makeDeferred()
+    backend.state.deferPrepare = deferred as never
+
+    const connecting = wsStore.connect(tab.id, tab.url, [])
+    await deferred.entered
+    backend.state.disconnectRejection = new Error("backend refused to close")
+    await wsStore.cancelOrDisconnect(tab.id, undefined).catch(() => undefined)
+    deferred.release()
+    await connecting.catch(() => undefined)
+
+    return { tabsStore, wsStore, tab }
+  }
+
+  it("keeps the leaked id on the tab when cancel cleanup fails twice", async () => {
+    const { tabsStore, tab } = await cancelWithFailingCleanup()
+
+    // The id was never stored on the tab during a normal cancel, but after a
+    // double cleanup failure it is the only route left to a connection the
+    // backend may still hold.
+    expect(tabsStore.tabs.find((item) => item.id === tab.id)?.wsConnectionId).toBe("ws-1")
+  })
+
+  it("retries the failed teardown on the next connect attempt", async () => {
+    const { wsStore, tab } = await cancelWithFailingCleanup()
+
+    // The backend recovers; the next connect must deal with the stranded id
+    // before starting anything new.
+    backend.state.disconnectRejection = undefined
+    const callsBefore = backend.state.calls.length
+    backend.state.preparedId = "ws-2"
+    await wsStore.connect(tab.id, tab.url, [])
+
+    const afterwards = backend.state.calls.slice(callsBefore)
+    expect(afterwards[0]).toBe("ws_disconnect")
+  })
+
   it("does not recreate the message map when a parked disconnect resumes after teardown", async () => {
     const { wsStore, tab } = setup()
     const connectionId = (await wsStore.connect(tab.id, tab.url, []))!

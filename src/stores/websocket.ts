@@ -334,13 +334,18 @@ export const useWebSocketStore = defineStore("websocket", () => {
           cleanupError = failure
         }
       }
-      tabsStore.updateTab(tabId, { wsStatus: "disconnected", wsConnectionId: undefined })
-
       if (cleanupError !== undefined) {
         // Handing the id back failed twice. The backend may still hold this
         // connection, so reporting a clean cancel here would be a lie — and a
         // cancel that silently leaves a socket open is exactly what the caller
         // needs to hear about.
+        //
+        // The id is written onto the tab rather than cleared, even when it was
+        // never stored there: it is the only remaining route to that
+        // connection, and the next connect on this tab retries teardown before
+        // doing anything else. Clearing it here would be the same mistake
+        // teardown used to make, one layer up.
+        tabsStore.updateTab(tabId, { wsStatus: "disconnected", wsConnectionId: id })
         recordConsoleEntry(
           "error",
           `[network] WebSocket cleanup failed, connection may still be open: ${describeError(cleanupError)}`,
@@ -348,6 +353,10 @@ export const useWebSocketStore = defineStore("websocket", () => {
         )
         throw cleanupError
       }
+
+      // Cleanup succeeded, so the id points at nothing and clearing it loses
+      // no route to anything.
+      tabsStore.updateTab(tabId, { wsStatus: "disconnected", wsConnectionId: undefined })
 
       if (wasCancelled) {
         // A cancel is the user's intent, not a failure to report.
