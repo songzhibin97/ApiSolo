@@ -341,15 +341,18 @@ export const useWebSocketStore = defineStore("websocket", () => {
       const wasCancelled =
         attempt.cancelled || (id !== undefined && (connections.value[id]?.cancelled ?? true))
 
-      let cleanupError: unknown
+      // Paired deliberately: a cleanup failure only exists when there was an id
+      // to clean up, and keeping them together is what lets the recovery below
+      // work with an id it knows is real.
+      let stranded: { id: string; error: unknown } | undefined
       if (id !== undefined) {
         try {
           await teardown(id)
         } catch (failure) {
-          cleanupError = failure
+          stranded = { id, error: failure }
         }
       }
-      if (cleanupError !== undefined) {
+      if (stranded !== undefined) {
         // Handing the id back failed twice. The backend may still hold this
         // connection, so reporting a clean cancel here would be a lie — and a
         // cancel that silently leaves a socket open is exactly what the caller
@@ -363,16 +366,16 @@ export const useWebSocketStore = defineStore("websocket", () => {
         // no state record exists either, so the id would vanish entirely. The
         // orphan list is the owner that does not depend on the tab surviving.
         if (tabsStore.tabs.some((item) => item.id === tabId)) {
-          tabsStore.updateTab(tabId, { wsStatus: "disconnected", wsConnectionId: id })
-        } else if (!orphanConnections.value.includes(id)) {
-          orphanConnections.value = [...orphanConnections.value, id]
+          tabsStore.updateTab(tabId, { wsStatus: "disconnected", wsConnectionId: stranded.id })
+        } else if (!orphanConnections.value.includes(stranded.id)) {
+          orphanConnections.value = [...orphanConnections.value, stranded.id]
         }
         recordConsoleEntry(
           "error",
-          `[network] WebSocket cleanup failed, connection may still be open: ${describeError(cleanupError)}`,
+          `[network] WebSocket cleanup failed, connection may still be open: ${describeError(stranded.error)}`,
           "network",
         )
-        throw cleanupError
+        throw stranded.error
       }
 
       // Cleanup succeeded, so the id points at nothing and clearing it loses
