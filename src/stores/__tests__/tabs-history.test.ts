@@ -114,6 +114,38 @@ describe("useTabsStore.openHistoryEntry", () => {
         download: 9,
         total: 236,
       },
+      bodyKind: "text",
+    })
+  })
+
+  describe("§56 the response body kind comes back with the response", () => {
+    it("restores the kind the entry was written with", () => {
+      const store = useTabsStore()
+
+      store.openHistoryEntry(
+        makeHistoryEntry({
+          status: 200,
+          // Built at runtime on purpose. Written as literal bytes this file
+          // stops being text: git diffs it as binary and no reviewer can read
+          // the change. The bytes matter because they are what makes a body
+          // binary upstream, so the fixture keeps them without keeping them in
+          // the source.
+          responseBody: `${String.fromCharCode(0, 1)}binary`,
+          responseBodyKind: "binary",
+        }),
+      )
+
+      expect(store.activeTab.response?.bodyKind).toBe("binary")
+    })
+
+    it("reads an entry written before the field existed as text", () => {
+      const store = useTabsStore()
+      const legacy = makeHistoryEntry({ status: 200, responseBody: "hello" })
+      delete (legacy as { responseBodyKind?: unknown }).responseBodyKind
+
+      store.openHistoryEntry(legacy)
+
+      expect(store.activeTab.response?.bodyKind).toBe("text")
     })
   })
 

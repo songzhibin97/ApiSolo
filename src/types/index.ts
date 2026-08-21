@@ -150,6 +150,14 @@ export interface RequestTimings {
   total: number
 }
 
+/**
+ * Machine-readable companion to a response body. Declared non-optional because
+ * the Rust side always serialises it: reading the producing struct is the only
+ * way to get this right, and the previous omission here is exactly why nothing
+ * in the frontend could tell a binary body from server text.
+ */
+export type ResponseBodyKind = "text" | "binary"
+
 export interface HttpResponse {
   status: number
   statusText: string
@@ -159,6 +167,7 @@ export interface HttpResponse {
   time: number
   timings: RequestTimings
   contentType: string
+  bodyKind: ResponseBodyKind
 }
 
 export interface HistoryEntry {
@@ -184,6 +193,9 @@ export interface HistoryEntry {
   testScript?: string
   responseBody?: string
   responseHeaders?: [string, string][]
+  note?: string
+  starred?: boolean
+  responseBodyKind?: ResponseBodyKind
 }
 
 export interface ScriptAssertion {

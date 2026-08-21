@@ -152,7 +152,12 @@ function formatBytes(size: number) {
       </div>
 
       <div class="min-h-0 flex-1 overflow-hidden bg-[var(--bg-primary)] p-4">
-        <ResponseBody v-if="activeSection === 'body'" :body="response.body" :content-type="response.contentType" />
+        <ResponseBody
+          v-if="activeSection === 'body'"
+          :body="response.body"
+          :content-type="response.contentType"
+          :body-kind="response.bodyKind"
+        />
         <ResponseHeaders v-else-if="activeSection === 'headers'" :headers="response.headers" />
         <ResponseCookies v-else-if="activeSection === 'cookies'" :headers="response.headers" />
         <ScriptResults v-else-if="activeSection === 'tests'" :result="scriptResult" />

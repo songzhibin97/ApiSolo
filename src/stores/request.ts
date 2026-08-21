@@ -494,6 +494,7 @@ function buildHistoryEntry(tab: Tab, response: HttpResponse): HistoryEntry {
         ? `${response.body.slice(0, HISTORY_RESPONSE_BODY_LIMIT)}\n[truncated]`
         : response.body,
     responseHeaders: response.headers,
+    responseBodyKind: response.bodyKind,
   }
 
   return sanitizeHistoryEntry(raw)

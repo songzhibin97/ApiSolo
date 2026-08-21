@@ -101,3 +101,74 @@ describe("filterEntries", () => {
     expect(filterEntries(entries, "  ")).toHaveLength(2)
   })
 })
+
+describe("§37/§42 notes are searchable and stars are filterable", () => {
+  function entry(overrides: Partial<HistoryEntry> = {}): HistoryEntry {
+    return {
+      id: "e-1",
+      method: "GET",
+      url: "https://api.example.com/things",
+      status: 200,
+      time: 5,
+      size: 2,
+      timestamp: "2026-03-27T10:00:00Z",
+      contentType: "application/json",
+      ...overrides,
+    } as HistoryEntry
+  }
+
+  const noted = entry({ id: "noted", url: "https://api.example.com/a", note: "the flaky one" })
+  const plain = entry({ id: "plain", url: "https://api.example.com/b" })
+  const starred = entry({ id: "starred", url: "https://api.example.com/c", starred: true })
+
+  it("§37 finds an entry by a word that only appears in its note", () => {
+    expect(filterEntries([noted, plain], "flaky").map((item) => item.id)).toEqual(["noted"])
+  })
+
+  it("§37 returns nothing when the word is in neither the url nor the note", () => {
+    expect(filterEntries([noted, plain], "nowhere")).toEqual([])
+  })
+
+  it("§38 stops matching once the note is cleared", () => {
+    const cleared = { ...noted, note: undefined }
+
+    expect(filterEntries([cleared, plain], "flaky")).toEqual([])
+  })
+
+  it("§42 lists only starred entries while the filter is on", () => {
+    expect(filterEntries([noted, plain, starred], "", true).map((item) => item.id)).toEqual([
+      "starred",
+    ])
+  })
+
+  it("§42 restores the full list when the filter goes off", () => {
+    expect(filterEntries([noted, plain, starred], "", false)).toHaveLength(3)
+  })
+
+  it("§42 intersects the filter with the search instead of overriding it", () => {
+    const starredElsewhere = entry({ id: "other", url: "https://api.example.com/z", starred: true })
+
+    expect(
+      filterEntries([noted, plain, starred, starredElsewhere], "/c", true).map((item) => item.id),
+    ).toEqual(["starred"])
+  })
+
+  // Two groups, each holding one starred and one plain row. Filtering must
+  // thin every group without dissolving any of them: a fixture where a whole
+  // group disappears cannot tell "still grouped" apart from "flattened".
+  it("§42 keeps the grouping shape, only thinner", () => {
+    const rows = [
+      entry({ id: "s1", url: "https://api.example.com/users/1", starred: true }),
+      entry({ id: "p1", url: "https://api.example.com/users/2" }),
+      entry({ id: "s2", url: "https://api.example.com/orders/1", starred: true }),
+      entry({ id: "p2", url: "https://api.example.com/orders/2" }),
+    ]
+
+    const all = groupByPrefix(filterEntries(rows, "", false), 1)
+    const onlyStarred = groupByPrefix(filterEntries(rows, "", true), 1)
+
+    expect(onlyStarred.map((group) => group.label)).toEqual(all.map((group) => group.label))
+    expect(all.map((group) => group.count)).toEqual([2, 2])
+    expect(onlyStarred.map((group) => group.count)).toEqual([1, 1])
+  })
+})

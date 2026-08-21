@@ -319,9 +319,13 @@ async fn measure_connection_timings(url: &Url, budget: Duration) -> (u64, u64) {
 /// Machine-readable companion to `HttpResponse::body`. Without it the frontend
 /// could only tell an ApiSolo placeholder from genuine server text by matching
 /// the placeholder string, which is a far worse contract.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum ResponseBodyKind {
+    // A history row written before this field existed is text: that is what the
+    // panel already assumed, and defaulting to Binary would hide those bodies
+    // behind the binary notice.
+    #[default]
     Text,
     Binary,
 }
@@ -379,6 +383,12 @@ struct HistoryEntry {
     response_body: String,
     #[serde(default)]
     response_headers: Vec<(String, String)>,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    starred: bool,
+    #[serde(default)]
+    response_body_kind: ResponseBodyKind,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -3421,8 +3431,20 @@ fn append_history(mut entry: HistoryEntry) -> Result<(), String> {
     file.entries.push(entry);
 
     if file.entries.len() > MAX_HISTORY_ENTRIES {
-        let overflow = file.entries.len() - MAX_HISTORY_ENTRIES;
-        file.entries.drain(0..overflow);
+        // Starred rows are exempt from automatic eviction, so the overflow has
+        // to be taken out of the unstarred ones only. `retain` walks front to
+        // back, which is oldest first, and stops taking once the quota is met.
+        // When everything is starred the quota is never met and the file is
+        // allowed to grow past the cap -- that is the deal starring makes.
+        let mut overflow = file.entries.len() - MAX_HISTORY_ENTRIES;
+        file.entries.retain(|entry| {
+            if overflow > 0 && !entry.starred {
+                overflow -= 1;
+                false
+            } else {
+                true
+            }
+        });
     }
 
     write_history_entries(&file.entries, &file.corrupt_lines)
@@ -3485,6 +3507,51 @@ fn update_history_entries(entries: Vec<HistoryEntry>) -> Result<(), String> {
 
     // Passing &[] here would silently drop quarantine-bound lines that may
     // carry plaintext credentials.
+    write_history_entries(&file.entries, &file.corrupt_lines)
+}
+
+/// Trims, then folds blank to "no note": a note of spaces is not a note, and
+/// once trimmed it has to be indistinguishable from never having written one.
+fn normalize_history_note(note: &str) -> Option<String> {
+    let trimmed = note.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Takes the id and the two annotation fields, never a whole entry. A caller
+/// that hands back a row it read earlier would overwrite whatever changed in
+/// between, and `HistoryEntry` drops fields this binary does not know -- one
+/// stale round trip would erase them from the entire file.
+///
+/// `None` and `Some("")` are different on purpose: `None` means this call said
+/// nothing about that field, `Some("")` means clear it. Collapsing the two
+/// would make every star toggle wipe the note.
+#[tauri::command]
+fn set_history_annotation(
+    id: String,
+    note: Option<String>,
+    starred: Option<bool>,
+) -> Result<(), String> {
+    let _guard = lock_history();
+    let mut file = read_history_entries()?;
+
+    let entry = file
+        .entries
+        .iter_mut()
+        .find(|entry| entry.id == id)
+        .ok_or_else(|| format!("History entry {id} does not exist"))?;
+
+    if let Some(note) = note {
+        entry.note = normalize_history_note(&note);
+    }
+
+    if let Some(starred) = starred {
+        entry.starred = starred;
+    }
+
     write_history_entries(&file.entries, &file.corrupt_lines)
 }
 
@@ -4971,6 +5038,17 @@ struct UpdateHistoryEntriesArgs {
 }
 
 #[derive(Deserialize)]
+struct SetHistoryAnnotationArgs {
+    id: String,
+    // Both stay `Option` across the bridge for the same reason they do in the
+    // command: an absent key must not read as "clear it".
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    starred: Option<bool>,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CancelRequestArgs {
     request_id: String,
@@ -5171,6 +5249,12 @@ async fn api_update_history_entries(Json(args): Json<UpdateHistoryEntriesArgs>) 
     api_unit(update_history_entries(args.entries))
 }
 
+async fn api_set_history_annotation(
+    Json(args): Json<SetHistoryAnnotationArgs>,
+) -> impl IntoResponse {
+    api_unit(set_history_annotation(args.id, args.note, args.starred))
+}
+
 #[cfg(feature = "dev-bridge")]
 async fn start_dev_server() {
     let app = Router::new()
@@ -5218,6 +5302,10 @@ async fn start_dev_server() {
         .route(
             "/api/update_history_entries",
             post(api_update_history_entries),
+        )
+        .route(
+            "/api/set_history_annotation",
+            post(api_set_history_annotation),
         )
         .layer(middleware::from_fn(require_dev_bridge_token))
         .layer(dev_bridge_cors_layer());
@@ -5273,6 +5361,7 @@ pub fn run() {
             clear_history,
             delete_history_entry,
             update_history_entries,
+            set_history_annotation,
             get_history_health,
             get_secret_key_collisions,
             acknowledge_secret_key_collision,
@@ -6010,6 +6099,9 @@ mod tests {
             test_script: String::new(),
             response_body: String::new(),
             response_headers: vec![],
+            note: None,
+            starred: false,
+            response_body_kind: ResponseBodyKind::Text,
         }
     }
 
@@ -7009,6 +7101,9 @@ mod tests {
                 .to_string(),
             response_body: "{\"ok\":true}".to_string(),
             response_headers: vec![("content-type".to_string(), "application/json".to_string())],
+            note: None,
+            starred: false,
+            response_body_kind: ResponseBodyKind::Text,
         };
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -7299,6 +7394,9 @@ mod tests {
                 test_script: String::new(),
                 response_body: get_response.body.clone(),
                 response_headers: get_response.headers.clone(),
+                note: None,
+                starred: false,
+                response_body_kind: ResponseBodyKind::Text,
             };
             append_history(history_entry).unwrap();
 
@@ -7368,6 +7466,9 @@ mod tests {
                 test_script: String::new(),
                 response_body: post_response.body.clone(),
                 response_headers: post_response.headers.clone(),
+                note: None,
+                starred: false,
+                response_body_kind: ResponseBodyKind::Text,
             };
             append_history(post_history).unwrap();
 
@@ -8727,6 +8828,9 @@ mod tests {
             test_script: "pm.test('ok', () => true)".to_string(),
             response_body: "{\"id\":1}".to_string(),
             response_headers: vec![("content-type".to_string(), "application/json".to_string())],
+            note: None,
+            starred: false,
+            response_body_kind: ResponseBodyKind::Text,
         };
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -11394,6 +11498,402 @@ mod tests {
         let health = get_history_health().unwrap();
         assert_eq!(health.skipped_lines, 0);
         assert_eq!(health.quarantined_lines, 2);
+    }
+
+    // ----------------------------------------------------------------- D07
+    // Notes, stars, and the response-body kind: three fields on the existing
+    // history row, plus the eviction rule starring buys.
+
+    fn d07_entry(id: &str, timestamp: &str, starred: bool) -> HistoryEntry {
+        let mut entry = sample_history_entry(id, timestamp);
+        entry.starred = starred;
+        entry
+    }
+
+    fn d07_seed(entries: &[HistoryEntry]) {
+        write_history_entries(entries, &[]).unwrap();
+    }
+
+    fn d07_disk_entries() -> Vec<HistoryEntry> {
+        read_history_entries().unwrap().entries
+    }
+
+    fn d07_disk_ids() -> Vec<String> {
+        d07_disk_entries()
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect()
+    }
+
+    fn d07_find(id: &str) -> HistoryEntry {
+        d07_disk_entries()
+            .into_iter()
+            .find(|entry| entry.id == id)
+            .unwrap_or_else(|| panic!("history entry {id} is not on disk"))
+    }
+
+    /// Field-by-field comparison without a `PartialEq` derive on the production
+    /// struct. Serialising both sides also means a field added later is
+    /// compared automatically instead of being silently skipped.
+    fn d07_json(entry: &HistoryEntry) -> serde_json::Value {
+        serde_json::to_value(entry).unwrap()
+    }
+
+    /// Takes write permission off a directory so the next `write_atomic` cannot
+    /// create its temp file. This is the call-site probe: it fails a write that
+    /// insists on being atomic, while a plain truncating write to an *existing*
+    /// file inside that directory still succeeds (POSIX checks write permission
+    /// on the file, not on its parent). So a call site that stopped using
+    /// `write_atomic` returns Ok here instead of Err.
+    fn d07_set_dir_writable(dir: &Path, writable: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if writable { 0o755 } else { 0o555 };
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn test_d07_note_survives_a_round_trip() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        append_history(sample_history_entry("n-1", "2026-03-27T10:00:00Z")).unwrap();
+        set_history_annotation("n-1".to_string(), Some("why this one".to_string()), None).unwrap();
+
+        assert_eq!(d07_find("n-1").note.as_deref(), Some("why this one"));
+    }
+
+    #[test]
+    fn test_d07_note_is_trimmed_and_blank_folds_to_no_note() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        append_history(sample_history_entry("n-1", "2026-03-27T10:00:00Z")).unwrap();
+
+        set_history_annotation("n-1".to_string(), Some("  padded  ".to_string()), None).unwrap();
+        assert_eq!(d07_find("n-1").note.as_deref(), Some("padded"));
+
+        set_history_annotation("n-1".to_string(), Some("   ".to_string()), None).unwrap();
+        assert_eq!(d07_find("n-1").note, None);
+    }
+
+    #[test]
+    fn test_d07_star_survives_a_round_trip() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        append_history(sample_history_entry("s-1", "2026-03-27T10:00:00Z")).unwrap();
+        set_history_annotation("s-1".to_string(), None, Some(true)).unwrap();
+
+        assert!(d07_find("s-1").starred);
+    }
+
+    /// §54: the two meanings of `Option` must stay apart. Collapsing `None`
+    /// into `Some("")` is the defect that makes every star toggle wipe a note.
+    #[test]
+    fn test_d07_adjacent_writes_to_one_entry_do_not_clobber_each_other() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        append_history(sample_history_entry("a-1", "2026-03-27T10:00:00Z")).unwrap();
+
+        // (i) note, then star: the note is still there.
+        set_history_annotation("a-1".to_string(), Some("keep me".to_string()), None).unwrap();
+        set_history_annotation("a-1".to_string(), None, Some(true)).unwrap();
+        assert_eq!(
+            d07_find("a-1").note.as_deref(),
+            Some("keep me"),
+            "toggling the star erased the note"
+        );
+
+        // (ii) star, then clear the note: the star is still there.
+        set_history_annotation("a-1".to_string(), Some(String::new()), None).unwrap();
+        let entry = d07_find("a-1");
+        assert!(entry.starred, "clearing the note cleared the star");
+        // (iv) an explicitly empty note clears it.
+        assert_eq!(entry.note, None);
+
+        // (iii) an unmentioned note keeps whatever is on disk.
+        set_history_annotation("a-1".to_string(), Some("second".to_string()), None).unwrap();
+        set_history_annotation("a-1".to_string(), None, Some(false)).unwrap();
+        assert_eq!(d07_find("a-1").note.as_deref(), Some("second"));
+    }
+
+    /// §51: the command takes an id, never a row, so a caller holding a stale
+    /// snapshot cannot write its old values back over newer ones.
+    #[test]
+    fn test_d07_annotation_does_not_carry_a_stale_snapshot_back() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        append_history(sample_history_entry("p-1", "2026-03-27T10:00:00Z")).unwrap();
+
+        // Whatever the annotating caller last read, the disk has since moved on.
+        let mut newer = sample_history_entry("p-1", "2026-03-27T10:00:00Z");
+        newer.url = "https://api.example.com/moved-on".to_string();
+        update_history_entries(vec![newer]).unwrap();
+
+        set_history_annotation("p-1".to_string(), Some("note".to_string()), None).unwrap();
+
+        let entry = d07_find("p-1");
+        assert_eq!(entry.url, "https://api.example.com/moved-on");
+        assert_eq!(entry.note.as_deref(), Some("note"));
+    }
+
+    /// §53: an annotation write touches the annotation and nothing else, on
+    /// this row or any other.
+    #[test]
+    fn test_d07_annotation_leaves_every_other_field_and_row_untouched() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        append_history(sample_history_entry("k-1", "2026-03-27T10:00:00Z")).unwrap();
+        append_history(sample_history_entry("k-2", "2026-03-27T10:01:00Z")).unwrap();
+
+        let before_target = d07_json(&d07_find("k-1"));
+        let before_other = d07_json(&d07_find("k-2"));
+
+        set_history_annotation("k-1".to_string(), Some("note".to_string()), Some(true)).unwrap();
+
+        let after_target = d07_json(&d07_find("k-1"));
+        for (key, value) in before_target.as_object().unwrap() {
+            if key == "note" || key == "starred" {
+                continue;
+            }
+            assert_eq!(
+                after_target.get(key),
+                Some(value),
+                "annotating changed unrelated field {key}"
+            );
+        }
+
+        assert_eq!(
+            d07_json(&d07_find("k-2")),
+            before_other,
+            "annotating one entry rewrote another"
+        );
+    }
+
+    /// §52: a row written before these three fields existed still reads, and
+    /// reads as "no note, not starred, text body".
+    #[test]
+    fn test_d07_rows_without_the_new_fields_still_load() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        let mut legacy = d07_json(&sample_history_entry("old-1", "2026-03-27T10:00:00Z"));
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("note");
+        object.remove("starred");
+        object.remove("responseBodyKind");
+        let field_count = object.len();
+
+        let mut raw = serde_json::to_vec(&legacy).unwrap();
+        raw.push(b'\n');
+        d03_write_raw_history(&raw);
+
+        let entry = d07_find("old-1");
+        assert_eq!(entry.note, None);
+        assert!(!entry.starred);
+        assert_eq!(entry.response_body_kind, ResponseBodyKind::Text);
+
+        // ...and the rest of the row arrived intact, not defaulted away.
+        let reloaded = d07_json(&entry);
+        for (key, value) in legacy.as_object().unwrap() {
+            assert_eq!(reloaded.get(key), Some(value), "legacy field {key} was lost");
+        }
+        assert_eq!(field_count, 22, "the legacy fixture is no longer the old shape");
+    }
+
+    #[test]
+    fn test_d07_response_body_kind_survives_a_round_trip() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        let mut entry = sample_history_entry("b-1", "2026-03-27T10:00:00Z");
+        entry.response_body_kind = ResponseBodyKind::Binary;
+        append_history(entry).unwrap();
+
+        assert_eq!(d07_find("b-1").response_body_kind, ResponseBodyKind::Binary);
+    }
+
+    /// §43: overflow comes out of the unstarred rows, oldest first.
+    #[test]
+    fn test_d07_overflow_evicts_only_unstarred_oldest_first() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        let seeded: Vec<HistoryEntry> = (0..MAX_HISTORY_ENTRIES)
+            .map(|index| {
+                d07_entry(
+                    &format!("e{index:04}"),
+                    &format!("2026-03-27T10:00:{:02}Z", index % 60),
+                    index < 2,
+                )
+            })
+            .collect();
+        d07_seed(&seeded);
+
+        append_history(d07_entry("newest", "2026-03-27T11:00:00Z", false)).unwrap();
+
+        let ids = d07_disk_ids();
+        assert_eq!(ids.len(), MAX_HISTORY_ENTRIES);
+        assert!(ids.contains(&"e0000".to_string()), "a starred row was evicted");
+        assert!(ids.contains(&"e0001".to_string()), "a starred row was evicted");
+        assert!(
+            !ids.contains(&"e0002".to_string()),
+            "the oldest unstarred row was not the one evicted"
+        );
+        assert_eq!(ids.last().unwrap(), "newest");
+        assert_eq!(&ids[..3], &["e0000", "e0001", "e0003"]);
+    }
+
+    /// §44: once there is nothing unstarred left to drop, the file is allowed
+    /// to grow past the cap rather than start eating starred rows.
+    #[test]
+    fn test_d07_all_starred_history_grows_past_the_cap() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        let seeded: Vec<HistoryEntry> = (0..MAX_HISTORY_ENTRIES)
+            .map(|index| {
+                d07_entry(
+                    &format!("e{index:04}"),
+                    &format!("2026-03-27T10:00:{:02}Z", index % 60),
+                    true,
+                )
+            })
+            .collect();
+        d07_seed(&seeded);
+
+        append_history(d07_entry("newest", "2026-03-27T11:00:00Z", true)).unwrap();
+
+        assert_eq!(d07_disk_ids().len(), MAX_HISTORY_ENTRIES + 1);
+    }
+
+    /// §47: a regression lock, not a new behaviour. Clearing already deletes
+    /// everything; this keeps a later "be kind to starred rows" change from
+    /// quietly turning the escape hatch into a partial delete.
+    #[test]
+    fn test_d07_clear_history_deletes_starred_entries_too() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        d07_seed(&[
+            d07_entry("plain", "2026-03-27T10:00:00Z", false),
+            d07_entry("starred", "2026-03-27T10:01:00Z", true),
+        ]);
+
+        clear_history().unwrap();
+
+        assert!(d07_disk_ids().is_empty(), "a starred entry survived an explicit clear");
+        assert!(d03_read_raw_history().is_empty(), "the history file is not empty");
+    }
+
+    /// §46: history is rewritten atomically, and the rewrite *call site* is the
+    /// thing under test — see `d07_set_dir_writable` for why a non-atomic call
+    /// site would return Ok here.
+    #[test]
+    fn test_d07_failed_history_rewrite_leaves_the_old_file_intact() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        d07_seed(&[d07_entry("keep", "2026-03-27T10:00:00Z", false)]);
+        let before = d03_read_raw_history();
+        assert!(!before.is_empty());
+
+        let scratch = history_file_path().unwrap().parent().unwrap().to_path_buf();
+        d07_set_dir_writable(&scratch, false);
+        let result = append_history(d07_entry("doomed", "2026-03-27T10:01:00Z", false));
+        d07_set_dir_writable(&scratch, true);
+
+        assert!(result.is_err(), "a history write that could not be atomic reported success");
+        assert_eq!(
+            d03_read_raw_history(),
+            before,
+            "the old history file did not survive a failed rewrite"
+        );
+    }
+
+    /// §17: same property for saved requests, where the file is worth more --
+    /// a hand-built request beats a history row.
+    #[test]
+    fn test_d07_failed_overwrite_leaves_the_saved_request_intact() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        create_project("My API".to_string(), String::new()).unwrap();
+        save_request(
+            "My API".to_string(),
+            String::new(),
+            sample_saved_request("Keeper", "GET", "https://api.example.com/keeper"),
+            None,
+        )
+        .unwrap();
+
+        let dir = project_collections_dir(&resolve_project("My API").unwrap().dir);
+        let file = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .expect("the saved request file is missing");
+        let before = std::fs::read(&file).unwrap();
+
+        d07_set_dir_writable(&dir, false);
+        let overwrite = save_request(
+            "My API".to_string(),
+            String::new(),
+            sample_saved_request("Keeper", "POST", "https://api.example.com/overwritten"),
+            Some(
+                file.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap()
+                    .to_string(),
+            ),
+        );
+        let fresh = save_request(
+            "My API".to_string(),
+            String::new(),
+            sample_saved_request("Brand New", "GET", "https://api.example.com/new"),
+            None,
+        );
+        d07_set_dir_writable(&dir, true);
+
+        assert!(
+            overwrite.is_err(),
+            "an overwrite that could not be atomic reported success"
+        );
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            before,
+            "a failed overwrite damaged the existing request file"
+        );
+
+        assert!(fresh.is_err(), "a create that could not be atomic reported success");
+        let json_files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".json"))
+            .collect();
+        assert_eq!(
+            json_files.len(),
+            1,
+            "a failed create left a file behind: {json_files:?}"
+        );
     }
 
     // ---------------------------------------------------------------- D03 §七

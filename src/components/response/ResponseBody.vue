@@ -4,15 +4,25 @@ import { useI18n } from "vue-i18n";
 
 import CodeEditor from "../editor/CodeEditor.vue";
 import JsonTreeView from "./JsonTreeView.vue";
+import type { ResponseBodyKind } from "../../types";
 
 const props = defineProps<{
   body: string;
   contentType: string;
+  bodyKind?: ResponseBodyKind;
 }>();
 
 const { t } = useI18n();
 const activeMode = ref<"tree" | "raw">("raw");
 const MAX_DISPLAY_SIZE = 500_000
+
+/**
+ * The decision is the flag, never the content type. A response declaring
+ * `text/plain` that carries NUL bytes has already been judged binary upstream,
+ * and matching the placeholder text instead would call a body binary purely
+ * because the server happened to send a sentence that looks like one.
+ */
+const isBinary = computed(() => props.bodyKind === "binary");
 
 const normalizedContentType = computed(() => props.contentType.toLowerCase());
 const isTruncated = computed(() => props.body.length > MAX_DISPLAY_SIZE)
@@ -57,7 +67,9 @@ const parsedJsonState = computed(() => {
 });
 
 const parsedJson = computed(() => parsedJsonState.value.value);
-const canUseTreeView = computed(() => parsedJsonState.value.isValid && !isTruncated.value);
+const canUseTreeView = computed(
+  () => parsedJsonState.value.isValid && !isTruncated.value && !isBinary.value,
+);
 
 const displayBody = computed(() => {
   if (isTruncated.value) {
@@ -86,6 +98,15 @@ watch(
 
 <template>
   <div class="flex h-full min-h-0 flex-col gap-3">
+    <div
+      v-if="isBinary"
+      data-testid="binary-body-notice"
+      class="flex min-h-0 flex-1 items-center justify-center rounded-lg border border-dashed border-[var(--border)] bg-[var(--bg-primary)] px-4 text-center text-sm leading-6 text-[var(--text-secondary)]"
+    >
+      {{ t("response.binaryBody") }}
+    </div>
+
+    <template v-else>
     <div v-if="canUseTreeView" class="flex items-center gap-2">
       <button
         type="button"
@@ -127,5 +148,6 @@ watch(
       readonly
       class="min-h-0 flex-1"
     />
+    </template>
   </div>
 </template>
