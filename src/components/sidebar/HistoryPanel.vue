@@ -1,36 +1,92 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue"
 import { storeToRefs } from "pinia"
-import { ChevronDown, ChevronRight, Search, Trash2 } from "lucide-vue-next"
+import {
+  AlertTriangle,
+  ChevronDown,
+  ChevronRight,
+  FolderPlus,
+  Search,
+  Star,
+  StickyNote,
+  Trash2,
+} from "lucide-vue-next"
 import { useI18n } from "vue-i18n"
 
 import ConfirmDialog from "../ui/ConfirmDialog.vue"
+import InlineError from "../ui/InlineError.vue"
+import SaveFromHistory from "./SaveFromHistory.vue"
 import { useHistoryStore } from "../../stores/history"
+import { useProjectsStore } from "../../stores/projects"
 import { useTabsStore } from "../../stores/tabs"
 import type { HistoryEntry, HistoryGroupMode } from "../../types"
 
 const historyStore = useHistoryStore()
+const projectsStore = useProjectsStore()
 const tabsStore = useTabsStore()
 const { t, locale } = useI18n()
 
-const { entries, groupedEntries, groupMode, prefixDepth, searchQuery } = storeToRefs(historyStore)
+const {
+  entries,
+  groupedEntries,
+  groupMode,
+  prefixDepth,
+  searchQuery,
+  starredOnly,
+  badRows,
+  clearableCount,
+  starredCount,
+} = storeToRefs(historyStore)
+const { activeProject } = storeToRefs(projectsStore)
 const collapsedGroups = ref<Record<string, boolean>>({})
 const clearDialogVisible = ref(false)
 const isClearing = ref(false)
 const errorMessage = ref("")
+const saveEntry = ref<HistoryEntry | null>(null)
+const pendingDelete = ref<HistoryEntry | null>(null)
+const isDeleting = ref(false)
+const noteEntry = ref<HistoryEntry | null>(null)
+const noteDraft = ref("")
+const isSavingNote = ref(false)
 
 const groupModes: HistoryGroupMode[] = ["prefix", "time", "method"]
 
 const depthOptions = computed(() => [1, 2, 3, 4])
 
+/**
+ * Both gates that stood in front of Clear History have to open together. Leaving
+ * the early return in place gives a button that is enabled and does nothing,
+ * which is worse than a disabled one -- a disabled button at least tells the
+ * truth. And a user whose file is all bad lines has no other way out: the read
+ * fails, the list is empty, and clearing is the only thing left.
+ */
+const clearBlocked = computed(() => entries.value.length === 0 && badRows.value === 0)
+
+const clearMessage = computed(() => {
+  const total = t("history.clearConfirm", { count: clearableCount.value })
+
+  // No "including 0 starred" filler: a clause that is always there stops being
+  // read.
+  return starredCount.value > 0
+    ? `${total} ${t("history.clearWithStarred", { starred: starredCount.value })}`
+    : total
+})
+
+const deleteMessage = computed(() =>
+  pendingDelete.value
+    ? t("history.deleteConfirm", { method: pendingDelete.value.method, url: pendingDelete.value.url })
+    : "",
+)
+
 onMounted(async () => {
-  if (historyStore.entries.length === 0) {
-    try {
-      errorMessage.value = ""
+  try {
+    errorMessage.value = ""
+    if (historyStore.entries.length === 0) {
       await historyStore.loadHistory()
-    } catch (error) {
-      errorMessage.value = error instanceof Error ? error.message : String(error)
     }
+    await historyStore.loadHealth()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : String(error)
   }
 })
 
@@ -56,6 +112,70 @@ function toggleGroup(label: string) {
 
 function openEntry(entry: HistoryEntry) {
   tabsStore.openHistoryEntry(entry)
+}
+
+function openSaveDialog(entry: HistoryEntry) {
+  errorMessage.value = ""
+  saveEntry.value = entry
+}
+
+function openDeleteDialog(entry: HistoryEntry) {
+  errorMessage.value = ""
+  pendingDelete.value = entry
+}
+
+function openNoteDialog(entry: HistoryEntry) {
+  errorMessage.value = ""
+  noteEntry.value = entry
+  noteDraft.value = entry.note ?? ""
+}
+
+async function submitNote() {
+  const entry = noteEntry.value
+  if (!entry) {
+    return
+  }
+
+  isSavingNote.value = true
+  errorMessage.value = ""
+
+  try {
+    await historyStore.setNote(entry.id, noteDraft.value)
+    noteEntry.value = null
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    isSavingNote.value = false
+  }
+}
+
+async function toggleStar(entry: HistoryEntry) {
+  errorMessage.value = ""
+
+  try {
+    await historyStore.toggleStar(entry.id)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : String(error)
+  }
+}
+
+async function confirmDelete() {
+  const entry = pendingDelete.value
+  if (!entry) {
+    return
+  }
+
+  isDeleting.value = true
+  errorMessage.value = ""
+
+  try {
+    await historyStore.deleteEntry(entry.id)
+    pendingDelete.value = null
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    isDeleting.value = false
+  }
 }
 
 function formatEntryUrl(rawUrl: string) {
@@ -131,8 +251,7 @@ function translateGroupLabel(label: string) {
 }
 
 function confirmClearHistory() {
-  const total = entries.value.length
-  if (total === 0) {
+  if (clearBlocked.value) {
     return
   }
 
@@ -204,6 +323,35 @@ async function clearHistory() {
             </option>
           </select>
         </label>
+
+        <label
+          class="flex h-9 items-center gap-2 rounded border border-[var(--border)] bg-[var(--bg-primary)] px-3 text-xs font-semibold uppercase tracking-wide text-[var(--text-secondary)]"
+        >
+          <input
+            type="checkbox"
+            data-testid="starred-only"
+            :checked="starredOnly"
+            @change="historyStore.setStarredOnly(($event.target as HTMLInputElement).checked)"
+          />
+          <span>{{ t("history.starredOnly") }}</span>
+        </label>
+      </div>
+
+      <div
+        v-if="badRows > 0"
+        data-testid="history-health-notice"
+        class="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-200"
+      >
+        <AlertTriangle :size="14" class="mt-0.5 shrink-0" />
+        <span>{{ t("history.healthBadRows", { count: badRows }) }}</span>
+      </div>
+
+      <div
+        v-if="!activeProject && entries.length > 0"
+        data-testid="history-save-needs-project"
+        class="rounded-lg border border-[var(--border)] bg-[color-mix(in_srgb,var(--bg-primary)_76%,black)] px-3 py-2 text-xs leading-5 text-[var(--text-secondary)]"
+      >
+        {{ t("history.saveNeedsProject") }}
       </div>
 
       <div class="rounded-lg border border-[var(--border)] bg-[color-mix(in_srgb,var(--bg-primary)_76%,black)] px-3 py-2 text-xs leading-5 text-[var(--text-secondary)]">
@@ -243,48 +391,112 @@ async function clearHistory() {
           </button>
 
           <div v-if="!collapsedGroups[group.label]" class="border-t border-[var(--border)] px-2 py-2">
-            <button
+            <!--
+              A row is a container with one primary action and several siblings,
+              not one big button: nesting the secondary buttons inside the row
+              button would be invalid HTML, and clicking any of them would open
+              the entry as well.
+            -->
+            <div
               v-for="entry in group.entries"
               :key="entry.id"
-              class="flex w-full items-center gap-2 rounded px-2 py-2 text-left transition hover:bg-[color-mix(in_srgb,var(--bg-surface)_35%,transparent)]"
-              type="button"
-              :title="`${entry.method} ${entry.url} • ${formatTimestamp(entry.timestamp)}`"
-              @click="openEntry(entry)"
+              data-testid="history-row"
+              class="flex w-full items-center gap-1 rounded px-1 transition hover:bg-[color-mix(in_srgb,var(--bg-surface)_35%,transparent)]"
             >
-              <span class="w-12 shrink-0 text-[11px] font-semibold tracking-wide" :class="methodClass(entry.method)">
-                {{ entry.method }}
-              </span>
-              <span class="min-w-0 flex-1">
-                <span class="block truncate text-sm text-[var(--text-primary)]">
-                  {{ formatEntryUrl(entry.url) }}
+              <button
+                class="flex min-w-0 flex-1 items-center gap-2 rounded px-1 py-2 text-left"
+                data-testid="history-open"
+                type="button"
+                :title="`${entry.method} ${entry.url} • ${formatTimestamp(entry.timestamp)}`"
+                @click="openEntry(entry)"
+              >
+                <span class="w-12 shrink-0 text-[11px] font-semibold tracking-wide" :class="methodClass(entry.method)">
+                  {{ entry.method }}
                 </span>
-                <span
-                  v-if="entry.responseBody"
-                  class="block truncate text-xs text-[var(--text-secondary)]"
-                >
-                  {{ summarizeResponseBody(entry.responseBody) }}
+                <span class="min-w-0 flex-1">
+                  <span class="block truncate text-sm text-[var(--text-primary)]">
+                    {{ formatEntryUrl(entry.url) }}
+                  </span>
+                  <span
+                    v-if="entry.responseBody"
+                    class="block truncate text-xs text-[var(--text-secondary)]"
+                  >
+                    {{ summarizeResponseBody(entry.responseBody) }}
+                  </span>
                 </span>
-              </span>
-              <span class="shrink-0 text-xs font-semibold" :class="statusClass(entry.status)">
-                {{ entry.status }}
-              </span>
-              <span class="shrink-0 text-xs text-[var(--text-secondary)]">
-                {{ formatTime(entry.time) }}
-              </span>
-            </button>
+                <StickyNote
+                  v-if="entry.note"
+                  data-testid="history-note-badge"
+                  :size="12"
+                  class="shrink-0 text-[var(--accent)]"
+                />
+                <span class="shrink-0 text-xs font-semibold" :class="statusClass(entry.status)">
+                  {{ entry.status }}
+                </span>
+                <span class="shrink-0 text-xs text-[var(--text-secondary)]">
+                  {{ formatTime(entry.time) }}
+                </span>
+              </button>
+
+              <button
+                class="shrink-0 rounded p-1 text-[var(--text-secondary)] transition hover:text-[var(--text-primary)]"
+                data-testid="history-star"
+                type="button"
+                :title="entry.starred ? t('history.unstar') : t('history.star')"
+                :aria-label="entry.starred ? t('history.unstar') : t('history.star')"
+                @click.stop="toggleStar(entry)"
+              >
+                <Star :size="14" :class="entry.starred ? 'text-amber-300' : ''" />
+              </button>
+
+              <button
+                class="shrink-0 rounded p-1 text-[var(--text-secondary)] transition hover:text-[var(--text-primary)]"
+                data-testid="history-note"
+                type="button"
+                :title="t('history.note')"
+                :aria-label="t('history.note')"
+                @click.stop="openNoteDialog(entry)"
+              >
+                <StickyNote :size="14" />
+              </button>
+
+              <button
+                class="shrink-0 rounded p-1 text-[var(--text-secondary)] transition hover:text-[var(--text-primary)] disabled:cursor-not-allowed disabled:opacity-40"
+                data-testid="history-save"
+                type="button"
+                :title="t('history.saveToCollection')"
+                :aria-label="t('history.saveToCollection')"
+                :disabled="!activeProject"
+                @click.stop="openSaveDialog(entry)"
+              >
+                <FolderPlus :size="14" />
+              </button>
+
+              <button
+                class="shrink-0 rounded p-1 text-[var(--text-secondary)] transition hover:text-rose-300"
+                data-testid="history-delete"
+                type="button"
+                :title="t('history.deleteEntry')"
+                :aria-label="t('history.deleteEntry')"
+                @click.stop="openDeleteDialog(entry)"
+              >
+                <Trash2 :size="14" />
+              </button>
+            </div>
           </div>
         </div>
       </div>
     </div>
 
     <div class="border-t border-[var(--border)] p-3">
-      <div v-if="errorMessage" class="mb-2 text-sm text-rose-300">
-        {{ errorMessage }}
+      <div class="mb-2">
+        <InlineError :message="errorMessage" />
       </div>
       <button
         class="flex h-8 w-full items-center justify-center gap-2 rounded border border-[var(--border)] bg-[var(--bg-primary)] px-3 text-sm font-semibold text-[var(--text-primary)] transition hover:border-[color-mix(in_srgb,var(--accent)_60%,white)] disabled:cursor-not-allowed disabled:opacity-50"
+        data-testid="history-clear"
         type="button"
-        :disabled="historyStore.entries.length === 0"
+        :disabled="clearBlocked"
         @click="confirmClearHistory"
       >
         <Trash2 :size="16" />
@@ -292,10 +504,63 @@ async function clearHistory() {
       </button>
     </div>
 
+    <div
+      v-if="noteEntry"
+      data-testid="history-note-dialog"
+      class="fixed inset-0 z-30 flex items-center justify-center bg-black/45 p-4"
+    >
+      <div class="w-full max-w-md rounded-lg border border-[var(--border)] bg-[var(--bg-primary)] p-4 shadow-lg">
+        <div class="text-lg font-semibold text-[var(--text-primary)]">{{ t("history.note") }}</div>
+        <!--
+          Submitting an empty note is how a note is removed, so this control
+          cannot borrow the "no blank submissions" rule the rename prompt uses.
+        -->
+        <textarea
+          v-model="noteDraft"
+          data-testid="history-note-input"
+          class="mt-4 min-h-32 w-full rounded border border-[var(--border)] bg-[var(--bg-secondary)] p-3 text-sm text-[var(--text-primary)] outline-none transition focus:border-[color-mix(in_srgb,var(--accent)_70%,white)]"
+          :placeholder="t('history.notePlaceholder')"
+        />
+        <div class="mt-5 flex justify-end gap-2">
+          <button
+            class="h-8 rounded border border-[var(--border)] px-3 text-sm text-[var(--text-secondary)] transition hover:text-[var(--text-primary)]"
+            type="button"
+            :disabled="isSavingNote"
+            @click="noteEntry = null"
+          >
+            {{ t("common.cancel") }}
+          </button>
+          <button
+            class="h-8 rounded bg-[var(--accent)] px-3 text-sm font-semibold text-white transition hover:brightness-110"
+            data-testid="history-note-submit"
+            type="button"
+            :disabled="isSavingNote"
+            @click="submitNote"
+          >
+            {{ t("common.save") }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <SaveFromHistory :visible="saveEntry !== null" :entry="saveEntry" @close="saveEntry = null" />
+
+    <ConfirmDialog
+      :visible="pendingDelete !== null"
+      :title="t('history.deleteEntry')"
+      :message="deleteMessage"
+      :confirm-label="isDeleting ? t('common.loading') : t('history.deleteEntry')"
+      :cancel-label="t('common.cancel')"
+      :busy="isDeleting"
+      danger
+      @cancel="!isDeleting && (pendingDelete = null)"
+      @confirm="confirmDelete"
+    />
+
     <ConfirmDialog
       :visible="clearDialogVisible"
       :title="t('history.clearHistory')"
-      :message="t('history.clearConfirm', { count: entries.length })"
+      :message="clearMessage"
       :confirm-label="isClearing ? t('common.loading') : t('history.clearHistory')"
       :cancel-label="t('common.cancel')"
       danger

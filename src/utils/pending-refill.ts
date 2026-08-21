@@ -156,7 +156,7 @@ function fileFields(body: RequestBody): PendingField[] {
 }
 
 export function pendingRefillFields(source: PendingRefillSource): PendingField[] {
-  return [
+  const fields = [
     ...pairFields(source.headers, "header"),
     ...pairFields(source.params, "query"),
     ...urlQueryFields(source.url),
@@ -164,6 +164,22 @@ export function pendingRefillFields(source: PendingRefillSource): PendingField[]
     ...authFields(source.auth),
     ...fileFields(source.body),
   ]
+
+  // A query parameter can be reached twice: params are the source of truth for
+  // a request, but a tab opened from history also keeps the query in its url.
+  // Listing "Query · api_key" twice tells the user nothing and inflates the
+  // count the dialog reports.
+  const seen = new Set<string>()
+
+  return fields.filter((field) => {
+    const identity = `${field.kind}|${field.source}|${field.path}`
+    if (seen.has(identity)) {
+      return false
+    }
+
+    seen.add(identity)
+    return true
+  })
 }
 
 export function refillFields(fields: PendingField[]): PendingField[] {

@@ -6,20 +6,24 @@ import { useI18n } from "vue-i18n";
 
 import { useProjectsStore } from "../../stores/projects";
 import { useRequestStore } from "../../stores/request";
+import { useSaveGateStore } from "../../stores/save-gate";
 import { isUntitledTabLabel, useTabsStore } from "../../stores/tabs";
+import { flattenCollectionFolders } from "../../utils/collection-options";
 import { exportCurl } from "../../utils/curl-export";
 import { parseCurl } from "../../utils/curl-parser";
+import { pendingRefillFields } from "../../utils/pending-refill";
 import { hasPendingRedactedFields, pendingRedactedFieldNames } from "../../utils/redaction";
 import { buildSavedRequest } from "../../utils/saved-request";
 import { buildUrlWithParams, syncParamsFromUrl } from "../../utils/url-params";
 import AuthEditor from "../request/AuthEditor.vue";
 import BodyEditor from "../request/BodyEditor.vue";
 import KeyValueEditor from "../request/KeyValueEditor.vue";
+import PendingRefillNotice from "../request/PendingRefillNotice.vue";
 import ScriptsEditor from "../request/ScriptsEditor.vue";
 import UrlBar from "../request/UrlBar.vue";
+import InlineError from "../ui/InlineError.vue";
 import type {
   AuthConfig,
-  CollectionNode,
   HttpMethod,
   KeyValuePair,
   RequestBody,
@@ -29,6 +33,7 @@ import type {
 const tabsStore = useTabsStore();
 const projectsStore = useProjectsStore();
 const requestStore = useRequestStore();
+const saveGate = useSaveGateStore();
 const { activeTab } = storeToRefs(tabsStore);
 const { activeProject, collectionTree } = storeToRefs(projectsStore);
 const { t } = useI18n();
@@ -69,8 +74,17 @@ const redactedFieldLabels = computed(() =>
 
 const collectionOptions = computed(() => [
   { label: t("common.rootCollection"), value: "" },
-  ...flattenFolders(collectionTree.value),
+  ...flattenCollectionFolders(collectionTree.value),
 ]);
+
+/**
+ * The same check the history entry point runs, on the same criteria. The gate
+ * is on the state of the request, not on which button was pressed: this button
+ * is the one that used to have no gate at all, and it is the second step of the
+ * path where a request from history gets saved blank and then 401s in silence.
+ */
+const pendingFields = computed(() => pendingRefillFields(activeTab.value));
+const saveBlocked = computed(() => saveGate.blocksSave(pendingFields.value));
 
 function countEnabled(items: KeyValuePair[]) {
   return items.filter((item) => item.enabled && (item.key || item.value)).length;
@@ -199,6 +213,10 @@ function openSaveDialog() {
 }
 
 async function submitSave() {
+  if (saveBlocked.value) {
+    return;
+  }
+
   saveError.value = "";
 
   try {
@@ -285,22 +303,6 @@ function deriveCollectionPath(path: string | null) {
   }
 
   return path.split("/").slice(0, -1).join("/");
-}
-
-function flattenFolders(nodes: CollectionNode[]): { label: string; value: string }[] {
-  return nodes.flatMap((node) => {
-    if (node.nodeType !== "folder") {
-      return [];
-    }
-
-    return [
-      { label: node.name, value: node.path },
-      ...flattenFolders(node.children).map((child: { label: string; value: string }) => ({
-        label: `${node.name} / ${child.label}`,
-        value: child.value,
-      })),
-    ];
-  });
 }
 
 function onSaveShortcut() {
@@ -501,10 +503,12 @@ onUnmounted(() => {
             type="text"
             :placeholder="t('request.requestNameExample')"
           />
+
+          <PendingRefillNotice :fields="pendingFields" />
         </div>
 
-        <div v-if="saveError" class="mt-3 text-sm text-rose-300">
-          {{ saveError }}
+        <div class="mt-3">
+          <InlineError :message="saveError" />
         </div>
 
         <div class="mt-5 flex justify-end gap-2">
@@ -516,8 +520,10 @@ onUnmounted(() => {
             {{ t("common.cancel") }}
           </button>
           <button
-            class="h-8 rounded bg-[var(--accent)] px-3 text-sm font-semibold text-white transition hover:brightness-110"
+            class="h-8 rounded bg-[var(--accent)] px-3 text-sm font-semibold text-white transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
+            data-testid="request-save-submit"
             type="button"
+            :disabled="saveBlocked"
             @click="submitSave"
           >
             {{ t("common.save") }}

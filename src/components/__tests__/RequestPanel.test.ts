@@ -12,9 +12,15 @@ vi.mock("vue-i18n", async (importOriginal) => ({
 
 import RequestPanel from "../panels/RequestPanel.vue"
 import KeyValueEditor from "../request/KeyValueEditor.vue"
+import PendingRefillNotice from "../request/PendingRefillNotice.vue"
 import UrlBar from "../request/UrlBar.vue"
+import { useProjectsStore } from "../../stores/projects"
+import { useSaveGateStore } from "../../stores/save-gate"
 import { useTabsStore } from "../../stores/tabs"
-import type { KeyValuePair } from "../../types"
+import { historyEntryToRequest } from "../../utils/history-to-request"
+import { pendingRefillFields, type PendingField } from "../../utils/pending-refill"
+import { REDACTION_SENTINEL } from "../../utils/redaction"
+import type { AuthConfig, HistoryEntry, KeyValuePair } from "../../types"
 
 let pinia: ReturnType<typeof createPinia>
 
@@ -141,5 +147,135 @@ describe("§10 the panel forwards the writes that come from outside the field", 
     // the user's old draft sitting on top of an imported request.
     expect(tabs.activeTab.urlRevision).toBe(before + 1)
     expect(wrapper.findComponent(UrlBar).props("url")).toBe("https://api.test/items?q=a+b")
+  })
+})
+
+/**
+ * §6 — the gate is on the state of the request, not on which button was
+ * pressed. This is the button that had no gate at all, and it is step 2 of the
+ * lying path: open from history, save with this button, reopen from the
+ * collection, and every warning is gone.
+ */
+describe("§6 the existing save button is gated by the same check as the new one", () => {
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+  })
+
+  function entry(overrides: Partial<HistoryEntry> = {}): HistoryEntry {
+    return {
+      id: "h-1",
+      method: "POST",
+      url: `https://api.example.com/users?api_key=${REDACTION_SENTINEL}`,
+      status: 201,
+      time: 42,
+      size: 12,
+      timestamp: "2026-03-27T10:00:00Z",
+      contentType: "application/json",
+      requestHeaders: [pair("Authorization", REDACTION_SENTINEL)],
+      requestParams: [],
+      requestAuth: { type: "bearer", bearer: { token: "" } } as AuthConfig,
+      requestBodyType: "none",
+      requestBodyFormData: [],
+      ...overrides,
+    } as HistoryEntry
+  }
+
+  async function openSaveDialog(wrapper: ReturnType<typeof mountPanel>) {
+    const buttons = wrapper.findAll("button")
+    const save = buttons.find((button) => button.text().includes("request.save"))
+    expect(save, "the save button is not rendered").toBeDefined()
+    await save!.trigger("click")
+  }
+
+  it("does not save while the request has unacknowledged pending fields", async () => {
+    const projects = useProjectsStore()
+    projects.activeProject = "My API"
+    const saveRequest = vi.spyOn(projects, "saveRequest").mockResolvedValue(undefined)
+    const tabs = useTabsStore()
+    tabs.openHistoryEntry(entry())
+
+    const wrapper = mountPanel()
+    await openSaveDialog(wrapper)
+    const submit = wrapper.find("[data-testid=\"request-save-submit\"]")
+
+    // Both halves of the gate, because they fail differently: the binding is
+    // what the user sees, the guard is what stops a submit that reaches the
+    // handler anyway.
+    expect((submit.element as HTMLButtonElement).disabled).toBe(true)
+    await submit.trigger("click")
+    expect(saveRequest).not.toHaveBeenCalled()
+  })
+
+  it("saves once the same fields have been acknowledged elsewhere", async () => {
+    const projects = useProjectsStore()
+    projects.activeProject = "My API"
+    const saveRequest = vi.spyOn(projects, "saveRequest").mockResolvedValue(undefined)
+    const tabs = useTabsStore()
+    tabs.openHistoryEntry(entry())
+    const gate = useSaveGateStore()
+
+    const wrapper = mountPanel()
+    await openSaveDialog(wrapper)
+
+    // The acknowledgement belongs to the request, so it does not matter which
+    // entry point collected it.
+    gate.acknowledge(wrapper.findComponent(PendingRefillNotice).props("fields") as PendingField[])
+    await wrapper.vm.$nextTick()
+
+    const submit = wrapper.find("[data-testid=\"request-save-submit\"]")
+    expect((submit.element as HTMLButtonElement).disabled).toBe(false)
+    await submit.trigger("click")
+    expect(saveRequest).toHaveBeenCalledTimes(1)
+  })
+
+  it("shows the same list the history entry point would show", async () => {
+    const projects = useProjectsStore()
+    projects.activeProject = "My API"
+    const source = entry()
+    const tabs = useTabsStore()
+    tabs.openHistoryEntry(source)
+
+    const wrapper = mountPanel()
+    await openSaveDialog(wrapper)
+
+    const fromPanel = wrapper.findComponent(PendingRefillNotice).props("fields") as PendingField[]
+    const fromHistory = pendingRefillFields(historyEntryToRequest(source))
+
+    expect(fromPanel).toHaveLength(3)
+    expect([...fromPanel].sort((a, b) => a.path.localeCompare(b.path))).toEqual(
+      [...fromHistory].sort((a, b) => a.path.localeCompare(b.path)),
+    )
+  })
+
+  /**
+   * The one class where the two lists differ, written down rather than left to
+   * be discovered. Replay clears the placeholders out of the body text, so by
+   * the time a tab exists the individual key names are gone and only a marker
+   * survives; a history row still has them. Both lists name the body and both
+   * hold the save, so the gate works from either side — but the acknowledgement
+   * does not carry across for this class, and the user confirms twice.
+   */
+  it("names body fields less precisely once the request has been replayed", async () => {
+    const projects = useProjectsStore()
+    projects.activeProject = "My API"
+    const source = entry({
+      requestHeaders: [],
+      url: "https://api.example.com/users",
+      requestAuth: undefined,
+      requestBodyType: "json",
+      requestBodyContent: `{"password":"${REDACTION_SENTINEL}"}`,
+    })
+    const tabs = useTabsStore()
+    tabs.openHistoryEntry(source)
+
+    const wrapper = mountPanel()
+    await openSaveDialog(wrapper)
+
+    const fromPanel = wrapper.findComponent(PendingRefillNotice).props("fields") as PendingField[]
+    expect(fromPanel.map((field) => field.path)).toEqual(["Body · request body"])
+    expect(pendingRefillFields(historyEntryToRequest(source)).map((field) => field.path)).toEqual([
+      "Body · password",
+    ])
   })
 })
