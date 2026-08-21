@@ -10509,12 +10509,32 @@ mod tests {
         // The accept loop must keep running: the pre-connect timing probe opens
         // its own throwaway connection first, so a single-accept fixture would
         // serve the probe and then leave the real request with a closed port.
+        //
+        // The handler must read the request head before responding. An earlier
+        // version wrote the response immediately on accept, which raced hyper's
+        // dispatch: bytes arriving while the client connection is still idle
+        // (request not yet written) trip `require_empty_read` and cancel the
+        // queued request as `client error (Canceled)` instead of ever reaching
+        // the body read — the D10 flake. Reading until the `\r\n\r\n` head
+        // terminator forces the response to land strictly after the request,
+        // when hyper is mid-message, and drains the inbound buffer so the
+        // close below is a clean FIN rather than an RST. The probe connection
+        // sends nothing and EOFs out of the read loop without a response,
+        // exactly as it was served before.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 tokio::spawn(async move {
-                    use tokio::io::AsyncWriteExt;
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => request.extend_from_slice(&chunk[..read]),
+                        }
+                    }
                     let _ = stream
                         .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort")
                         .await;
