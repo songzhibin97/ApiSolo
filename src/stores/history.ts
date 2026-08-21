@@ -23,11 +23,14 @@ const MAX_VISIBLE_ENTRIES = 1000
  * The shape `get_history_health` actually serialises, read off the Rust struct
  * rather than inferred from what this panel happens to need.
  *
- * `quarantinedLines` is modelled but deliberately unused by the panel: those
- * lines have already been moved out of `history.jsonl` into the quarantine
- * file, so they are neither hidden rows of the list being shown nor rows that
- * clearing is about to delete. Counting them would keep the "unreadable lines"
- * notice up forever, since clearing history is what puts lines there.
+ * `quarantinedLines` is modelled but deliberately unused by the panel. It counts
+ * lines an earlier write already moved out of `history.jsonl` and into the
+ * quarantine file. The panel's notice says a number of lines "cannot be parsed
+ * and are not shown in the list", and the list is `history.jsonl` — a line
+ * sitting in quarantine is not an unreadable line of that file, it is a
+ * preserved copy of one that used to be. Adding the two together would count
+ * the same original line twice: once while it was still in the file, and again
+ * every session after it was moved out.
  */
 export interface HistoryHealth {
   skippedLines: number
