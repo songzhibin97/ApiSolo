@@ -155,31 +155,37 @@ function fileFields(body: RequestBody): PendingField[] {
   return []
 }
 
+/**
+ * The query string is reachable from two places at once. Params are a
+ * request's source of truth, but a tab opened from history also keeps the query
+ * in its url, so a redacted parameter would otherwise be listed twice and
+ * inflate the count the dialog reports.
+ *
+ * The overlap is resolved per name, not per row. Collapsing by identity would
+ * also swallow a genuine repeat within one source: `?tag=a&tag=b` with both
+ * values redacted is two rows the user has to refill, and reporting one is the
+ * same class of lie as reporting three.
+ */
+function queryFields(source: PendingRefillSource): PendingField[] {
+  const fromParams = pairFields(source.params, "query")
+  const named = new Set(fromParams.map((field) => field.path))
+
+  return [
+    ...fromParams,
+    ...urlQueryFields(source.url).filter((field) => !named.has(field.path)),
+  ]
+}
+
 export function pendingRefillFields(source: PendingRefillSource): PendingField[] {
   const fields = [
     ...pairFields(source.headers, "header"),
-    ...pairFields(source.params, "query"),
-    ...urlQueryFields(source.url),
+    ...queryFields(source),
     ...bodyFields(source),
     ...authFields(source.auth),
     ...fileFields(source.body),
   ]
 
-  // A query parameter can be reached twice: params are the source of truth for
-  // a request, but a tab opened from history also keeps the query in its url.
-  // Listing "Query · api_key" twice tells the user nothing and inflates the
-  // count the dialog reports.
-  const seen = new Set<string>()
-
-  return fields.filter((field) => {
-    const identity = `${field.kind}|${field.source}|${field.path}`
-    if (seen.has(identity)) {
-      return false
-    }
-
-    seen.add(identity)
-    return true
-  })
+  return fields
 }
 
 export function refillFields(fields: PendingField[]): PendingField[] {

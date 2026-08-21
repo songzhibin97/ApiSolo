@@ -180,3 +180,55 @@ describe("§9 each entry says where it lives, not just what it is called", () =>
     ).toEqual(["Auth · Basic password"])
   })
 })
+
+/**
+ * The query string arrives from two directions and the two have to be told
+ * apart from a genuine repeat. Params are a request's source of truth; a tab
+ * opened from history keeps the query in its url as well. Collapsing the
+ * overlap is right; collapsing a repeat inside one source is a lie in the other
+ * direction — the dialog would promise fewer fields to refill than there are.
+ */
+describe("the query overlap collapses, a same-source repeat does not", () => {
+  it("reports one entry when params and the url name the same parameter", () => {
+    expect(
+      paths(
+        request({
+          url: `https://api.example.com/s?api_key=${REDACTION_SENTINEL}`,
+          params: [pair("api_key", REDACTION_SENTINEL)],
+        }),
+      ),
+    ).toEqual(["Query · api_key"])
+  })
+
+  it("reports both entries for a repeated parameter name in the url", () => {
+    expect(
+      paths(
+        request({
+          url: `https://api.example.com/s?tag=${REDACTION_SENTINEL}&tag=${REDACTION_SENTINEL}`,
+        }),
+      ),
+    ).toEqual(["Query · tag", "Query · tag"])
+  })
+
+  it("reports both entries for a repeated parameter name in the params", () => {
+    expect(
+      paths(
+        request({
+          params: [pair("tag", REDACTION_SENTINEL), { ...pair("tag", REDACTION_SENTINEL), id: "tag-2" }],
+        }),
+      ),
+    ).toEqual(["Query · tag", "Query · tag"])
+  })
+
+  // Both sources carry the same repeated name: still two, not four and not one.
+  it("keeps the count at the real number when both sources repeat it", () => {
+    expect(
+      paths(
+        request({
+          url: `https://api.example.com/s?tag=${REDACTION_SENTINEL}&tag=${REDACTION_SENTINEL}`,
+          params: [pair("tag", REDACTION_SENTINEL), { ...pair("tag", REDACTION_SENTINEL), id: "tag-2" }],
+        }),
+      ),
+    ).toEqual(["Query · tag", "Query · tag"])
+  })
+})
