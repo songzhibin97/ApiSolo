@@ -6,6 +6,7 @@ const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }))
 vi.mock("../../utils/invoke", () => ({ invoke: invokeMock }))
 
 import { useHistoryStore } from "../history"
+import { REDACTION_SENTINEL } from "../../utils/redaction"
 import type { HistoryEntry } from "../../types"
 
 function entry(overrides: Partial<HistoryEntry> = {}): HistoryEntry {
@@ -286,23 +287,49 @@ describe("§42 the starred filter narrows the same list", () => {
  * command that exists to merge rows.
  */
 describe("§53 an annotation write does not re-sanitize anything", () => {
-  const REDACTED = "[redacted]"
-
-  it("leaves an already-redacted value exactly as it was", async () => {
+  /**
+   * The value under a sensitive key is deliberately NOT already redacted. An
+   * already-redacted fixture cannot show this: redaction is idempotent, so a
+   * second pass over `[redacted]` returns `[redacted]` and the assertion holds
+   * whether or not the annotation path re-ran it. A plaintext value is the only
+   * input a re-sanitize would visibly change — which is what makes this
+   * assertion load-bearing rather than decorative.
+   *
+   * A row can genuinely be in this state: rows written before field-name
+   * redaction shipped hold plaintext, and rewriting them is `loadHistory`'s job
+   * with its own write-back, not something an annotation write may do behind it.
+   */
+  it("leaves a plaintext value under a sensitive key exactly as it was", async () => {
     const store = useHistoryStore()
     store.entries = [
       entry({
         id: "a",
         requestHeaders: [
-          { id: "h1", enabled: true, key: "Authorization", value: REDACTED, description: "" },
+          { id: "h1", enabled: true, key: "Authorization", value: "Bearer live-abc", description: "" },
         ],
       }),
     ]
 
     await store.setNote("a", "still fine")
 
-    expect(store.entries[0].requestHeaders?.[0].value).toBe(REDACTED)
+    expect(store.entries[0].requestHeaders?.[0].value).toBe("Bearer live-abc")
     expect(store.entries[0].note).toBe("still fine")
+  })
+
+  it("leaves an already-redacted value alone too", async () => {
+    const store = useHistoryStore()
+    store.entries = [
+      entry({
+        id: "a",
+        requestHeaders: [
+          { id: "h1", enabled: true, key: "Authorization", value: REDACTION_SENTINEL, description: "" },
+        ],
+      }),
+    ]
+
+    await store.toggleStar("a")
+
+    expect(store.entries[0].requestHeaders?.[0].value).toBe(REDACTION_SENTINEL)
   })
 
   it("does not push the whole file back through the row-merge command", async () => {
