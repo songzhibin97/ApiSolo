@@ -278,3 +278,42 @@ describe("§42 the starred filter narrows the same list", () => {
     expect(store.groupedEntries.flatMap((group) => ids(group.entries))).toEqual(["b"])
   })
 })
+
+/**
+ * §53 (frontend half): writing an annotation is not an excuse to re-run
+ * redaction. A second pass over an already-redacted row would rewrite values
+ * that are already placeholders, and it would push a whole-file write through a
+ * command that exists to merge rows.
+ */
+describe("§53 an annotation write does not re-sanitize anything", () => {
+  const REDACTED = "[redacted]"
+
+  it("leaves an already-redacted value exactly as it was", async () => {
+    const store = useHistoryStore()
+    store.entries = [
+      entry({
+        id: "a",
+        requestHeaders: [
+          { id: "h1", enabled: true, key: "Authorization", value: REDACTED, description: "" },
+        ],
+      }),
+    ]
+
+    await store.setNote("a", "still fine")
+
+    expect(store.entries[0].requestHeaders?.[0].value).toBe(REDACTED)
+    expect(store.entries[0].note).toBe("still fine")
+  })
+
+  it("does not push the whole file back through the row-merge command", async () => {
+    const store = useHistoryStore()
+    store.entries = [entry({ id: "a" }), entry({ id: "b", url: "https://api.example.com/b" })]
+
+    await store.setNote("a", "note")
+    await store.toggleStar("b")
+
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === "update_history_entries"),
+    ).toEqual([])
+  })
+})

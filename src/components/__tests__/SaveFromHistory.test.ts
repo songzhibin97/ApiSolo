@@ -223,7 +223,11 @@ describe("§12 the confirmation appears exactly when there is something to confi
 })
 
 describe("§16 a failed save says so and stays open", () => {
-  it("keeps the dialog on screen after a rejection", async () => {
+  // Asserted as the absent `close` event rather than as a still-rendered
+  // dialog: `visible` is a prop, so in isolation the dialog stays on screen
+  // whether or not it asked to be closed, and the assertion would hold for a
+  // component that closes on failure.
+  it("does not ask to be closed after a rejection", async () => {
     const projects = useProjectsStore()
     vi.spyOn(projects, "saveRequest").mockRejectedValue(new Error("Request with the same name already exists"))
     const wrapper = mountDialog()
@@ -231,7 +235,18 @@ describe("§16 a failed save says so and stays open", () => {
     await wrapper.find("[data-testid=\"save-from-history-submit\"]").trigger("click")
     await wrapper.vm.$nextTick()
 
-    expect(wrapper.find("[data-testid=\"save-from-history-submit\"]").exists()).toBe(true)
+    expect(wrapper.emitted("close")).toBeUndefined()
+  })
+
+  it("does ask to be closed when the save succeeded", async () => {
+    const projects = useProjectsStore()
+    vi.spyOn(projects, "saveRequest").mockResolvedValue(undefined)
+    const wrapper = mountDialog()
+
+    await wrapper.find("[data-testid=\"save-from-history-submit\"]").trigger("click")
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.emitted("close")).toHaveLength(1)
   })
 
   it("hands the failure through verbatim rather than a message of its own", async () => {

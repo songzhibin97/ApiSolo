@@ -293,12 +293,15 @@ describe("§20 a collapsed group stays collapsed across a delete", () => {
     history.setPrefixDepth(1)
     await wrapper.vm.$nextTick()
 
-    // Collapse the first group. Its rows stop rendering, which is how collapse
-    // is observable at all.
-    const groupHeaders = wrapper.findAll("section > div > div > div > button")
-    await groupHeaders[0].trigger("click")
+    // Collapse the first group. Its rows stop rendering, which is the only way
+    // collapse is observable at all -- and the collapse has to be confirmed to
+    // have happened, or this test would pass without ever collapsing anything.
+    const expanded = rows(wrapper, "history-row").length
+    expect(expanded).toBe(3)
+    await wrapper.findAll("[data-testid=\"history-group-header\"]")[0].trigger("click")
     await wrapper.vm.$nextTick()
     const collapsedBefore = rows(wrapper, "history-row").length
+    expect(collapsedBefore).toBeLessThan(expanded)
 
     await rows(wrapper, "history-delete")[0].trigger("click")
     await wrapper.vm.$nextTick()

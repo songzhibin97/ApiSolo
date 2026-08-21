@@ -1324,7 +1324,15 @@ describe("§34/§41 notes and stars never reach the wire", () => {
     executeScriptMock.mockClear()
   })
 
-  it("sends nothing named note or starred when replaying an annotated entry", async () => {
+  /**
+   * The annotation is put on the tab itself, which is the shape the defect
+   * would actually take: something copies an annotated history row wholesale
+   * onto a tab, and the payload builder spreads the tab instead of naming the
+   * fields it wants. Replaying through `openHistoryEntry` alone cannot show
+   * this — that path never copies a note onto the tab, so a leak in the builder
+   * would have nothing to leak and the test would pass either way.
+   */
+  it("sends nothing named note or starred when the tab is carrying them", async () => {
     invokeMock.mockImplementation(okInvoke())
 
     const tabsStore = useTabsStore()
@@ -1341,6 +1349,11 @@ describe("§34/§41 notes and stars never reach the wire", () => {
       note: "do not send me",
       starred: true,
     } as HistoryEntry)
+    tabsStore.updateTab(tabsStore.activeTab.id, {
+      note: "do not send me",
+      starred: true,
+    } as never)
+    expect((tabsStore.activeTab as never as { note: string }).note).toBe("do not send me")
 
     await requestStore.sendRequest(tabsStore.activeTab)
 

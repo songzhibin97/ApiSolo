@@ -380,6 +380,7 @@ async function clearHistory() {
         >
           <button
             class="flex w-full items-center gap-2 px-3 py-2.5 text-left text-sm text-[var(--text-primary)] transition hover:bg-[color-mix(in_srgb,var(--bg-surface)_30%,transparent)]"
+            data-testid="history-group-header"
             type="button"
             @click="toggleGroup(group.label)"
           >

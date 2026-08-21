@@ -126,3 +126,30 @@ describe("§50 annotations live in the history row, not in a second file", () =>
     expect(historyFileNames().filter((name) => !ALLOWED.includes(name))).toEqual([])
   })
 })
+
+/**
+ * §51: the annotation command takes an id and the two fields, never a row. This
+ * is a structural check rather than a behavioural one on purpose — a signature
+ * that cannot carry a whole entry cannot overwrite one, so the defect is not
+ * expressible instead of merely untested (PROCESS.md P8).
+ */
+describe("§51 the annotation command cannot be handed a whole history row", () => {
+  function annotationSignature(): string {
+    const source = readFileSync("src-tauri/src/lib.rs", "utf8")
+    const start = source.indexOf("fn set_history_annotation(")
+    expect(start, "set_history_annotation is missing").toBeGreaterThan(-1)
+    const end = source.indexOf(")", start)
+    return source.slice(start, end + 1)
+  }
+
+  it("the scan is looking at the signature it thinks it is", () => {
+    // Fail-closed: a slice that happened to be empty or to miss the parameters
+    // would pass the check below without having read anything.
+    expect(annotationSignature()).toContain("id: String")
+    expect(annotationSignature()).toContain("starred: Option<bool>")
+  })
+
+  it("names no entry type among its parameters", () => {
+    expect(annotationSignature()).not.toContain("HistoryEntry")
+  })
+})

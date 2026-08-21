@@ -213,6 +213,13 @@ function openSaveDialog() {
 }
 
 async function submitSave() {
+  // Depth behind the `disabled` binding, which is what actually stops the
+  // click today -- so no test can kill this line on its own, and deleting it
+  // changes nothing observable. It stays because `disabled` only guards the one
+  // button: anything that calls this function directly (a keyboard shortcut, a
+  // form submit, a future third entry point) arrives here with the binding
+  // never consulted, and this slice exists because a save that goes through
+  // unannounced is silent.
   if (saveBlocked.value) {
     return;
   }
