@@ -97,6 +97,7 @@ function buildResponse(overrides: Partial<HttpResponse> = {}): HttpResponse {
       total: 45,
     },
     contentType: "application/json",
+    bodyKind: "text",
     ...overrides,
   }
 }
@@ -1278,5 +1279,77 @@ describe("each sanitizeHistoryEntry call site is reachable from the send path", 
     expect(entry.requestHeaders?.[0].value).toBe("password: hunter2")
     expect(entry.requestParams?.[0].value).toBe(`Bearer ${JWT}`)
     expect(entry.requestBodyContent).toBe(`Digest ${DIGEST}`)
+  })
+})
+
+// The response body kind is machine-readable on the Rust side and was being
+// dropped on the floor here, which is why a binary body used to reach the panel
+// as a line of placeholder text with nothing marking it as such.
+describe("§55 the response body kind reaches append_history", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    invokeMock.mockReset()
+    executeScriptMock.mockClear()
+  })
+
+  async function captureEntry(response: Partial<HttpResponse>): Promise<HistoryEntry> {
+    invokeMock.mockImplementation(okInvoke({ send_request: buildResponse(response) }))
+
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+    await requestStore.sendRequest(tabsStore.activeTab)
+
+    const call = invokeMock.mock.calls.find(([command]) => command === "append_history")
+    expect(call, "append_history was never called").toBeDefined()
+    return (call![1] as { entry: HistoryEntry }).entry
+  }
+
+  it("carries a text response through as text", async () => {
+    expect((await captureEntry({ bodyKind: "text" })).responseBodyKind).toBe("text")
+  })
+
+  it("carries a binary response through as binary", async () => {
+    expect((await captureEntry({ bodyKind: "binary" })).responseBodyKind).toBe("binary")
+  })
+})
+
+// §34 / §41: annotations are data about a call, never part of one. A note is
+// the one field here a user can type free text into, so it is also the one
+// that would quietly become a header or a body field if anything ever spread
+// a history entry into the outgoing request.
+describe("§34/§41 notes and stars never reach the wire", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    invokeMock.mockReset()
+    executeScriptMock.mockClear()
+  })
+
+  it("sends nothing named note or starred when replaying an annotated entry", async () => {
+    invokeMock.mockImplementation(okInvoke())
+
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+    tabsStore.openHistoryEntry({
+      id: "annotated-1",
+      method: "GET",
+      url: "https://api.example.com/notes",
+      status: 200,
+      time: 5,
+      size: 2,
+      timestamp: "2026-03-27T10:00:00Z",
+      contentType: "application/json",
+      note: "do not send me",
+      starred: true,
+    } as HistoryEntry)
+
+    await requestStore.sendRequest(tabsStore.activeTab)
+
+    const call = invokeMock.mock.calls.find(([command]) => command === "send_request")
+    expect(call, "send_request was never called").toBeDefined()
+    const payload = JSON.stringify(call![1])
+
+    expect(payload).not.toContain("do not send me")
+    expect(payload).not.toContain("\"note\"")
+    expect(payload).not.toContain("\"starred\"")
   })
 })

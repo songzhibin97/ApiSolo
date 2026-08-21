@@ -449,6 +449,9 @@ export const useTabsStore = defineStore("tabs", () => {
         time: entry.time,
         contentType: entry.contentType,
         timings: entry.timings ?? { dnsLookup: 0, tcpConnect: 0, tlsHandshake: 0, ttfb: 0, download: 0, total: entry.time },
+        // Rows written before this field existed are text — that is what the
+        // panel already assumed of them.
+        bodyKind: entry.responseBodyKind ?? "text",
       }
     }
 
