@@ -67,6 +67,9 @@ ApiSolo stores data locally. It does not require a cloud account.
 - Secret metadata: `.env.secrets.json` stores names and vault references only; secret values are written as empty strings.
 - Migration: if an older `.env.secrets.json` contains plaintext secret values, ApiSolo imports them into the selected secret backend on first load and rewrites the metadata file without plaintext.
 - Quarantined history lines: `$HOME/ApiSolo/scratch/history.corrupt.jsonl` holds lines that could not be parsed, byte for byte, so a single damaged line costs only itself instead of blanking the whole panel. Clearing history deletes this file along with `history.jsonl`; that is not undoable.
+- Starred history entries are exempt from automatic eviction, so history can grow without any upper bound; how far it grows is decided entirely by how many entries you star. Starring does not exempt an entry from an explicit clear — Clear History deletes every entry, starred ones included.
+- A request saved to a collection from history keeps its redacted fields as empty values and carries no marker for them. Opening that request from the collection later shows no "needs re-entering" banner: the empty fields look exactly like fields you chose to leave blank.
+- Saving from history is not lossless. The bytes and the path of an uploaded file are not stored in history (only a bare file name survives), and a parameter or header that was disabled when you sent the request is not written to history at all. The save dialog can tell you which files to pick again; it cannot mention the disabled rows, because they are not in the entry for it to point at.
 - Vault maintenance: `$HOME/ApiSolo/scratch/vault-maintenance.json` records identifier collisions found during migration and the vault entries still queued for deletion. It stores identifiers and a failure category only — never a secret value, and never the raw error text from a keychain or vault backend.
 - Secret identifiers: a vault key is `<project>:<environment>:<base64url variable name>`, and non-ASCII project and environment names are kept as written rather than folded into underscores, so `生产` and `测试` no longer share one slot.
 - Lazy migration: entries stored under the older identifier scheme are moved the next time you open that environment, not in a batch on startup. Until an environment is opened it keeps working off its old entry.
@@ -145,7 +148,6 @@ Release expectations:
 
 ## Known Issues
 
-- History entries do not yet carry the machine-readable body-kind marker that live responses have. Replaying a binary response from history therefore renders its placeholder text as if it were the response body. Scheduled for the history-annotations slice (backlog D07b).
 - Response bodies are read fully into memory with no size cap on the network read (only the decompressed output is capped). Very large responses can exhaust memory. Tracked as backlog D09.
 
 ## License
