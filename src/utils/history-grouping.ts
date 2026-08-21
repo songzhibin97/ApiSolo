@@ -96,12 +96,26 @@ export function groupByTime(entries: HistoryEntry[]): HistoryGroup[] {
     }))
 }
 
-export function filterEntries(entries: HistoryEntry[], query: string): HistoryEntry[] {
+/**
+ * Search and the starred filter intersect rather than override: someone with
+ * the filter on is narrowing the same list, not switching to a different one.
+ * Grouping runs afterwards on whatever survives, so the group structure keeps
+ * its shape and only gets thinner.
+ */
+export function filterEntries(
+  entries: HistoryEntry[],
+  query: string,
+  starredOnly = false,
+): HistoryEntry[] {
   const trimmed = query.trim().toLowerCase()
-  if (!trimmed) {
-    return entries
-  }
-  return entries.filter((entry) => entry.url.toLowerCase().includes(trimmed))
+  const matchesQuery = (entry: HistoryEntry) =>
+    !trimmed ||
+    entry.url.toLowerCase().includes(trimmed) ||
+    // A note is the only part of a row the user wrote themselves, which makes
+    // it the thing they are most likely to search for.
+    (entry.note ?? "").toLowerCase().includes(trimmed)
+
+  return entries.filter((entry) => (!starredOnly || entry.starred === true) && matchesQuery(entry))
 }
 
 export function sortEntries(entries: HistoryEntry[]) {
