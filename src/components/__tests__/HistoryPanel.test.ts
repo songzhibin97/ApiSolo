@@ -121,6 +121,21 @@ describe("harness self-check", () => {
   })
 })
 
+describe("D09 the truncation badge marks rows whose body was never fully received", () => {
+  it("renders the badge on an entry stored as truncated", async () => {
+    const wrapper = await mountPanel([entry({ responseBodyTruncated: true })])
+
+    expect(rows(wrapper, "history-truncated-badge")).toHaveLength(1)
+  })
+
+  it("renders no badge on an entry that was read in full", async () => {
+    // The field is simply absent, as on every row written before the cap.
+    const wrapper = await mountPanel([entry()])
+
+    expect(rows(wrapper, "history-truncated-badge")).toHaveLength(0)
+  })
+})
+
 describe("§1/§18 every row offers both new actions", () => {
   const three = [
     entry({ id: "a", url: "https://api.example.com/a" }),
