@@ -186,6 +186,34 @@ describe("D08 §13 the collision notice decisions are written down in both READM
   })
 })
 
+/**
+ * D08 §14: a text gate, not a behaviour gate — start_dev_server sits under
+ * #[cfg(feature = "dev-bridge")], so no default test run can send an HTTP
+ * request to these routes. What can be pinned is that the route literals are
+ * on disk and spelled exactly like the command names: a one-letter mismatch is
+ * a 404, and under §2 a 404 renders as "no collisions" — indistinguishable
+ * from the notice silently dying in dev:web.
+ */
+describe("D08 §14 the dev bridge declares routes for both collision commands", () => {
+  function devBridgeRouteNames(): string[] {
+    const source = readFileSync("src-tauri/src/lib.rs", "utf8")
+    return [...source.matchAll(/"\/api\/([A-Za-z0-9_-]+)"/g)].map((match) => match[1])
+  }
+
+  it("the scan finds a route that predates this slice", () => {
+    // Fail-closed: an empty scan would otherwise read as "routes are fine".
+    expect(devBridgeRouteNames()).toContain("get_history_health")
+  })
+
+  it("declares the collision query route, spelled like the command", () => {
+    expect(devBridgeRouteNames()).toContain("get_secret_key_collisions")
+  })
+
+  it("declares the acknowledge route, spelled like the command", () => {
+    expect(devBridgeRouteNames()).toContain("acknowledge_secret_key_collision")
+  })
+})
+
 describe("§51 the annotation command cannot be handed a whole history row", () => {
   function annotationSignature(): string {
     const source = readFileSync("src-tauri/src/lib.rs", "utf8")
