@@ -80,6 +80,43 @@ const MATRIX: Record<string, { "zh-CN": string; en: string }> = {
     "zh-CN": "这是二进制响应体，不能作为文本显示。",
     en: "This is a binary response body and cannot be shown as text.",
   },
+  "environment.collisionTitle": {
+    "zh-CN": "有 {count} 个密钥值曾被两个环境共用",
+    en: "{count} secret values were shared by two environments",
+  },
+  "environment.collisionConsequence": {
+    "zh-CN":
+      "这些环境名在升级前生成了相同的密钥标识，后保存的值覆盖了先保存的。被覆盖的那个值不在磁盘上，也没有备份，无法恢复——请在下面列出的每个环境里重新填写这个变量。ApiSolo 不会猜它是什么，也不会用空值顶替。",
+    en: "Before the upgrade these environment names produced the same secret identifier, so whichever value was saved later overwrote the earlier one. The overwritten value is not on disk, is not backed up, and cannot be recovered — re-enter this variable in each environment listed below. ApiSolo does not guess what it was, and does not put an empty value in its place.",
+  },
+  "environment.collisionVariable": {
+    "zh-CN": "变量 {name}",
+    en: "Variable {name}",
+  },
+  "environment.collisionShared": {
+    "zh-CN": "共用同一个格子的环境（磁盘上的项目目录名 / 环境文件名，可能与项目显示名不同）：",
+    en: "Environments that shared one slot (project directory / environment file name on disk, which can differ from the project's display name):",
+  },
+  "environment.collisionDetectedAt": {
+    "zh-CN": "发现于 {at}",
+    en: "Detected at {at}",
+  },
+  "environment.collisionAck": {
+    "zh-CN": "我已重填，不再提示",
+    en: "I have re-entered it — stop showing this",
+  },
+  "environment.collisionAckTitle": {
+    "zh-CN": "不再提示这次碰撞？",
+    en: "Stop showing this collision?",
+  },
+  "environment.collisionAckConfirm": {
+    "zh-CN": "这会删除 {variable} 的这条碰撞记录，无法撤销。ApiSolo 此后不会再提到这次碰撞。",
+    en: "This deletes the collision record for {variable} and cannot be undone. ApiSolo will not mention this collision again.",
+  },
+  "environment.nameNormalizedHint": {
+    "zh-CN": "环境名会按大小写、空格与标点归一化成一个文件名，两种写法可能落到同一个环境上。",
+    en: "Environment names are normalised — case, spaces and punctuation — into a single file name, so two spellings can land on the same environment.",
+  },
 }
 
 const i18n = createI18n({

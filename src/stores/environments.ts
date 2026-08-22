@@ -5,7 +5,7 @@ import i18n from "../i18n"
 import { recordConsoleEntry } from "./console"
 import { invoke } from "../utils/invoke"
 import { useProjectsStore } from "./projects"
-import type { Environment, EnvVariable } from "../types"
+import type { Environment, EnvVariable, SecretKeyCollision } from "../types"
 
 export const useEnvironmentsStore = defineStore("environments", () => {
   const projectsStore = useProjectsStore()
@@ -13,7 +13,40 @@ export const useEnvironmentsStore = defineStore("environments", () => {
   const environments = ref<string[]>([])
   const activeEnv = ref<string | null>(null)
   const variables = ref<EnvVariable[]>([])
+  const collisions = ref<SecretKeyCollision[]>([])
   const pendingEnvironmentNames = new Set<string>()
+
+  /**
+   * Never throws. This fetch is not a user action: it piggybacks on mounting
+   * the panel, loading an environment and saving one, and letting it reject
+   * would fail those actions for a reason that has nothing to do with them.
+   * On failure the panel simply shows no collision notice — and no "no
+   * collisions" claim either, because an unread file proves nothing.
+   */
+  async function loadCollisions() {
+    try {
+      collisions.value = await invoke<SecretKeyCollision[]>("get_secret_key_collisions")
+    } catch (error) {
+      recordConsoleEntry(
+        "error",
+        `[app] Failed to read secret key collisions: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        "app",
+      )
+    }
+  }
+
+  /**
+   * Throws: this one is a user action, and the backend's own words must reach
+   * the confirmation dialog. On success the list is re-fetched rather than
+   * spliced locally — the disk is the truth, and removing the row in memory
+   * would show a success the write-back may not have delivered.
+   */
+  async function acknowledgeCollision(legacyVaultKey: string) {
+    await invoke("acknowledge_secret_key_collision", { legacyVaultKey })
+    await loadCollisions()
+  }
 
   watch(activeEnv, async (nextEnv, previousEnv) => {
     if (!projectsStore.activeProject) {
@@ -102,6 +135,10 @@ export const useEnvironmentsStore = defineStore("environments", () => {
 
     activeEnv.value = env.name
     variables.value = env.variables
+    // After the staleness check on purpose: loading an environment is one of
+    // the two moments that produce a collision record, so the list is
+    // re-fetched here — but only for a load the user is still looking at.
+    await loadCollisions()
     return env
   }
 
@@ -129,6 +166,11 @@ export const useEnvironmentsStore = defineStore("environments", () => {
 
       pendingEnvironmentNames.delete(envName)
       await loadEnvironments()
+      // Saving is the other moment that produces a collision record. The
+      // loadEnvironments() above usually re-fetches once already (via its
+      // chained loadEnvironment), but that hop depends on the saved name
+      // being selected and listed; this call is the one that does not.
+      await loadCollisions()
       recordConsoleEntry(
         "info",
         `[app] Environment saved: ${projectsStore.activeProject}/${envName}`,
@@ -142,6 +184,28 @@ export const useEnvironmentsStore = defineStore("environments", () => {
         }`,
         "app",
       )
+      if (isDraft) {
+        // A rejected draft must not stay in the list: it looks like a real
+        // environment, loads as an empty table, and can never be saved. The
+        // rows typed into that table go with it — the price of the honest
+        // list, chosen over keeping a lying entry.
+        pendingEnvironmentNames.delete(envName)
+        try {
+          // From disk, not an in-memory filter: loadEnvironments also moves
+          // the selection back to something that really exists (or to none).
+          await loadEnvironments()
+        } catch (rollbackError) {
+          // The rollback's own failure must not replace the save failure —
+          // the user asked why the save failed, not what the cleanup hit.
+          recordConsoleEntry(
+            "error",
+            `[app] Failed to reload environments after rejected draft ${envName}: ${
+              rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
+            }`,
+            "app",
+          )
+        }
+      }
       throw error
     }
   }
@@ -199,8 +263,11 @@ export const useEnvironmentsStore = defineStore("environments", () => {
     environments,
     activeEnv,
     variables,
+    collisions,
     loadEnvironments,
     loadEnvironment,
+    loadCollisions,
+    acknowledgeCollision,
     saveEnvironment,
     deleteEnvironment,
     setActiveEnv,

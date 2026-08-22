@@ -5,9 +5,10 @@ import { Eye, EyeOff, Lock, Plus, Trash2 } from "lucide-vue-next"
 import { useI18n } from "vue-i18n"
 
 import ConfirmDialog from "../ui/ConfirmDialog.vue"
+import InlineError from "../ui/InlineError.vue"
 import { useEnvironmentsStore } from "../../stores/environments"
 import { useProjectsStore } from "../../stores/projects"
-import type { EnvVariable } from "../../types"
+import type { EnvVariable, SecretKeyCollision } from "../../types"
 
 interface EditableEnvVariable extends EnvVariable {
   id: string
@@ -18,13 +19,19 @@ const environmentsStore = useEnvironmentsStore()
 const { t } = useI18n()
 
 const { activeProject } = storeToRefs(projectsStore)
-const { environments, activeEnv, variables } = storeToRefs(environmentsStore)
+const { environments, activeEnv, variables, collisions } = storeToRefs(environmentsStore)
 
 const errorMessage = ref("")
 const showSecrets = ref(false)
 const showCreateEnvironment = ref(false)
 const newEnvironmentName = ref("")
 const deleteDialogVisible = ref(false)
+
+// The record being confirmed, or null. Confirming deletes the record from
+// disk — irreversibly — so the button never acknowledges directly.
+const collisionToAcknowledge = ref<SecretKeyCollision | null>(null)
+const acknowledgeError = ref("")
+const acknowledgeBusy = ref(false)
 
 onMounted(async () => {
   try {
@@ -33,7 +40,55 @@ onMounted(async () => {
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
   }
+  // The panel is unmounted whenever the sidebar shows another tab, so this
+  // runs on every entry, not once per app launch. loadCollisions never
+  // throws (a failed read shows nothing, and claims nothing).
+  await environmentsStore.loadCollisions()
 })
+
+/**
+ * variableKey can be an empty string when the vault key's third segment does
+ * not decode; the identifier is the only honest fallback, never a blank.
+ */
+function collisionVariableName(record: SecretKeyCollision): string {
+  return record.variableKey || record.legacyVaultKey
+}
+
+/** RFC 3339 in, locale string out; an unparseable value shows as itself. */
+function formatDetectedAt(value: string): string {
+  const parsed = new Date(value)
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString()
+}
+
+function requestAcknowledgeCollision(record: SecretKeyCollision) {
+  acknowledgeError.value = ""
+  collisionToAcknowledge.value = record
+}
+
+function cancelAcknowledgeCollision() {
+  collisionToAcknowledge.value = null
+  acknowledgeError.value = ""
+}
+
+async function confirmAcknowledgeCollision() {
+  if (!collisionToAcknowledge.value) {
+    return
+  }
+
+  acknowledgeBusy.value = true
+  try {
+    await environmentsStore.acknowledgeCollision(collisionToAcknowledge.value.legacyVaultKey)
+    collisionToAcknowledge.value = null
+    acknowledgeError.value = ""
+  } catch (error) {
+    // The dialog stays open and shows the backend's own words: a failed
+    // acknowledgement that looks successful would resurface the record on
+    // the next visit as a surprise.
+    acknowledgeError.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    acknowledgeBusy.value = false
+  }
+}
 
 const rows = computed<EditableEnvVariable[]>(() => {
   const baseRows = variables.value.map((item, index) => ({
@@ -173,6 +228,12 @@ async function confirmDeleteEnvironment() {
             <span>{{ t("environment.new") }}</span>
           </button>
         </div>
+        <p
+          v-if="showCreateEnvironment"
+          class="mt-2 text-xs leading-5 text-[var(--text-secondary)]"
+        >
+          {{ t("environment.nameNormalizedHint") }}
+        </p>
         <form v-if="showCreateEnvironment" class="mt-2 flex gap-2" @submit.prevent="createEnvironment">
           <input
             v-model="newEnvironmentName"
@@ -196,8 +257,61 @@ async function confirmDeleteEnvironment() {
         </form>
       </template>
 
-      <div v-if="errorMessage" class="mt-3 text-sm text-rose-300">
-        {{ errorMessage }}
+      <div v-if="errorMessage" class="mt-3">
+        <InlineError :message="errorMessage" />
+      </div>
+
+      <!--
+        Outside the activeProject gate on purpose: collision records are
+        global, carry their own project names, and missing one costs an
+        unrecoverable credential — so they show with no project active too.
+      -->
+      <div
+        v-if="collisions.length > 0"
+        data-testid="collision-section"
+        class="mt-3 rounded border border-amber-400/50 bg-[color-mix(in_srgb,#f59e0b_10%,transparent)] p-3"
+      >
+        <div class="text-sm font-semibold text-amber-300">
+          {{ t("environment.collisionTitle", { count: collisions.length }) }}
+        </div>
+        <div class="mt-2 text-sm leading-6 text-[var(--text-secondary)]">
+          {{ t("environment.collisionConsequence") }}
+        </div>
+        <!-- Keyed by legacyVaultKey: the backend never records the same key twice. -->
+        <div
+          v-for="record in collisions"
+          :key="record.legacyVaultKey"
+          data-testid="collision-record"
+          class="mt-3 border-t border-[color-mix(in_srgb,var(--border)_80%,transparent)] pt-3"
+        >
+          <div class="text-sm font-semibold text-[var(--text-primary)]">
+            {{ t("environment.collisionVariable", { name: collisionVariableName(record) }) }}
+          </div>
+          <div class="mt-1 text-sm leading-6 text-[var(--text-secondary)]">
+            {{ t("environment.collisionShared") }}
+          </div>
+          <ul class="mt-1 space-y-0.5">
+            <li
+              v-for="environmentRef in record.environments"
+              :key="`${environmentRef.project}/${environmentRef.environment}`"
+              data-testid="collision-environment"
+              class="font-mono text-sm text-[var(--text-primary)]"
+            >
+              {{ environmentRef.project }} / {{ environmentRef.environment }}
+            </li>
+          </ul>
+          <div class="mt-1 text-sm text-[var(--text-secondary)]">
+            {{ t("environment.collisionDetectedAt", { at: formatDetectedAt(record.detectedAt) }) }}
+          </div>
+          <button
+            data-testid="collision-ack"
+            class="mt-2 inline-flex h-8 items-center rounded border border-[var(--border)] px-3 text-sm text-[var(--text-primary)] transition hover:border-[color-mix(in_srgb,var(--accent)_60%,white)]"
+            type="button"
+            @click="requestAcknowledgeCollision(record)"
+          >
+            {{ t("environment.collisionAck") }}
+          </button>
+        </div>
       </div>
     </div>
 
@@ -270,12 +384,13 @@ async function confirmDeleteEnvironment() {
         </div>
       </div>
 
-      <div v-if="errorMessage" class="px-4 pb-2 text-sm text-rose-300">
-        {{ errorMessage }}
+      <div v-if="errorMessage" class="px-4 pb-2">
+        <InlineError :message="errorMessage" />
       </div>
 
       <div class="flex gap-2 border-t border-[var(--border)] p-3">
         <button
+          data-testid="environment-save"
           class="flex h-8 flex-1 items-center justify-center rounded bg-[var(--accent)] px-3 text-sm font-semibold text-white transition hover:brightness-110"
           type="button"
           @click="saveEnvironment"
@@ -319,6 +434,29 @@ async function confirmDeleteEnvironment() {
       danger
       @cancel="deleteDialogVisible = false"
       @confirm="confirmDeleteEnvironment"
+    />
+
+    <!--
+      v-if, not just :visible — with zero records the panel must contain no
+      collision-related node at all, and prop bindings evaluate (and call t()
+      with collision keys) even while the dialog is hidden.
+    -->
+    <ConfirmDialog
+      v-if="collisions.length > 0"
+      :visible="collisionToAcknowledge !== null"
+      :title="t('environment.collisionAckTitle')"
+      :message="
+        t('environment.collisionAckConfirm', {
+          variable: collisionToAcknowledge ? collisionVariableName(collisionToAcknowledge) : '',
+        })
+      "
+      :confirm-label="t('environment.collisionAck')"
+      :cancel-label="t('common.cancel')"
+      danger
+      :error-message="acknowledgeError"
+      :busy="acknowledgeBusy"
+      @cancel="cancelAcknowledgeCollision"
+      @confirm="confirmAcknowledgeCollision"
     />
   </section>
 </template>

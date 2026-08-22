@@ -268,6 +268,19 @@ export default {
     showSecretValues: "Show secret values",
     deleteConfirm: "Delete environment \"{name}\"?",
     nameRequired: "Environment name",
+    collisionTitle: "{count} secret values were shared by two environments",
+    collisionConsequence:
+      "Before the upgrade these environment names produced the same secret identifier, so whichever value was saved later overwrote the earlier one. The overwritten value is not on disk, is not backed up, and cannot be recovered — re-enter this variable in each environment listed below. ApiSolo does not guess what it was, and does not put an empty value in its place.",
+    collisionVariable: "Variable {name}",
+    collisionShared:
+      "Environments that shared one slot (project directory / environment file name on disk, which can differ from the project's display name):",
+    collisionDetectedAt: "Detected at {at}",
+    collisionAck: "I have re-entered it — stop showing this",
+    collisionAckTitle: "Stop showing this collision?",
+    collisionAckConfirm:
+      "This deletes the collision record for {variable} and cannot be undone. ApiSolo will not mention this collision again.",
+    nameNormalizedHint:
+      "Environment names are normalised — case, spaces and punctuation — into a single file name, so two spellings can land on the same environment.",
   },
   settings: {
     title: "Settings",

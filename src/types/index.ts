@@ -233,6 +233,30 @@ export interface Environment {
   variables: EnvVariable[]
 }
 
+/**
+ * Mirrors the Rust `EnvironmentRef` wire shape field for field. Both values
+ * are disk identifiers — the project directory name and the environment file
+ * stem — not display names, and the UI must say so rather than present them
+ * as project names.
+ */
+export interface SecretKeyCollisionEnvironmentRef {
+  project: string
+  environment: string
+}
+
+/**
+ * Mirrors the Rust `SecretKeyCollision` wire shape. All four fields are
+ * always present on the wire (no Option, no skip_serializing_if on the
+ * producing side). `variableKey` can be an empty string when the vault key's
+ * third segment does not decode.
+ */
+export interface SecretKeyCollision {
+  legacyVaultKey: string
+  variableKey: string
+  environments: SecretKeyCollisionEnvironmentRef[]
+  detectedAt: string
+}
+
 export interface WsMessage {
   id: string
   direction: "sent" | "received" | "system"
