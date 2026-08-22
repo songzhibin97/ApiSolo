@@ -473,6 +473,7 @@ function buildHistoryEntry(tab: Tab, response: HttpResponse): HistoryEntry {
     method: tab.method,
     url: tab.url,
     status: response.status,
+    statusText: response.statusText,
     time: response.time,
     size: response.size,
     timings: response.timings,

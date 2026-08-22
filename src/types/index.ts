@@ -175,6 +175,8 @@ export interface HistoryEntry {
   method: string
   url: string
   status: number
+  /** Absent on rows written before the field existed; Rust defaults it to "". */
+  statusText?: string
   time: number
   size: number
   timings?: RequestTimings

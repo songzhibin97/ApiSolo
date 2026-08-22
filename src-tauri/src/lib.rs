@@ -351,6 +351,12 @@ struct HistoryEntry {
     method: String,
     url: String,
     status: u16,
+    // Rows written before this field existed default to "": the frontend
+    // renders that as the bare status code, which is honest — the reason
+    // phrase for those rows was never recorded, and fabricating "OK" is
+    // exactly the bug this field exists to fix.
+    #[serde(default)]
+    status_text: String,
     time: u64,
     size: u64,
     #[serde(default)]
@@ -6074,6 +6080,7 @@ mod tests {
             method: "GET".to_string(),
             url: "http://example.com/api".to_string(),
             status: 200,
+            status_text: "OK".to_string(),
             time: 100,
             size: 1024,
             timings: RequestTimings {
@@ -7038,6 +7045,7 @@ mod tests {
 
         let entry: HistoryEntry = serde_json::from_str(json).unwrap();
         assert_eq!(entry.method, "GET");
+        assert!(entry.status_text.is_empty());
         assert!(entry.request_params.is_empty());
         assert!(entry.request_headers.is_empty());
         assert!(entry.request_body_type.is_empty());
@@ -7057,6 +7065,7 @@ mod tests {
             method: "POST".to_string(),
             url: "https://api.example.com/users".to_string(),
             status: 201,
+            status_text: "Created".to_string(),
             time: 220,
             size: 512,
             timings: RequestTimings {
@@ -7107,6 +7116,8 @@ mod tests {
         };
 
         let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"statusText\""));
+        assert!(!json.contains("\"status_text\""));
         assert!(json.contains("\"requestParams\""));
         assert!(json.contains("\"requestHeaders\""));
         assert!(json.contains("\"requestBodyType\""));
@@ -7121,6 +7132,7 @@ mod tests {
         assert!(!json.contains("\"request_params\""));
 
         let roundtrip: HistoryEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.status_text, "Created");
         assert_eq!(roundtrip.request_body_type, "json");
         assert_eq!(roundtrip.request_auth_type, "bearer");
         assert_eq!(
@@ -7362,6 +7374,7 @@ mod tests {
                 method: "GET".to_string(),
                 url: format!("{}/api/v1/users", base_url),
                 status: get_response.status,
+                status_text: get_response.status_text.clone(),
                 time: get_response.time,
                 size: get_response.size,
                 timings: get_response.timings.clone(),
@@ -7443,6 +7456,7 @@ mod tests {
                 method: "POST".to_string(),
                 url: format!("{}/api/v1/users", base_url),
                 status: post_response.status,
+                status_text: post_response.status_text.clone(),
                 time: post_response.time,
                 size: post_response.size,
                 timings: post_response.timings.clone(),
@@ -8788,6 +8802,7 @@ mod tests {
             method: "POST".to_string(),
             url: "https://example.com/items".to_string(),
             status: 201,
+            status_text: "Created".to_string(),
             time: 75,
             size: 256,
             timings: RequestTimings {
@@ -11679,8 +11694,9 @@ mod tests {
         );
     }
 
-    /// §52: a row written before these three fields existed still reads, and
-    /// reads as "no note, not starred, text body".
+    /// §52: a row written before these fields existed (the three D07 ones,
+    /// plus the later statusText) still reads, and reads as "no note, not
+    /// starred, text body, no recorded reason phrase".
     #[test]
     fn test_d07_rows_without_the_new_fields_still_load() {
         let _guard = lock_env();
@@ -11692,6 +11708,7 @@ mod tests {
         object.remove("note");
         object.remove("starred");
         object.remove("responseBodyKind");
+        object.remove("statusText");
         let field_count = object.len();
 
         let mut raw = serde_json::to_vec(&legacy).unwrap();
@@ -11702,6 +11719,7 @@ mod tests {
         assert_eq!(entry.note, None);
         assert!(!entry.starred);
         assert_eq!(entry.response_body_kind, ResponseBodyKind::Text);
+        assert!(entry.status_text.is_empty());
 
         // ...and the rest of the row arrived intact, not defaulted away.
         let reloaded = d07_json(&entry);
