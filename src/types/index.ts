@@ -226,7 +226,6 @@ export interface EnvVariable {
   key: string
   value: string
   secret: boolean
-  vaultKey?: string
 }
 
 export interface Environment {
