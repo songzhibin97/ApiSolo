@@ -5056,6 +5056,12 @@ struct SetHistoryAnnotationArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct AcknowledgeSecretKeyCollisionArgs {
+    legacy_vault_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CancelRequestArgs {
     request_id: String,
 }
@@ -5251,6 +5257,16 @@ async fn api_get_history_health() -> impl IntoResponse {
     api_response(get_history_health())
 }
 
+async fn api_get_secret_key_collisions() -> impl IntoResponse {
+    api_response(get_secret_key_collisions())
+}
+
+async fn api_acknowledge_secret_key_collision(
+    Json(args): Json<AcknowledgeSecretKeyCollisionArgs>,
+) -> impl IntoResponse {
+    api_unit(acknowledge_secret_key_collision(args.legacy_vault_key))
+}
+
 async fn api_update_history_entries(Json(args): Json<UpdateHistoryEntriesArgs>) -> impl IntoResponse {
     api_unit(update_history_entries(args.entries))
 }
@@ -5303,6 +5319,14 @@ async fn start_dev_server() {
         .route("/api/append_history", post(api_append_history))
         .route("/api/load_history", post(api_load_history))
         .route("/api/get_history_health", post(api_get_history_health))
+        .route(
+            "/api/get_secret_key_collisions",
+            post(api_get_secret_key_collisions),
+        )
+        .route(
+            "/api/acknowledge_secret_key_collision",
+            post(api_acknowledge_secret_key_collision),
+        )
         .route("/api/clear_history", post(api_clear_history))
         .route("/api/delete_history_entry", post(api_delete_history_entry))
         .route(

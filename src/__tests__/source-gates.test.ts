@@ -133,6 +133,87 @@ describe("§50 annotations live in the history row, not in a second file", () =>
  * that cannot carry a whole entry cannot overwrite one, so the defect is not
  * expressible instead of merely untested (PROCESS.md P8).
  */
+/**
+ * D08 §13: four decisions of the collision notice that are invisible from the
+ * interface at the moment they matter — the notice's scope, what acknowledging
+ * really does, what was already lost, and how environment names collide. Both
+ * READMEs are asserted separately: writing a decision down in one language
+ * means it was not written down for the other half of the users.
+ */
+describe("D08 §13 the collision notice decisions are written down in both READMEs", () => {
+  it("the English README says the notice is global and lives only in the environment panel", () => {
+    expect(readmeEn).toContain(
+      "The collision notice is global: it lists every recorded collision regardless of which project is active, and it appears only in the environment panel",
+    )
+  })
+
+  it("the Chinese README says the notice is global and lives only in the environment panel", () => {
+    expect(readmeZh).toContain(
+      "碰撞提示是全局的：无论当前激活哪个项目都列出全部记录，且只出现在环境面板里",
+    )
+  })
+
+  it("the English README says acknowledging deletes the record irreversibly", () => {
+    expect(readmeEn).toContain(
+      "deletes that collision record from the maintenance file. This cannot be undone",
+    )
+  })
+
+  it("the Chinese README says acknowledging deletes the record irreversibly", () => {
+    expect(readmeZh).toContain("会从维护文件里删除那条碰撞记录，不可撤销")
+  })
+
+  it("the English README says the overwritten value is unrecoverable and never guessed or blanked", () => {
+    expect(readmeEn).toContain(
+      "cannot be recovered. ApiSolo does not guess what it was and does not write an empty value in its place",
+    )
+  })
+
+  it("the Chinese README says the overwritten value is unrecoverable and never guessed or blanked", () => {
+    expect(readmeZh).toContain("无法恢复；ApiSolo 不猜它是什么，也不会用空值顶替")
+  })
+
+  it("the English README says colliding new names are rejected and do not stay in the list", () => {
+    expect(readmeEn).toContain(
+      "whose name normalises to an existing one is rejected when saved, and the unsaved name does not stay in the list",
+    )
+  })
+
+  it("the Chinese README says colliding new names are rejected and do not stay in the list", () => {
+    expect(readmeZh).toContain(
+      "用一个会归一化到已有环境的名字新建时，保存会被拒绝，而那个未保存的名字不会留在列表里",
+    )
+  })
+})
+
+/**
+ * D08 §14: a text gate, not a behaviour gate — start_dev_server sits under
+ * #[cfg(feature = "dev-bridge")], so no default test run can send an HTTP
+ * request to these routes. What can be pinned is that the route literals are
+ * on disk and spelled exactly like the command names: a one-letter mismatch is
+ * a 404, and under §2 a 404 renders as "no collisions" — indistinguishable
+ * from the notice silently dying in dev:web.
+ */
+describe("D08 §14 the dev bridge declares routes for both collision commands", () => {
+  function devBridgeRouteNames(): string[] {
+    const source = readFileSync("src-tauri/src/lib.rs", "utf8")
+    return [...source.matchAll(/"\/api\/([A-Za-z0-9_-]+)"/g)].map((match) => match[1])
+  }
+
+  it("the scan finds a route that predates this slice", () => {
+    // Fail-closed: an empty scan would otherwise read as "routes are fine".
+    expect(devBridgeRouteNames()).toContain("get_history_health")
+  })
+
+  it("declares the collision query route, spelled like the command", () => {
+    expect(devBridgeRouteNames()).toContain("get_secret_key_collisions")
+  })
+
+  it("declares the acknowledge route, spelled like the command", () => {
+    expect(devBridgeRouteNames()).toContain("acknowledge_secret_key_collision")
+  })
+})
+
 describe("§51 the annotation command cannot be handed a whole history row", () => {
   function annotationSignature(): string {
     const source = readFileSync("src-tauri/src/lib.rs", "utf8")

@@ -12,6 +12,7 @@ vi.mock("../../utils/invoke", () => ({
 import i18n from "../../i18n"
 import { useEnvironmentsStore } from "../environments"
 import { useProjectsStore } from "../projects"
+import type { SecretKeyCollision } from "../../types"
 
 async function flushPromises() {
   await Promise.resolve()
@@ -45,6 +46,28 @@ function deferred<T>() {
 function lastCallFor(command: string) {
   const calls = invokeMock.mock.calls.filter(([name]) => name === command)
   return calls[calls.length - 1]?.[1] as Record<string, unknown> | undefined
+}
+
+function callCountFor(command: string) {
+  return invokeMock.mock.calls.filter(([name]) => name === command).length
+}
+
+/**
+ * The real wire shape (all four fields present, none null): the Rust structs
+ * carry no Option and no skip_serializing_if, so this is what actually
+ * arrives, not what a frontend-side declaration suggests.
+ */
+function collisionRecord(overrides: Partial<SecretKeyCollision> = {}): SecretKeyCollision {
+  return {
+    legacyVaultKey: "my-api:__:dG9rZW4",
+    variableKey: "token",
+    environments: [
+      { project: "my-api", environment: "staging" },
+      { project: "my-api", environment: "prod" },
+    ],
+    detectedAt: "2026-08-20T09:30:00+00:00",
+    ...overrides,
+  }
 }
 
 describe("useEnvironmentsStore", () => {
@@ -418,5 +441,320 @@ describe("useEnvironmentsStore", () => {
     // conflict.
     await store.saveEnvironment()
     expect(lastCallFor("save_environment")?.create).toBe(true)
+  })
+
+  // D08 §1 (ii): loading an environment is one of the two moments that produce
+  // a collision record, so the list is re-read right there.
+  it("re-reads collision records exactly once after loading an environment", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "list_environments") {
+        return ["dev"]
+      }
+
+      if (command === "get_collection_tree") {
+        return []
+      }
+
+      if (command === "load_environment") {
+        return { name: "dev", variables: [] }
+      }
+
+      if (command === "get_secret_key_collisions") {
+        return []
+      }
+
+      throw new Error(`Unexpected invoke: ${command}`)
+    })
+
+    const projectsStore = useProjectsStore()
+    projectsStore.activeProject = "demo"
+
+    const store = useEnvironmentsStore()
+    await settle()
+
+    const before = callCountFor("get_secret_key_collisions")
+    await store.loadEnvironment("dev")
+
+    // Exactly one: the fetch rides on this load and nothing else runs here.
+    expect(callCountFor("get_secret_key_collisions")).toBe(before + 1)
+  })
+
+  // D08 §1 (iii): saving is the other moment that produces a record.
+  it("re-reads collision records after a successful save, beyond the reload's own fetch", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "list_environments") {
+        return ["dev"]
+      }
+
+      if (command === "get_collection_tree") {
+        return []
+      }
+
+      if (command === "load_environment") {
+        return { name: "dev", variables: [] }
+      }
+
+      if (command === "get_secret_key_collisions") {
+        return []
+      }
+
+      if (command === "save_environment") {
+        return undefined
+      }
+
+      throw new Error(`Unexpected invoke: ${command}`)
+    })
+
+    const projectsStore = useProjectsStore()
+    projectsStore.activeProject = "demo"
+
+    const store = useEnvironmentsStore()
+    await settle()
+
+    const before = callCountFor("get_secret_key_collisions")
+    await store.saveEnvironment()
+
+    // Two by construction, asserted exactly: the post-save loadEnvironments()
+    // chains into loadEnvironment("dev"), which fetches once; the explicit
+    // post-save fetch is the second. Dropping the explicit call leaves one.
+    expect(callCountFor("get_secret_key_collisions")).toBe(before + 2)
+  })
+
+  // D08 §2: a failed collision read neither breaks the environment load nor
+  // invents records — and never throws out of loadCollisions itself.
+  it("keeps the environment load intact when the collision read fails", async () => {
+    const loaded = [{ key: "API_URL", value: "https://dev.example.com", secret: false }]
+
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "list_environments") {
+        return ["dev"]
+      }
+
+      if (command === "get_collection_tree") {
+        return []
+      }
+
+      if (command === "load_environment") {
+        return { name: "dev", variables: loaded }
+      }
+
+      if (command === "get_secret_key_collisions") {
+        throw new Error("maintenance file unreadable")
+      }
+
+      throw new Error(`Unexpected invoke: ${command}`)
+    })
+
+    const projectsStore = useProjectsStore()
+    projectsStore.activeProject = "demo"
+
+    const store = useEnvironmentsStore()
+    await settle()
+
+    // (iii) the read itself resolves rather than rejecting.
+    await expect(store.loadCollisions()).resolves.toBeUndefined()
+
+    // (i) the load still resolves and the variables still arrive.
+    const env = await store.loadEnvironment("dev")
+    expect(env).toEqual({ name: "dev", variables: loaded })
+    expect(store.variables).toEqual(loaded)
+
+    // (ii) no records were invented on the failure path.
+    expect(store.collisions).toEqual([])
+  })
+
+  // D08 §6 (store side): acknowledging re-reads the list from disk instead of
+  // splicing locally — the disk is the truth about what was deleted.
+  it("acknowledges with the record's own key and re-reads the list from disk", async () => {
+    let acknowledged = false
+
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "list_environments") {
+        return ["dev"]
+      }
+
+      if (command === "get_collection_tree") {
+        return []
+      }
+
+      if (command === "load_environment") {
+        return { name: "dev", variables: [] }
+      }
+
+      if (command === "get_secret_key_collisions") {
+        return acknowledged ? [] : [collisionRecord()]
+      }
+
+      if (command === "acknowledge_secret_key_collision") {
+        acknowledged = true
+        return undefined
+      }
+
+      throw new Error(`Unexpected invoke: ${command}`)
+    })
+
+    const projectsStore = useProjectsStore()
+    projectsStore.activeProject = "demo"
+
+    const store = useEnvironmentsStore()
+    await settle()
+
+    await store.loadCollisions()
+    expect(store.collisions).toEqual([collisionRecord()])
+
+    const before = callCountFor("get_secret_key_collisions")
+    await store.acknowledgeCollision("my-api:__:dG9rZW4")
+
+    expect(lastCallFor("acknowledge_secret_key_collision")).toEqual({
+      legacyVaultKey: "my-api:__:dG9rZW4",
+    })
+    expect(callCountFor("get_secret_key_collisions")).toBe(before + 1)
+    expect(store.collisions).toEqual([])
+  })
+
+  // D08 §7 (store side): the backend's words must survive the failure path.
+  it("propagates a failed acknowledgement verbatim and keeps the record", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "list_environments") {
+        return ["dev"]
+      }
+
+      if (command === "get_collection_tree") {
+        return []
+      }
+
+      if (command === "load_environment") {
+        return { name: "dev", variables: [] }
+      }
+
+      if (command === "get_secret_key_collisions") {
+        return [collisionRecord()]
+      }
+
+      if (command === "acknowledge_secret_key_collision") {
+        throw new Error("vault maintenance file is locked")
+      }
+
+      throw new Error(`Unexpected invoke: ${command}`)
+    })
+
+    const projectsStore = useProjectsStore()
+    projectsStore.activeProject = "demo"
+
+    const store = useEnvironmentsStore()
+    await settle()
+    await store.loadCollisions()
+
+    await expect(store.acknowledgeCollision("my-api:__:dG9rZW4")).rejects.toThrow(
+      "vault maintenance file is locked",
+    )
+    expect(store.collisions).toEqual([collisionRecord()])
+  })
+
+  // D08 §10 (i)–(iv): a rejected draft must not stay in the list as a ghost.
+  it("removes a rejected draft, moves the selection back to disk, and rethrows", async () => {
+    invokeMock.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "list_environments") {
+        return ["dev"]
+      }
+
+      if (command === "get_collection_tree") {
+        return []
+      }
+
+      if (command === "load_environment") {
+        if (args?.name === "dev") {
+          return { name: "dev", variables: [] }
+        }
+
+        throw new Error(`missing environment file: ${String(args?.name)}`)
+      }
+
+      if (command === "get_secret_key_collisions") {
+        return []
+      }
+
+      if (command === "save_environment") {
+        throw new Error("Environment already exists: staging")
+      }
+
+      throw new Error(`Unexpected invoke: ${command}`)
+    })
+
+    const projectsStore = useProjectsStore()
+    projectsStore.activeProject = "demo"
+
+    const store = useEnvironmentsStore()
+    await settle()
+
+    store.createEnvironment("STAGING")
+    await settle()
+    expect(store.activeEnv).toBe("STAGING")
+
+    const listCallsBefore = callCountFor("list_environments")
+
+    // (iv) the backend's own words, not a substitute and not a silent success.
+    await expect(store.saveEnvironment()).rejects.toThrow("Environment already exists: staging")
+    await settle()
+
+    // (i) the ghost is gone from the list.
+    expect(store.environments).toEqual(["dev"])
+    // (ii) the selection is back on something that exists on disk.
+    expect(store.activeEnv).toBe("dev")
+    // (iii) the list came from disk again, not from an in-memory filter.
+    expect(callCountFor("list_environments")).toBe(listCallsBefore + 1)
+
+    // The draft mark went with the ghost: loading that name now asks the
+    // backend instead of short-circuiting into an empty draft table.
+    await expect(store.loadEnvironment("STAGING")).rejects.toThrow(
+      "missing environment file: STAGING",
+    )
+    expect(
+      invokeMock.mock.calls.some(
+        ([command, args]) => command === "load_environment" && args?.name === "STAGING",
+      ),
+    ).toBe(true)
+  })
+
+  // D08 §10 (v): a real environment's failed save must not shuffle the panel.
+  it("does not roll back when a non-draft save fails", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "list_environments") {
+        return ["dev"]
+      }
+
+      if (command === "get_collection_tree") {
+        return []
+      }
+
+      if (command === "load_environment") {
+        return { name: "dev", variables: [] }
+      }
+
+      if (command === "get_secret_key_collisions") {
+        return []
+      }
+
+      if (command === "save_environment") {
+        throw new Error("disk full")
+      }
+
+      throw new Error(`Unexpected invoke: ${command}`)
+    })
+
+    const projectsStore = useProjectsStore()
+    projectsStore.activeProject = "demo"
+
+    const store = useEnvironmentsStore()
+    await settle()
+    expect(store.activeEnv).toBe("dev")
+
+    const listCallsBefore = callCountFor("list_environments")
+    await expect(store.saveEnvironment()).rejects.toThrow("disk full")
+    await settle()
+
+    expect(callCountFor("list_environments")).toBe(listCallsBefore)
+    expect(store.activeEnv).toBe("dev")
+    expect(store.environments).toEqual(["dev"])
   })
 })
