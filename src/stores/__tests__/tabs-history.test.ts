@@ -116,6 +116,7 @@ describe("useTabsStore.openHistoryEntry", () => {
         total: 236,
       },
       bodyKind: "text",
+      bodyTruncated: false,
     })
   })
 
@@ -171,6 +172,44 @@ describe("useTabsStore.openHistoryEntry", () => {
       // Empty, not "OK": the phrase was never recorded, and the UI must not
       // claim server text that does not exist.
       expect(store.activeTab.response?.statusText).toBe("")
+    })
+  })
+
+  describe("D09 §17 the truncation flag comes back with the response", () => {
+    it("restores the flag the entry was written with", () => {
+      const store = useTabsStore()
+
+      store.openHistoryEntry(
+        makeHistoryEntry({ status: 200, responseBody: "prefix", responseBodyTruncated: true }),
+      )
+
+      expect(store.activeTab.response?.bodyTruncated).toBe(true)
+    })
+
+    it("reads an entry written before the field existed as not truncated", () => {
+      const store = useTabsStore()
+      const legacy = makeHistoryEntry({ status: 200, responseBody: "hello" })
+      delete (legacy as { responseBodyTruncated?: unknown }).responseBodyTruncated
+
+      store.openHistoryEntry(legacy)
+
+      expect(store.activeTab.response?.bodyTruncated).toBe(false)
+    })
+
+    it("never infers truncation from the body length", () => {
+      const store = useTabsStore()
+
+      // A very long stored body with the flag explicitly false stays false:
+      // the flag is carried, not reconstructed from what the text looks like.
+      store.openHistoryEntry(
+        makeHistoryEntry({
+          status: 200,
+          responseBody: "a".repeat(60_000),
+          responseBodyTruncated: false,
+        }),
+      )
+
+      expect(store.activeTab.response?.bodyTruncated).toBe(false)
     })
   })
 

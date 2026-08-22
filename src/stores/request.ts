@@ -27,7 +27,10 @@ import type {
 } from "../types"
 import { useSettingsStore } from "./settings"
 
-const HISTORY_RESPONSE_BODY_LIMIT = 50_000
+// Exported for tests only, so assertions about the stored-body cut can state
+// the relationship (limit + suffix) instead of retyping the literals.
+export const HISTORY_RESPONSE_BODY_LIMIT = 50_000
+export const HISTORY_TRUNCATION_SUFFIX = "\n[truncated]"
 
 interface SendRequestPayload {
   requestId: string
@@ -492,10 +495,13 @@ function buildHistoryEntry(tab: Tab, response: HttpResponse): HistoryEntry {
     testScript: tab.testScript,
     responseBody:
       response.body.length > HISTORY_RESPONSE_BODY_LIMIT
-        ? `${response.body.slice(0, HISTORY_RESPONSE_BODY_LIMIT)}\n[truncated]`
+        ? `${response.body.slice(0, HISTORY_RESPONSE_BODY_LIMIT)}${HISTORY_TRUNCATION_SUFFIX}`
         : response.body,
     responseHeaders: response.headers,
     responseBodyKind: response.bodyKind,
+    // Network truncation is a separate fact from the storage cut above: this
+    // flag says the bytes never arrived, the cut says history stores less.
+    responseBodyTruncated: response.bodyTruncated,
   }
 
   return sanitizeHistoryEntry(raw)

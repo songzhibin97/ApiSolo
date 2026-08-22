@@ -97,6 +97,8 @@ export default {
     chooseFile: "选择一个文件作为请求体发送。",
     selectFile: "选择文件",
     noFileSelected: "未选择文件",
+    fileSizeLimit: "单个文件上限 {limit}。",
+    fileTooLarge: "「{name}」有 {size}，超过单个文件上限 {limit}，没有添加。",
     tooltips: {
       none: "不发送请求体",
       json: "发送 JSON 格式数据 (Content-Type: application/json)",
@@ -137,6 +139,8 @@ export default {
     treeView: "树形",
     rawView: "原始",
     largeBodyTruncated: "[响应过大，已截断显示]",
+    networkTruncated: "响应体超过 {limit}，网络读取已在此处停止。剩余部分没有收到，ApiSolo 不会自动重取。",
+    networkTruncatedBadge: "未收全",
     copied: "已复制",
     items: "项",
     headers: "响应头",

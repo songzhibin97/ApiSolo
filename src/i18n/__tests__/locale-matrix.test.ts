@@ -117,6 +117,22 @@ const MATRIX: Record<string, { "zh-CN": string; en: string }> = {
     "zh-CN": "环境名会按大小写、空格与标点归一化成一个文件名，两种写法可能落到同一个环境上。",
     en: "Environment names are normalised — case, spaces and punctuation — into a single file name, so two spellings can land on the same environment.",
   },
+  "response.networkTruncated": {
+    "zh-CN": "响应体超过 {limit}，网络读取已在此处停止。剩余部分没有收到，ApiSolo 不会自动重取。",
+    en: "The response body exceeded {limit}; the network read stopped there. The rest was never received, and ApiSolo will not fetch it automatically.",
+  },
+  "response.networkTruncatedBadge": {
+    "zh-CN": "未收全",
+    en: "Incomplete",
+  },
+  "body.fileSizeLimit": {
+    "zh-CN": "单个文件上限 {limit}。",
+    en: "Up to {limit} per file.",
+  },
+  "body.fileTooLarge": {
+    "zh-CN": "「{name}」有 {size}，超过单个文件上限 {limit}，没有添加。",
+    en: "\"{name}\" is {size}, over the {limit} per-file limit. It was not added.",
+  },
 }
 
 const i18n = createI18n({

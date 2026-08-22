@@ -4,13 +4,21 @@ import { useI18n } from "vue-i18n";
 
 import CodeEditor from "../editor/CodeEditor.vue";
 import JsonTreeView from "./JsonTreeView.vue";
+import { MAX_RESPONSE_WIRE_BYTES, formatBytesAsMib } from "../../utils/limits";
 import type { ResponseBodyKind } from "../../types";
 
 const props = defineProps<{
   body: string;
   contentType: string;
   bodyKind?: ResponseBodyKind;
+  bodyTruncated?: boolean;
 }>();
+
+/**
+ * The network cap the notice quotes. Interpolated, not hardcoded in the copy:
+ * a copy that names its own number drifts apart from the constant.
+ */
+const networkCapLabel = formatBytesAsMib(MAX_RESPONSE_WIRE_BYTES);
 
 const { t } = useI18n();
 const activeMode = ref<"tree" | "raw">("raw");
@@ -23,6 +31,13 @@ const MAX_DISPLAY_SIZE = 500_000
  * because the server happened to send a sentence that looks like one.
  */
 const isBinary = computed(() => props.bodyKind === "binary");
+
+/**
+ * Flag only, same rule as `isBinary`: never inferred from the body text, and
+ * deliberately independent of `isTruncated` below — that one means "the view
+ * cut a body it fully holds", this one means "the bytes never arrived".
+ */
+const isNetworkTruncated = computed(() => props.bodyTruncated === true);
 
 const normalizedContentType = computed(() => props.contentType.toLowerCase());
 const isTruncated = computed(() => props.body.length > MAX_DISPLAY_SIZE)
@@ -98,6 +113,20 @@ watch(
 
 <template>
   <div class="flex h-full min-h-0 flex-col gap-3">
+    <!--
+      Above the body area and never concatenated into the body text: appending
+      it would pollute what the user copies out of the read-only editor. When
+      the display cut also fires, that note sits inside the editor text, so
+      this notice is always the upper one of the two.
+    -->
+    <div
+      v-if="isNetworkTruncated"
+      data-testid="network-truncated-notice"
+      class="shrink-0 rounded border border-amber-500/40 bg-[color-mix(in_srgb,#f59e0b_10%,transparent)] px-3 py-2 text-sm leading-5 text-[var(--text-primary)]"
+    >
+      {{ t("response.networkTruncated", { limit: networkCapLabel }) }}
+    </div>
+
     <div
       v-if="isBinary"
       data-testid="binary-body-notice"

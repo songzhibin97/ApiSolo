@@ -32,7 +32,11 @@ vi.mock("../../utils/invoke", () => ({
 import pinia from ".."
 import { useConsoleStore } from "../console"
 import { useEnvironmentsStore } from "../environments"
-import { useRequestStore } from "../request"
+import {
+  HISTORY_RESPONSE_BODY_LIMIT,
+  HISTORY_TRUNCATION_SUFFIX,
+  useRequestStore,
+} from "../request"
 import { useTabsStore } from "../tabs"
 import {
   REDACTION_SENTINEL,
@@ -98,6 +102,7 @@ function buildResponse(overrides: Partial<HttpResponse> = {}): HttpResponse {
     },
     contentType: "application/json",
     bodyKind: "text",
+    bodyTruncated: false,
     ...overrides,
   }
 }
@@ -661,6 +666,92 @@ describe("useRequestStore", () => {
       '{"authorization":"[redacted]","token":"[redacted]"}',
     )
     expect(() => JSON.parse(historyPayload.entry.responseBody)).not.toThrow()
+  })
+
+  it("D09 §16 stores the truncation flag on the history row", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "send_request") {
+        return buildResponse({ bodyTruncated: true })
+      }
+      if (command === "append_history" || command === "list_environments") {
+        return command === "list_environments" ? [] : null
+      }
+      throw new Error(`Unexpected invoke: ${command}`)
+    })
+
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+    tabsStore.updateTab(tabsStore.activeTab.id, { url: "https://api.example.com/big" })
+
+    await requestStore.sendRequest(tabsStore.activeTab)
+
+    const payload = invokeMock.mock.calls.find(([command]) => command === "append_history")?.[1] as {
+      entry: HistoryEntry
+    }
+    expect(payload.entry.responseBodyTruncated).toBe(true)
+  })
+
+  it("D09 §18 keeps the existing storage cut on a truncated body, both truncations intact", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "send_request") {
+        return buildResponse({
+          body: "a".repeat(HISTORY_RESPONSE_BODY_LIMIT + 1000),
+          bodyTruncated: true,
+        })
+      }
+      if (command === "append_history" || command === "list_environments") {
+        return command === "list_environments" ? [] : null
+      }
+      throw new Error(`Unexpected invoke: ${command}`)
+    })
+
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+    tabsStore.updateTab(tabsStore.activeTab.id, { url: "https://api.example.com/big" })
+
+    await requestStore.sendRequest(tabsStore.activeTab)
+
+    const payload = invokeMock.mock.calls.find(([command]) => command === "append_history")?.[1] as {
+      entry: HistoryEntry
+    }
+    // The relationship (limit + suffix), both read from the production module
+    // - not retyped literals that would drift when another slice tunes them.
+    expect(payload.entry.responseBody).toHaveLength(
+      HISTORY_RESPONSE_BODY_LIMIT + HISTORY_TRUNCATION_SUFFIX.length,
+    )
+    expect(payload.entry.responseBody!.endsWith(HISTORY_TRUNCATION_SUFFIX)).toBe(true)
+    expect(payload.entry.responseBodyTruncated).toBe(true)
+  })
+
+  it("D09 §19 a truncated response still goes through sanitizeHistoryEntry", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "send_request") {
+        return buildResponse({
+          body: '{"authorization":"secret-a","token":"secret-b"}',
+          bodyTruncated: true,
+        })
+      }
+      if (command === "append_history" || command === "list_environments") {
+        return command === "list_environments" ? [] : null
+      }
+      throw new Error(`Unexpected invoke: ${command}`)
+    })
+
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+    tabsStore.updateTab(tabsStore.activeTab.id, { url: "https://api.example.com/big" })
+
+    await requestStore.sendRequest(tabsStore.activeTab)
+
+    const payload = invokeMock.mock.calls.find(([command]) => command === "append_history")?.[1] as {
+      entry: HistoryEntry
+    }
+    // Truncation must not open a redaction bypass: the entry still leaves
+    // through the same sanitizing exit.
+    expect(payload.entry.responseBody).toBe(
+      '{"authorization":"[redacted]","token":"[redacted]"}',
+    )
+    expect(payload.entry.responseBodyTruncated).toBe(true)
   })
 
   it("aborts the request when a pre-request script fails", async () => {

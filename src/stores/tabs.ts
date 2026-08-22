@@ -456,6 +456,9 @@ export const useTabsStore = defineStore("tabs", () => {
         // Rows written before this field existed are text — that is what the
         // panel already assumed of them.
         bodyKind: entry.responseBodyKind ?? "text",
+        // Same reasoning: rows from before the network cap were read in full.
+        // Carried from the stored flag, never inferred from the body length.
+        bodyTruncated: entry.responseBodyTruncated ?? false,
       }
     }
 
