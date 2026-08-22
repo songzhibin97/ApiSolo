@@ -437,9 +437,14 @@ async function confirmDeleteEnvironment() {
     />
 
     <!--
-      v-if, not just :visible — with zero records the panel must contain no
-      collision-related node at all, and prop bindings evaluate (and call t()
-      with collision keys) even while the dialog is hidden.
+      v-if, not just :visible — deliberately unlike the delete dialog above,
+      and not a candidate for "simplifying" back to that shape. A dialog that
+      stays mounted keeps evaluating its prop bindings, so the title, message
+      and confirm-label expressions would call t() with collision keys even
+      while the dialog is hidden. With zero records the panel must not touch
+      any collision key at all — no collision node, and no positive claim in
+      any wording (D08 §8; the test pins "no t() call with a collision key").
+      Mounting this dialog only while records exist is what keeps that true.
     -->
     <ConfirmDialog
       v-if="collisions.length > 0"
