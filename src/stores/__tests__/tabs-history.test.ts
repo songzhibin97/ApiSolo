@@ -82,6 +82,7 @@ describe("useTabsStore.openHistoryEntry", () => {
     store.openHistoryEntry(
       makeHistoryEntry({
         status: 201,
+        statusText: "Created",
         time: 236,
         size: 17,
         contentType: "application/json",
@@ -100,7 +101,7 @@ describe("useTabsStore.openHistoryEntry", () => {
 
     expect(store.activeTab.response).toEqual({
       status: 201,
-      statusText: "OK",
+      statusText: "Created",
       headers: [["content-type", "application/json"]],
       body: "{\"ok\":true}",
       size: 17,
@@ -146,6 +147,30 @@ describe("useTabsStore.openHistoryEntry", () => {
       store.openHistoryEntry(legacy)
 
       expect(store.activeTab.response?.bodyKind).toBe("text")
+    })
+  })
+
+  // The reason phrase used to be fabricated on restore: every 2xx came back
+  // as "OK", so a stored `201 Created` reopened as `201 OK`.
+  describe("the response statusText comes back with the response", () => {
+    it("restores the statusText the entry was written with", () => {
+      const store = useTabsStore()
+
+      store.openHistoryEntry(makeHistoryEntry({ status: 201, statusText: "Created" }))
+
+      expect(store.activeTab.response?.statusText).toBe("Created")
+    })
+
+    it("reads a 2xx entry written before the field existed without inventing OK", () => {
+      const store = useTabsStore()
+      const legacy = makeHistoryEntry({ status: 201 })
+      delete (legacy as { statusText?: unknown }).statusText
+
+      store.openHistoryEntry(legacy)
+
+      // Empty, not "OK": the phrase was never recorded, and the UI must not
+      // claim server text that does not exist.
+      expect(store.activeTab.response?.statusText).toBe("")
     })
   })
 

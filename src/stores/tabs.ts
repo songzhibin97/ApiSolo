@@ -442,7 +442,11 @@ export const useTabsStore = defineStore("tabs", () => {
     if (entry.status > 0) {
       tab.response = {
         status: entry.status,
-        statusText: entry.status >= 200 && entry.status < 300 ? "OK" : "",
+        // Rows written before this field existed fall back to "": the panel
+        // then shows the bare status code, which is honest — their reason
+        // phrase was never recorded, and fabricating "OK" turned a stored
+        // `201 Created` into `201 OK`.
+        statusText: entry.statusText ?? "",
         headers: entry.responseHeaders ?? [],
         body: entry.responseBody ?? "",
         size: entry.size,

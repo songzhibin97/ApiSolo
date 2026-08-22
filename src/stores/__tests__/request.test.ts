@@ -1313,6 +1313,31 @@ describe("§55 the response body kind reaches append_history", () => {
   })
 })
 
+// Same shape as the body kind above: HttpResponse has the reason phrase,
+// HistoryEntry used to drop it, and the restore path then fabricated "OK" —
+// a stored `201 Created` reopened as `201 OK`.
+describe("the response statusText reaches append_history", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    invokeMock.mockReset()
+    executeScriptMock.mockClear()
+  })
+
+  it("carries the statusText through to the history entry", async () => {
+    invokeMock.mockImplementation(
+      okInvoke({ send_request: buildResponse({ status: 201, statusText: "Created" }) }),
+    )
+
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+    await requestStore.sendRequest(tabsStore.activeTab)
+
+    const call = invokeMock.mock.calls.find(([command]) => command === "append_history")
+    expect(call, "append_history was never called").toBeDefined()
+    expect((call![1] as { entry: HistoryEntry }).entry.statusText).toBe("Created")
+  })
+})
+
 // §34 / §41: annotations are data about a call, never part of one. A note is
 // the one field here a user can type free text into, so it is also the one
 // that would quietly become a header or a body field if anything ever spread
