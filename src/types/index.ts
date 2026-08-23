@@ -168,6 +168,12 @@ export interface HttpResponse {
   timings: RequestTimings
   contentType: string
   bodyKind: ResponseBodyKind
+  /**
+   * True when the network read stopped at the wire cap: the rest of the body
+   * was never received. Required, not optional — Rust always serialises it,
+   * and an optional here would invite the `!== undefined` bug again.
+   */
+  bodyTruncated: boolean
 }
 
 export interface HistoryEntry {
@@ -198,6 +204,8 @@ export interface HistoryEntry {
   note?: string
   starred?: boolean
   responseBodyKind?: ResponseBodyKind
+  /** Absent on rows written before the network cap existed; those were read in full. */
+  responseBodyTruncated?: boolean
 }
 
 export interface ScriptAssertion {

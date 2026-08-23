@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest"
 
 import readmeEn from "../../README.md?raw"
 import readmeZh from "../../README.zh-CN.md?raw"
+import { MAX_RESPONSE_WIRE_BYTES, MAX_UPLOAD_FILE_BYTES } from "../utils/limits"
 
 /**
  * A text gate, not a behaviour gate. It can only prove the sentence is on disk;
@@ -211,6 +212,106 @@ describe("D08 §14 the dev bridge declares routes for both collision commands", 
 
   it("declares the acknowledge route, spelled like the command", () => {
     expect(devBridgeRouteNames()).toContain("acknowledge_secret_key_collision")
+  })
+})
+
+/**
+ * D09 §22 (vi): the TS caps and the Rust caps are the same number. There is no
+ * cross-language constant sharing in this repository, so this gate replaces
+ * "someone remembers to change both" — either value drifting fails the suite.
+ */
+describe("D09 §22 the TS byte caps equal the Rust byte caps", () => {
+  function rustConstBytes(name: string): number {
+    const source = readFileSync("src-tauri/src/lib.rs", "utf8")
+    const match = source.match(
+      new RegExp(`const ${name}: usize = ([0-9_]+(?:\\s*\\*\\s*[0-9_]+)*);`),
+    )
+    expect(match, `${name} is missing from lib.rs`).not.toBeNull()
+    return match![1]
+      .split("*")
+      .map((part) => Number(part.trim().replace(/_/g, "")))
+      .reduce((product, factor) => product * factor, 1)
+  }
+
+  it("the parser proves itself on a constant with a known value", () => {
+    // Fail-closed: a parser that silently mis-reads would make the equality
+    // checks below meaningless.
+    expect(rustConstBytes("MAX_DECOMPRESSED_RESPONSE_BYTES")).toBe(64 * 1024 * 1024)
+  })
+
+  it("the upload precheck cap equals Rust's MAX_UPLOAD_PART_BYTES", () => {
+    expect(MAX_UPLOAD_FILE_BYTES).toBe(rustConstBytes("MAX_UPLOAD_PART_BYTES"))
+  })
+
+  it("the response notice cap equals Rust's MAX_RESPONSE_WIRE_BYTES", () => {
+    expect(MAX_RESPONSE_WIRE_BYTES).toBe(rustConstBytes("MAX_RESPONSE_WIRE_BYTES"))
+  })
+})
+
+/**
+ * D09 §26: four size-cap decisions, each invisible from the interface at the
+ * moment it matters, written down in both READMEs — and the old "no size cap"
+ * known-issue sentence gone from both. The negative half matters most: a
+ * README claiming both "has a cap" and "has no cap" is worse than either
+ * alone, and only-adding patches pass every positive gate.
+ */
+describe("D09 §26 the size-cap decisions are written down in both READMEs", () => {
+  it("(i) the English README states the hard network cap, its number, and what is not offered", () => {
+    expect(readmeEn).toContain(
+      "The network read of a response body stops at a hard-coded, non-configurable cap of 16 MiB",
+    )
+    expect(readmeEn).toContain(
+      "the remainder is never received and ApiSolo will not fetch it automatically",
+    )
+    expect(readmeEn).toContain("There is no full-download escape hatch")
+  })
+
+  it("(ii) the Chinese README states the hard network cap, its number, and what is not offered", () => {
+    expect(readmeZh).toContain("响应体的网络读取有一个写死、不可配置的上限：16 MiB")
+    expect(readmeZh).toContain("ApiSolo 也不会自动重取")
+    expect(readmeZh).toContain("没有完整下载的出口")
+  })
+
+  it("(iii) the English README says the two caps are different numbers and the network one is smaller", () => {
+    expect(readmeEn).toContain(
+      "two different numbers on purpose, and the network cap is the smaller one",
+    )
+  })
+
+  it("(iv) the Chinese README says the two caps are different numbers and the network one is smaller", () => {
+    expect(readmeZh).toContain("是两个不同的数，且网络上限更小")
+  })
+
+  it("(v) the English README says an oversized upload errors instead of truncating", () => {
+    expect(readmeEn).toContain(
+      "fails with an error instead of being truncated: ApiSolo never sends a truncated request body",
+    )
+  })
+
+  it("(vi) the Chinese README says an oversized upload errors instead of truncating", () => {
+    expect(readmeZh).toContain(
+      "上传方向超限是报错，不是截断：ApiSolo 绝不发出一个被截断的请求体",
+    )
+  })
+
+  it("(vii) the English README says the dev bridge cap is explicit and both modes agree", () => {
+    expect(readmeEn).toContain("The dev bridge has an explicit inbound request-body cap (64 MiB)")
+    expect(readmeEn).toContain("give the same result for the same upload")
+  })
+
+  it("(viii) the Chinese README says the dev bridge cap is explicit and both modes agree", () => {
+    expect(readmeZh).toContain("dev bridge 的入站请求体有一个显式上限（64 MiB）")
+    expect(readmeZh).toContain("对同一次上传给出相同结果")
+  })
+
+  it("(ix) the English README no longer lists the missing cap as a known issue", () => {
+    expect(readmeEn).not.toContain("no size cap on the network read")
+    expect(readmeEn).not.toContain("Tracked as backlog D09")
+  })
+
+  it("(x) the Chinese README no longer lists the missing cap as a known issue", () => {
+    expect(readmeZh).not.toContain("无大小上限")
+    expect(readmeZh).not.toContain("已登记为 backlog D09")
   })
 })
 

@@ -26,6 +26,7 @@ function buildResponse(overrides: Partial<HttpResponse> = {}): HttpResponse {
     timings: { dnsLookup: 0, tcpConnect: 0, tlsHandshake: 0, ttfb: 0, download: 1, total: 45 },
     contentType: "application/json",
     bodyKind: "text",
+    bodyTruncated: false,
     ...overrides,
   }
 }

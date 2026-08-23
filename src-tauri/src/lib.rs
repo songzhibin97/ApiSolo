@@ -1,6 +1,6 @@
 #![cfg_attr(not(feature = "dev-bridge"), allow(dead_code, unused_imports))]
 
-use axum::extract::{Json, Request};
+use axum::extract::{DefaultBodyLimit, Json, Request};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
@@ -342,6 +342,11 @@ struct HttpResponse {
     timings: RequestTimings,
     content_type: String,
     body_kind: ResponseBodyKind,
+    // A bare bool, not Option<bool>: an Option would arrive in the frontend
+    // as JSON null, the exact shape of an already-shipped defect (a
+    // `!== undefined` guard that is always true). Orthogonal to `body_kind`
+    // on purpose - truncated binary and truncated text are both real.
+    body_truncated: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -395,6 +400,11 @@ struct HistoryEntry {
     starred: bool,
     #[serde(default)]
     response_body_kind: ResponseBodyKind,
+    // Rows written before this field existed were read in full: the network
+    // cap did not exist, so "not truncated" is the truth about them, not a
+    // guess.
+    #[serde(default)]
+    response_body_truncated: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -4088,15 +4098,16 @@ async fn send_request(args: SendRequestArgs) -> Result<HttpResponse, String> {
 }
 
 async fn execute_request(args: SendRequestArgs) -> Result<HttpResponse, String> {
-    execute_request_with_budget(args, REQUEST_TOTAL_BUDGET).await
+    execute_request_with_limits(args, REQUEST_TOTAL_BUDGET, MAX_RESPONSE_WIRE_BYTES).await
 }
 
-/// The budget is a parameter rather than a constant so that tests can observe
-/// whether the checkpoints are actually wired in - a helper can be written and
-/// tested perfectly and still never be called.
-async fn execute_request_with_budget(
+/// The budget and the wire cap are parameters rather than constants so that
+/// tests can observe whether the checkpoints are actually wired in - a helper
+/// can be written and tested perfectly and still never be called.
+async fn execute_request_with_limits(
     args: SendRequestArgs,
     total_budget: Duration,
+    wire_limit: usize,
 ) -> Result<HttpResponse, String> {
     // The one and only timing origin for this request.
     let overall_started_at = Instant::now();
@@ -4251,7 +4262,7 @@ async fn execute_request_with_budget(
         &args.body.body_type,
         overall_deadline,
     )?;
-    let response = client
+    let mut response = client
         .execute(built)
         .await
         .map_err(|error| format_error_chain("Request failed", &error))?;
@@ -4267,10 +4278,10 @@ async fn execute_request_with_budget(
     let plan = plan_content_encoding(&raw_headers);
 
     let download_started_at = Instant::now();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| format_error_chain("Failed to read response body", &error))?;
+    let (bytes, body_truncated) = read_response_body_capped(&mut response, wire_limit).await?;
+    // Dropping the response closes the connection. On a truncated body the
+    // remainder was never awaited (§4) and must never be.
+    drop(response);
     let download = download_started_at.elapsed().as_millis() as u64;
 
     // Checked before the task is created, not after: `spawn_blocking` cannot be
@@ -4280,12 +4291,11 @@ async fn execute_request_with_budget(
         ensure_budget_remaining(overall_deadline, Instant::now(), "decoding the response")?;
     let decoded = {
         let content_type = content_type.clone();
-        // `bytes` moves into the closure so the full copy happens inside the
-        // timeout; a remote-controlled body could otherwise be copied for
-        // seconds outside any budget.
+        // `bytes` is already an owned Vec from the capped read, so it moves
+        // into the closure without the full copy the old `Bytes::to_vec` made.
         let handle =
             tokio::task::spawn_blocking(move || {
-                finalize_response_body(bytes.to_vec(), plan, &content_type)
+                finalize_response_body(bytes, plan, &content_type, body_truncated)
             });
         let decode = async move {
             match handle.await {
@@ -4314,7 +4324,41 @@ async fn execute_request_with_budget(
         timings,
         content_type,
         body_kind: decoded.body_kind,
+        body_truncated,
     })
+}
+
+/// Reads at most `limit` bytes of the response body from the network,
+/// returning the bytes and whether the body was cut short.
+///
+/// The `return` inside the loop is the entire point (§4): the moment the
+/// buffer crosses the limit this function stops awaiting further chunks, so
+/// the remainder is never pulled off the connection. Reading everything and
+/// then discarding the tail would look almost identical in code and be the
+/// exact behaviour this cap exists to remove.
+async fn read_response_body_capped(
+    response: &mut reqwest::Response,
+    limit: usize,
+) -> Result<(Vec<u8>, bool), String> {
+    // No preallocation from Content-Length: that number is remote-controlled,
+    // and `with_capacity(declared)` would move the exhaustion from the read
+    // to the allocation.
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match response.chunk().await {
+            Err(error) => {
+                return Err(format_error_chain("Failed to read response body", &error))
+            }
+            Ok(None) => return Ok((buf, false)),
+            Ok(Some(chunk)) => {
+                buf.extend_from_slice(&chunk);
+                if buf.len() > limit {
+                    buf.truncate(limit);
+                    return Ok((buf, true));
+                }
+            }
+        }
+    }
 }
 
 fn should_measure_connection_timings(proxy: Option<&ProxyConfig>) -> bool {
@@ -4322,13 +4366,46 @@ fn should_measure_connection_timings(proxy: Option<&ProxyConfig>) -> bool {
 }
 
 /// Total wall-clock budget for one send, from the first line of
-/// `execute_request_with_budget` until the decoded body is in hand.
+/// `execute_request_with_limits` until the decoded body is in hand.
 const REQUEST_TOTAL_BUDGET: Duration = Duration::from_secs(30);
 
 /// Cap on decompressed output. Decompression introduces an amplification the
 /// identity path does not have: a 10 MB all-zero gzip expands to ~10 GB. The
 /// slice that creates the amplification carries the cap.
 const MAX_DECOMPRESSED_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Cap on the bytes read from the network for one response body, applied
+/// before decompression. Deliberately smaller than
+/// `MAX_DECOMPRESSED_RESPONSE_BYTES`: this one caps how much comes in, that
+/// one caps how much it may expand to, and a 16 MiB gzip legitimately expands
+/// to 60 MiB. 16 MiB is also small enough that an offline test can build a
+/// body that crosses it — a cap no test can reach is, for regression
+/// purposes, the same thing as no cap. Not configurable on purpose: a cap
+/// that can be raised to usize::MAX is no cap at all.
+const MAX_RESPONSE_WIRE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Cap on one decoded upload part (a binary body or a form-data file), applied
+/// after base64 decoding. Exceeding it fails the whole send instead of
+/// truncating: a truncated upload gets *sent*, and a server that quietly
+/// stores half a file is data corruption, not economy.
+const MAX_UPLOAD_PART_BYTES: usize = 16 * 1024 * 1024;
+
+/// Explicit inbound request-body cap for the dev bridge (A38). Without it the
+/// bridge inherits axum's implicit 2 MB default, which is not this
+/// repository's contract and changes silently with the dependency.
+///
+/// Invariant — keep this inequality true when touching either constant:
+///
+///   DEV_BRIDGE_MAX_BODY_BYTES  >=  MAX_UPLOAD_PART_BYTES * 4/3  +  JSON escaping and remaining fields
+///   64 MiB                     >=  16 MiB * 4/3 ≈ 21.4 MiB      +  headroom (~3x, fits several parts)
+///
+/// 4/3 is the base64 inflation factor. Lowering this below the inequality
+/// breaks uploads *only* under dev:web, with an error that looks nothing like
+/// the packaged app's — the hardest failure to trace back to this line. No
+/// test pins the inequality itself (it spans two constants); this comment is
+/// the only guard.
+#[cfg(any(test, feature = "dev-bridge"))]
+const DEV_BRIDGE_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ContentEncoding {
@@ -4456,6 +4533,65 @@ fn decompress_response_body_with_limit(
     Ok((decoded, true))
 }
 
+/// Best-effort decompression for a body already marked truncated (§7): a cut
+/// gzip/deflate/br stream necessarily ends mid-stream, so the trailing decode
+/// error is expected and the decodable prefix is the value. Deliberately a
+/// separate function from `read_capped`, which must stay strict - on an
+/// intact body a decode error is real corruption and must keep failing the
+/// request (§8). The decompression cap still applies: a truncated 16 MiB
+/// prefix can legally expand past it, and the output stops there.
+fn read_best_effort<R: Read>(reader: R, limit: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut reader = reader.take(limit as u64);
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => out.extend_from_slice(&chunk[..n]),
+            // The truncated stream ran out mid-block: keep the prefix.
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+/// The truncated-body counterpart of `decompress_response_body_with_limit`.
+/// Never fails: whatever decodes is returned, zero bytes included - the
+/// caller decides what an empty prefix means.
+fn decompress_response_body_best_effort(
+    bytes: Vec<u8>,
+    plan: &ContentEncodingPlan,
+    limit: usize,
+) -> (Vec<u8>, bool) {
+    let encoding = match plan {
+        ContentEncodingPlan::Decode(encoding) => *encoding,
+        ContentEncodingPlan::None | ContentEncodingPlan::Undecodable(_) => return (bytes, false),
+    };
+
+    let decoded = match encoding {
+        ContentEncoding::Gzip => {
+            read_best_effort(flate2::read::MultiGzDecoder::new(bytes.as_slice()), limit)
+        }
+        ContentEncoding::Brotli => read_best_effort(
+            brotli_decompressor::Decompressor::new(bytes.as_slice(), 4096),
+            limit,
+        ),
+        // Same zlib-then-raw fallback as the strict path: an empty zlib
+        // result on a truncated stream may just mean the header was raw
+        // deflate all along.
+        ContentEncoding::Deflate => {
+            let zlib = read_best_effort(flate2::read::ZlibDecoder::new(bytes.as_slice()), limit);
+            if zlib.is_empty() {
+                read_best_effort(flate2::read::DeflateDecoder::new(bytes.as_slice()), limit)
+            } else {
+                zlib
+            }
+        }
+    };
+
+    (decoded, true)
+}
+
 fn read_capped<R: Read>(reader: R, limit: usize, label: &str) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     // `take` stops the allocation from running away; the decision below is
@@ -4569,8 +4705,39 @@ fn finalize_response_body(
     bytes: Vec<u8>,
     plan: ContentEncodingPlan,
     content_type: &str,
+    truncated: bool,
 ) -> Result<DecodedResponseBody, String> {
-    let (body_bytes, decoded) = decompress_response_body(bytes, &plan)?;
+    let received_len = bytes.len();
+    let (body_bytes, decoded) = if truncated {
+        // §7: the tail of a truncated compressed stream is missing by
+        // definition, so its trailing decode error is expected - decode what
+        // is there instead of failing the request. This leniency exists ONLY
+        // here: on an intact body (§8, the branch below) a decode error is
+        // real corruption and stays an error.
+        decompress_response_body_best_effort(bytes, &plan, MAX_DECOMPRESSED_RESPONSE_BYTES)
+    } else {
+        decompress_response_body(bytes, &plan)?
+    };
+
+    // §7 fallback: a truncated compressed body that yielded nothing decodable
+    // is presented like an undecodable one - marker text, binary kind, byte
+    // count of what actually arrived. Headers are not dropped: no decoded
+    // content is on screen, so the encoding headers still describe the body.
+    if truncated && decoded && body_bytes.is_empty() && received_len > 0 {
+        let label = match &plan {
+            ContentEncodingPlan::Decode(ContentEncoding::Gzip) => "gzip",
+            ContentEncodingPlan::Decode(ContentEncoding::Deflate) => "deflate",
+            ContentEncodingPlan::Decode(ContentEncoding::Brotli) => "br",
+            ContentEncodingPlan::None | ContentEncodingPlan::Undecodable(_) => "",
+        };
+        return Ok(DecodedResponseBody {
+            size: received_len as u64,
+            body: binary_body_marker(received_len, content_type, Some(label)),
+            body_kind: ResponseBodyKind::Binary,
+            dropped_encoding_headers: false,
+        });
+    }
+
     let size = body_bytes.len() as u64;
 
     // An undecoded compressed payload can easily be valid UTF-8 by accident.
@@ -4749,7 +4916,7 @@ fn build_request_url(
 
 fn resolve_binary_body_bytes(body: &RequestBodyInput, label: &str) -> Result<Vec<u8>, String> {
     if let Some(content) = body.binary_content.as_ref() {
-        return decode_base64_field(content, label);
+        return decode_base64_field(content, label, MAX_UPLOAD_PART_BYTES);
     }
 
     if !body.binary_path.trim().is_empty() {
@@ -4758,7 +4925,7 @@ fn resolve_binary_body_bytes(body: &RequestBodyInput, label: &str) -> Result<Vec
         ));
     }
 
-    decode_base64_field(&body.content, label)
+    decode_base64_field(&body.content, label, MAX_UPLOAD_PART_BYTES)
 }
 
 fn resolve_form_data_items(body: &RequestBodyInput) -> Result<Vec<FormDataItem>, String> {
@@ -4806,7 +4973,13 @@ fn add_form_data_part(
             item.key.clone()
         };
         let bytes = if let Some(content) = item.file_content.as_ref() {
-            decode_base64_field(content, "form-data file")?
+            // The label names the part: with three parts in one form, "which
+            // one was too big" must not require guessing (§21).
+            decode_base64_field(
+                content,
+                &format!("form-data file '{file_name}'"),
+                MAX_UPLOAD_PART_BYTES,
+            )?
         } else if !item.file_path.trim().is_empty() {
             return Err(format!(
                 "Form-data file parts must include inline content; raw filesystem paths are not allowed ({})",
@@ -4827,14 +5000,27 @@ fn add_form_data_part(
     }
 }
 
-fn decode_base64_field(value: &str, label: &str) -> Result<Vec<u8>, String> {
+/// Decodes one base64 upload part, enforcing the per-part cap (§20). Over the
+/// cap is an error, never a truncation: a truncated upload body would still be
+/// sent, and a server quietly storing half a file is data corruption, not
+/// economy. The limit is a parameter for the same reason the request budget
+/// is one - so tests can prove the call sites actually pass the constant.
+fn decode_base64_field(value: &str, label: &str, limit: usize) -> Result<Vec<u8>, String> {
     if value.trim().is_empty() {
         return Ok(Vec::new());
     }
 
-    base64::engine::general_purpose::STANDARD
+    let decoded = base64::engine::general_purpose::STANDARD
         .decode(value)
-        .map_err(|error| format!("Invalid {label}: {error}"))
+        .map_err(|error| format!("Invalid {label}: {error}"))?;
+    if decoded.len() > limit {
+        return Err(format!(
+            "{label} is {} bytes after decoding, over the {limit}-byte per-part upload limit; \
+             the request was not sent",
+            decoded.len()
+        ));
+    }
+    Ok(decoded)
 }
 
 fn should_start_dev_bridge(env_value: Option<&str>) -> bool {
@@ -5277,9 +5463,14 @@ async fn api_set_history_annotation(
     api_unit(set_history_annotation(args.id, args.note, args.starred))
 }
 
-#[cfg(feature = "dev-bridge")]
-async fn start_dev_server() {
-    let app = Router::new()
+/// The dev bridge's one and only routing table, extracted so the §23 test can
+/// drive the exact router the bridge serves - a copy of the routes in a test
+/// would prove nothing about this one. `any(test, ...)` keeps it compiled for
+/// the default test run while still excluding it from packaged builds, where
+/// the `test` cfg is never active.
+#[cfg(any(test, feature = "dev-bridge"))]
+fn dev_bridge_router() -> Router {
+    Router::new()
         .route("/api/get_data_dir", post(api_get_data_dir))
         .route(
             "/api/get_secret_storage_state",
@@ -5338,7 +5529,17 @@ async fn start_dev_server() {
             post(api_set_history_annotation),
         )
         .layer(middleware::from_fn(require_dev_bridge_token))
-        .layer(dev_bridge_cors_layer());
+        .layer(dev_bridge_cors_layer())
+        // A38: one explicit inbound body cap covering all routes at once.
+        // Without it every Json<T> extractor above inherits axum's implicit
+        // 2 MB default, which is not this repository's contract and changes
+        // silently with the dependency.
+        .layer(DefaultBodyLimit::max(DEV_BRIDGE_MAX_BODY_BYTES))
+}
+
+#[cfg(feature = "dev-bridge")]
+async fn start_dev_server() {
+    let app = dev_bridge_router();
 
     let listener = match tokio::net::TcpListener::bind("127.0.0.1:3721").await {
         Ok(listener) => listener,
@@ -6133,6 +6334,7 @@ mod tests {
             note: None,
             starred: false,
             response_body_kind: ResponseBodyKind::Text,
+            response_body_truncated: false,
         }
     }
 
@@ -7043,6 +7245,7 @@ mod tests {
             },
             content_type: "application/json".to_string(),
             body_kind: ResponseBodyKind::Text,
+            body_truncated: false,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -7137,6 +7340,7 @@ mod tests {
             note: None,
             starred: false,
             response_body_kind: ResponseBodyKind::Text,
+            response_body_truncated: false,
         };
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -7434,6 +7638,7 @@ mod tests {
                 note: None,
                 starred: false,
                 response_body_kind: ResponseBodyKind::Text,
+            response_body_truncated: false,
             };
             append_history(history_entry).unwrap();
 
@@ -7507,6 +7712,7 @@ mod tests {
                 note: None,
                 starred: false,
                 response_body_kind: ResponseBodyKind::Text,
+            response_body_truncated: false,
             };
             append_history(post_history).unwrap();
 
@@ -8808,6 +9014,7 @@ mod tests {
             },
             content_type: "application/json".to_string(),
             body_kind: ResponseBodyKind::Text,
+            body_truncated: false,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -8870,6 +9077,7 @@ mod tests {
             note: None,
             starred: false,
             response_body_kind: ResponseBodyKind::Text,
+            response_body_truncated: false,
         };
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -10590,6 +10798,568 @@ mod tests {
         assert!(tail.matches(": ").count() >= 2, "chain not walked: {error}");
     }
 
+    // ---------- D09 §1-§11 网络读取上限 ----------
+
+    /// Serves one response with a chosen status/body/headers. The D02 helper
+    /// only takes `&'static [u8]`; the cap tests need runtime-sized bodies.
+    async fn d09_serve(
+        status: u16,
+        body: Vec<u8>,
+        headers: &[(&str, &str)],
+    ) -> wiremock::MockServer {
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let mut template = ResponseTemplate::new(status).set_body_bytes(body);
+        for (key, value) in headers {
+            template = template.insert_header(*key, *value);
+        }
+        Mock::given(method("GET"))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Fixture (3): declares `declared_len`, sends `body_bytes`, then neither
+    /// sends more nor closes. The returned receiver fires once the partial
+    /// body is on the wire.
+    ///
+    /// Reading the request head to `\r\n\r\n` first is a hard requirement,
+    /// not caution: a bare fixture that writes into an idle connection trips
+    /// hyper's `require_empty_read`, the queued request gets cancelled, and
+    /// the test goes red at random. That root cause was established by an
+    /// earlier slice's flaky-fix; this fixture follows it instead of
+    /// rediscovering it (4.4-h phase 2 re-proved it on this machine).
+    /// The accept loop must keep running: the pre-connect timing probe opens
+    /// its own throwaway connection first (it sends no bytes), so a
+    /// single-accept fixture would serve the probe and leave the real request
+    /// with a closed port - same lesson as the fixture in
+    /// test_body_read_error_includes_cause_chain.
+    async fn d09_stalled_server(
+        body_bytes: usize,
+        declared_len: usize,
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sent_tx, sent_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let sent_tx = sent_tx.clone();
+                tokio::spawn(async move {
+                    // ① Read the request head to \r\n\r\n before writing
+                    // anything. A connection that closes without sending one
+                    // (the timing probe) is simply dropped.
+                    let mut head = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => head.extend_from_slice(&chunk[..read]),
+                        }
+                        if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    // ② A Content-Length far beyond what will actually be sent.
+                    let header =
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {declared_len}\r\n\r\n");
+                    socket.write_all(header.as_bytes()).await.unwrap();
+                    // ③ The partial body.
+                    socket.write_all(&vec![b'a'; body_bytes]).await.unwrap();
+                    socket.flush().await.unwrap();
+                    let _ = sent_tx.send(());
+                    // ④ Neither more bytes nor a close: park until the test ends.
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), sent_rx)
+    }
+
+    /// §1: far below the cap, byte-for-byte the old behaviour plus an
+    /// explicit "not truncated". (§1's error-message half is already pinned
+    /// by test_body_read_error_includes_cause_chain above.)
+    #[tokio::test]
+    async fn test_d09_body_under_the_cap_is_untouched_and_unflagged() {
+        let server = d02_serve(b"ok", &[("content-type", "text/plain")]).await;
+        let response = send_request(d02_args("GET", server.uri())).await.unwrap();
+        assert_eq!(response.body, "ok");
+        assert_eq!(response.size, 2);
+        assert_eq!(response.body_kind, ResponseBodyKind::Text);
+        assert!(!response.body_truncated);
+    }
+
+    /// §2: exactly at the cap is complete, not truncated - "at most limit",
+    /// the same reading as the decompression cap boundary.
+    #[tokio::test]
+    async fn test_d09_body_exactly_at_the_cap_is_complete_and_unflagged() {
+        let server = d09_serve(200, vec![b'a'; 1024], &[]).await;
+        let response = execute_request_with_limits(
+            d02_args("GET", server.uri()),
+            REQUEST_TOTAL_BUDGET,
+            1024,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.body.len(), 1024);
+        assert!(!response.body_truncated);
+    }
+
+    /// §3: one byte over truncates to the cap and still succeeds with the
+    /// full envelope.
+    #[tokio::test]
+    async fn test_d09_body_over_the_cap_truncates_and_still_succeeds() {
+        let server = d09_serve(200, vec![b'a'; 1025], &[("x-test", "apisolo")]).await;
+        let response = execute_request_with_limits(
+            d02_args("GET", server.uri()),
+            REQUEST_TOTAL_BUDGET,
+            1024,
+        )
+        .await
+        .unwrap();
+        // 1024, not 1025: the sentinel byte that detected the overrun is cut.
+        assert_eq!(response.body.len(), 1024);
+        assert!(response.body_truncated);
+        assert_eq!(response.status, 200);
+        assert!(response
+            .headers
+            .iter()
+            .any(|(key, value)| key == "x-test" && value == "apisolo"));
+    }
+
+    /// 4.4-h phase 1: the bare-TcpListener fixture must first prove it can
+    /// serve a normal response - otherwise its "success" in the stall test
+    /// below proves nothing (P12).
+    #[tokio::test]
+    async fn test_d09_stalled_server_fixture_speaks_plain_http() {
+        let (url, _sent) = d09_stalled_server(512, 512).await;
+        let response =
+            execute_request_with_limits(d02_args("GET", url), REQUEST_TOTAL_BUDGET, 1024)
+                .await
+                .unwrap();
+        assert_eq!(response.body.len(), 512);
+        assert!(!response.body_truncated);
+    }
+
+    /// §4: the read stops at the cap. The server declares 1 GB, sends
+    /// limit+1, then neither sends nor closes - success within the budget IS
+    /// the proof the remainder was never awaited. An implementation that
+    /// drains before judging hangs here until the 30s budget dies and this
+    /// test fails with a timeout error instead.
+    #[tokio::test]
+    async fn test_d09_read_stops_at_the_cap_when_the_server_stalls_open() {
+        let (url, _sent) = d09_stalled_server(1025, 1_000_000_000).await;
+        let response =
+            execute_request_with_limits(d02_args("GET", url), REQUEST_TOTAL_BUDGET, 1024)
+                .await
+                .unwrap();
+        assert_eq!(response.body.len(), 1024);
+        assert!(response.body_truncated);
+    }
+
+    /// §5: the cap ignores the status code - error pages are exactly where
+    /// huge bodies live.
+    #[tokio::test]
+    async fn test_d09_a_500_body_over_the_cap_is_truncated_the_same_way() {
+        let server = d09_serve(500, vec![b'a'; 1025], &[]).await;
+        let response = execute_request_with_limits(
+            d02_args("GET", server.uri()),
+            REQUEST_TOTAL_BUDGET,
+            1024,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status, 500);
+        assert_eq!(response.body.len(), 1024);
+        assert!(response.body_truncated);
+    }
+
+    /// §6: both caps stay wired through the real constants. Compressed
+    /// ~1.9 MB (under the 16 MiB wire cap), decompressed 64 MiB + 1 KiB
+    /// (over the decompression cap): concatenated gzip members are legal, so
+    /// the fixture is the externally-generated D02_GZIP_1024 repeated - no
+    /// crate-under-test compression involved.
+    #[tokio::test]
+    async fn test_d09_decompression_cap_still_fires_when_the_wire_cap_does_not() {
+        let members = (MAX_DECOMPRESSED_RESPONSE_BYTES / 1024) + 1;
+        let mut body = Vec::with_capacity(members * D02_GZIP_1024.len());
+        for _ in 0..members {
+            body.extend_from_slice(D02_GZIP_1024);
+        }
+        assert!(body.len() < MAX_RESPONSE_WIRE_BYTES, "fixture must stay under the wire cap");
+        let server = d09_serve(200, body, &[("content-encoding", "gzip")]).await;
+        let error = send_request(d02_args("GET", server.uri())).await.unwrap_err();
+        assert!(error.contains("too large"), "{error}");
+    }
+
+    // ---------- D09 §7-§9 截断流的解码 ----------
+
+    /// Where the gzip fixture is cut for the truncated-stream tests. 4.4-i:
+    /// the cut must decode to strictly more than zero and strictly less than
+    /// the full payload - the self-check assertions below enforce it on every
+    /// run, so a silent regression of the fixture cannot pass. 50 was chosen
+    /// empirically (decodes 42 of 80 bytes): the prefix ends inside the ASCII
+    /// head of the payload, so the text path stays provable - a cut landing
+    /// mid-multibyte-character would honestly, but unhelpfully, come out
+    /// binary.
+    const D09_GZIP_CUT: usize = 50;
+
+    /// §7 (i)(ii) fixture self-checks, then (iii) the lenient path itself.
+    #[test]
+    fn test_d09_truncated_gzip_decodes_best_effort() {
+        let plan = ContentEncodingPlan::Decode(ContentEncoding::Gzip);
+
+        // (i) Self-check: the intact constant decodes fully.
+        let (full, _) = decompress_response_body(D02_GZIP.to_vec(), &plan).unwrap();
+        assert_eq!(full.len(), D02_PAYLOAD.len(), "intact fixture no longer decodes fully");
+
+        // (ii) Self-check: the cut decodes partially - not nothing, not all.
+        let (partial, decoded) = decompress_response_body_best_effort(
+            D02_GZIP[..D09_GZIP_CUT].to_vec(),
+            &plan,
+            MAX_DECOMPRESSED_RESPONSE_BYTES,
+        );
+        assert!(decoded);
+        assert!(
+            !partial.is_empty() && partial.len() < full.len(),
+            "fixture self-check: cut at {D09_GZIP_CUT} decoded {} of {} bytes",
+            partial.len(),
+            full.len()
+        );
+
+        // (iii) Through the truncated finalize path: the trailing decode
+        // error is swallowed, the decoded prefix is kept and decodes as text.
+        let result = finalize_response_body(
+            D02_GZIP[..D09_GZIP_CUT].to_vec(),
+            plan,
+            "application/json",
+            true,
+        )
+        .unwrap();
+        assert_eq!(result.body_kind, ResponseBodyKind::Text);
+        assert!(!result.body.is_empty());
+        assert!(
+            D02_PAYLOAD.starts_with(&result.body),
+            "decoded prefix must be a prefix of the original payload, got {:?}",
+            result.body
+        );
+    }
+
+    /// §7 (iv): nothing decodable at all falls back to the binary marker,
+    /// counting the bytes that actually arrived.
+    #[test]
+    fn test_d09_truncated_gzip_with_no_decodable_prefix_uses_the_binary_marker() {
+        // 8 bytes: not even the 10-byte gzip header survived.
+        let result = finalize_response_body(
+            D02_GZIP[..8].to_vec(),
+            ContentEncodingPlan::Decode(ContentEncoding::Gzip),
+            "application/json",
+            true,
+        )
+        .unwrap();
+        assert_eq!(result.body_kind, ResponseBodyKind::Binary);
+        assert!(result.body.contains("8 bytes"), "{}", result.body);
+    }
+
+    /// §8: the same broken input with truncated = false stays an error. §7's
+    /// leniency exists only behind the truncation flag.
+    #[test]
+    fn test_d09_intact_body_decode_errors_still_fail_the_request() {
+        let error = finalize_response_body(
+            D02_GZIP[..D09_GZIP_CUT].to_vec(),
+            ContentEncodingPlan::Decode(ContentEncoding::Gzip),
+            "application/json",
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("Failed to decode"), "{error}");
+    }
+
+    /// §9 (i)(iii): truncated binary keeps both facts, and the marker counts
+    /// the bytes that arrived (1024), not the declared length (1025).
+    #[tokio::test]
+    async fn test_d09_truncated_binary_keeps_both_facts_and_counts_received_bytes() {
+        let mut body = vec![b'a'; 1025];
+        body[10] = 0; // NUL inside the kept prefix: judged binary upstream
+        let server = d09_serve(200, body, &[("content-type", "application/octet-stream")]).await;
+        let response = execute_request_with_limits(
+            d02_args("GET", server.uri()),
+            REQUEST_TOTAL_BUDGET,
+            1024,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.body_kind, ResponseBodyKind::Binary);
+        assert!(response.body_truncated);
+        assert!(response.body.contains("1024 bytes"), "{}", response.body);
+    }
+
+    /// §9 (ii): truncated text still decodes by the declared charset. 你 in
+    /// GB2312 (0xC4 0xE3) leads the body so the cut removes ASCII only.
+    #[tokio::test]
+    async fn test_d09_truncated_text_still_decodes_by_the_declared_charset() {
+        let mut body = vec![0xC4, 0xE3];
+        body.extend_from_slice(&vec![b'a'; 1023]); // 1025 total
+        let server =
+            d09_serve(200, body, &[("content-type", "text/plain; charset=gb2312")]).await;
+        let response = execute_request_with_limits(
+            d02_args("GET", server.uri()),
+            REQUEST_TOTAL_BUDGET,
+            1024,
+        )
+        .await
+        .unwrap();
+        assert!(response.body_truncated);
+        assert_eq!(response.body_kind, ResponseBodyKind::Text);
+        assert!(response.body.starts_with('你'), "{}", response.body);
+        assert_eq!(response.body.chars().count(), 1023);
+    }
+
+    // ---------- D09 §10-§11 响应头与取消 ----------
+
+    /// §10 (i): truncation adds no header exception - an identity body keeps
+    /// content-length, still showing what the server *claimed* (1025).
+    #[tokio::test]
+    async fn test_d09_truncation_keeps_content_length_on_identity_bodies() {
+        let server = d09_serve(200, vec![b'a'; 1025], &[]).await;
+        let response = execute_request_with_limits(
+            d02_args("GET", server.uri()),
+            REQUEST_TOTAL_BUDGET,
+            1024,
+        )
+        .await
+        .unwrap();
+        assert!(response.body_truncated);
+        let content_length = response
+            .headers
+            .iter()
+            .find(|(key, _)| key == "content-length")
+            .map(|(_, value)| value.as_str());
+        assert_eq!(content_length, Some("1025"));
+    }
+
+    /// §10 (ii): a truncated compressed body that still decodes drops the
+    /// encoding headers exactly like an intact one.
+    #[tokio::test]
+    async fn test_d09_truncated_gzip_that_decodes_drops_encoding_headers() {
+        // Wire cap = the proven-partially-decodable cut of the 99-byte fixture.
+        let server = d09_serve(200, D02_GZIP.to_vec(), &[("content-encoding", "gzip")]).await;
+        let response = execute_request_with_limits(
+            d02_args("GET", server.uri()),
+            REQUEST_TOTAL_BUDGET,
+            D09_GZIP_CUT,
+        )
+        .await
+        .unwrap();
+        assert!(response.body_truncated);
+        assert_eq!(response.body_kind, ResponseBodyKind::Text);
+        assert!(!response
+            .headers
+            .iter()
+            .any(|(key, _)| key == "content-encoding" || key == "content-length"));
+    }
+
+    /// §11 (i): cancelling mid-read still cancels - the chunk loop must keep
+    /// an await point. (§11 (ii), the zero-budget path, is pinned by
+    /// test_execute_request_with_zero_budget_sends_nothing.)
+    #[tokio::test]
+    async fn test_d09_cancel_during_the_body_read_still_cancels() {
+        let (url, mut sent) = d09_stalled_server(100, 1_000_000_000).await;
+        let mut args = d02_args("GET", url);
+        args.request_id = "d09-cancel".to_string();
+        let handle = tokio::spawn(send_request(args));
+
+        // The partial body is on the wire and the abort handle registered:
+        // the send is parked inside the body read.
+        sent.recv().await.unwrap();
+        for _ in 0..1000 {
+            let registered = active_request_pool()
+                .lock()
+                .await
+                .get("d09-cancel")
+                .map(|state| state.handle.is_some())
+                .unwrap_or(false);
+            if registered {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        cancel_request("d09-cancel".to_string()).await.unwrap();
+        let result = handle.await.unwrap();
+        assert_eq!(result.unwrap_err(), "Request cancelled");
+    }
+
+    // ---------- D09 §16(iv) / §20 / §21 结构与上传上限 ----------
+
+    /// §16 (iv): structural - the killer is a compile failure, not a red
+    /// assertion. Truncation must stay a separate bool: adding a member to
+    /// ResponseBodyKind makes this match non-exhaustive and the whole suite
+    /// stops building.
+    #[test]
+    fn test_d09_response_body_kind_is_exactly_text_and_binary() {
+        let name_of = |kind: ResponseBodyKind| match kind {
+            ResponseBodyKind::Text => "text",
+            ResponseBodyKind::Binary => "binary",
+        };
+        assert_eq!(name_of(ResponseBodyKind::Text), "text");
+        assert_eq!(name_of(ResponseBodyKind::Binary), "binary");
+    }
+
+    /// §20 (i)(ii): the upload cap is "at most limit", one byte over fails.
+    #[test]
+    fn test_d09_upload_part_boundary_is_at_most_the_limit() {
+        let at_limit = base64::engine::general_purpose::STANDARD.encode(vec![b'x'; 1024]);
+        let decoded = decode_base64_field(&at_limit, "binary body 'a.bin'", 1024).unwrap();
+        assert_eq!(decoded.len(), 1024);
+
+        let over = base64::engine::general_purpose::STANDARD.encode(vec![b'x'; 1025]);
+        assert!(decode_base64_field(&over, "binary body 'a.bin'", 1024).is_err());
+    }
+
+    /// §20 (iii)(iv): the error names the part it was handed - two different
+    /// labels, both verbatim - and states the limit.
+    #[test]
+    fn test_d09_upload_error_names_the_part_and_the_limit() {
+        let over = base64::engine::general_purpose::STANDARD.encode(vec![b'x'; 1025]);
+
+        let error = decode_base64_field(&over, "binary body 'a.bin'", 1024).unwrap_err();
+        assert!(error.contains("binary body 'a.bin'"), "{error}");
+        assert!(error.contains("1024"), "{error}");
+
+        let error = decode_base64_field(&over, "form-data file 'b.pdf'", 1024).unwrap_err();
+        assert!(error.contains("form-data file 'b.pdf'"), "{error}");
+    }
+
+    fn d09_file_part(key: &str, file_name: &str, content: String) -> FormDataItem {
+        FormDataItem {
+            enabled: true,
+            key: key.to_string(),
+            value: String::new(),
+            description: String::new(),
+            value_type: "file".to_string(),
+            file_name: file_name.to_string(),
+            file_path: String::new(),
+            file_content: Some(content),
+            content_type: String::new(),
+        }
+    }
+
+    /// §21: one oversized part fails the whole send through the real
+    /// MAX_UPLOAD_PART_BYTES - nothing goes on the wire, and the error names
+    /// the middle part, not the first or the last.
+    #[tokio::test]
+    async fn test_d09_one_oversized_part_fails_the_whole_send() {
+        let server = d02_serve(b"ok", &[]).await;
+        let small = base64::engine::general_purpose::STANDARD.encode(b"ok");
+        let oversized = base64::engine::general_purpose::STANDARD
+            .encode(vec![b'x'; MAX_UPLOAD_PART_BYTES + 1]);
+
+        let mut args = d02_args("POST", server.uri());
+        args.body = RequestBodyInput {
+            body_type: "form-data".to_string(),
+            content: String::new(),
+            form_data: vec![
+                d09_file_part("first", "first.bin", small.clone()),
+                d09_file_part("middle", "middle.bin", oversized),
+                d09_file_part("last", "last.bin", small),
+            ],
+            binary_path: String::new(),
+            binary_content: None,
+        };
+
+        let error = send_request(args).await.unwrap_err();
+        assert!(error.contains("middle.bin"), "{error}");
+        assert!(
+            !error.contains("first.bin") && !error.contains("last.bin"),
+            "{error}"
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "the request must never have been sent"
+        );
+    }
+
+    // ---------- D09 §23 dev bridge 入站上限 ----------
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = env::var(key).ok();
+            unsafe {
+                env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => unsafe { env::set_var(self.key, value) },
+                None => unsafe { env::remove_var(self.key) },
+            }
+        }
+    }
+
+    /// §23: the dev bridge's inbound body cap is the explicit constant, not
+    /// axum's implicit 2 MB default. The under-cap probe sits far above 2 MB
+    /// on purpose - green under the old behaviour would prove nothing.
+    #[tokio::test]
+    async fn test_d09_dev_bridge_body_limit_is_explicit_not_the_axum_default() {
+        let _guard = lock_env();
+        let _token = EnvVarGuard::set(DEV_BRIDGE_TOKEN_ENV, "d09-test-token");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, dev_bridge_router()).await.ok();
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let url = format!("http://{addr}/api/send_request");
+
+        // (i) Under the cap (and far over axum's 2 MB default): not a 413.
+        // The all-brace body is invalid JSON, so anything but "too large"
+        // (400/422) proves size was not the objection. The JSON content type
+        // matters: without it the extractor rejects with 415 before reading
+        // the body at all, and nothing about the cap gets exercised.
+        let under = client
+            .post(&url)
+            .header("x-apisolo-dev-token", "d09-test-token")
+            .header("content-type", "application/json")
+            .body(vec![b'{'; DEV_BRIDGE_MAX_BODY_BYTES - 1024])
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            under.status().as_u16(),
+            413,
+            "a body under the explicit cap must not be rejected for size"
+        );
+
+        // (ii) Just over the cap: rejected for size.
+        let over = client
+            .post(&url)
+            .header("x-apisolo-dev-token", "d09-test-token")
+            .header("content-type", "application/json")
+            .body(vec![b'{'; DEV_BRIDGE_MAX_BODY_BYTES + 1024])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(over.status().as_u16(), 413);
+
+        server.abort();
+    }
+
     // ---------- §36-§45 预算、探测与耗时 ----------
 
     #[tokio::test]
@@ -10765,7 +11535,11 @@ mod tests {
         // Wiring, not helper: deleting the pre-send checkpoint makes the
         // request go out and this turns red.
         let server = d02_serve(b"ok", &[]).await;
-        let error = execute_request_with_budget(d02_args("GET", server.uri()), Duration::ZERO)
+        let error = execute_request_with_limits(
+            d02_args("GET", server.uri()),
+            Duration::ZERO,
+            MAX_RESPONSE_WIRE_BYTES,
+        )
             .await
             .unwrap_err();
         assert!(error.contains("budget exhausted"), "{error}");
@@ -10789,9 +11563,10 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let outcome = execute_request_with_budget(
+        let outcome = execute_request_with_limits(
             d02_args("GET", server.uri()),
             Duration::from_millis(500),
+            MAX_RESPONSE_WIRE_BYTES,
         )
         .await;
         assert!(outcome.is_err(), "budget was ignored: {outcome:?}");
@@ -10879,6 +11654,7 @@ mod tests {
             D02_PAYLOAD.as_bytes().to_vec(),
             ContentEncodingPlan::None,
             "application/json",
+            false,
         )
         .unwrap();
         assert_eq!(decoded.body, D02_PAYLOAD);
@@ -11719,8 +12495,9 @@ mod tests {
     }
 
     /// §52: a row written before these fields existed (the three D07 ones,
-    /// plus the later statusText) still reads, and reads as "no note, not
-    /// starred, text body, no recorded reason phrase".
+    /// plus the later statusText, plus D09's responseBodyTruncated) still
+    /// reads, and reads as "no note, not starred, text body, no recorded
+    /// reason phrase, not truncated".
     #[test]
     fn test_d07_rows_without_the_new_fields_still_load() {
         let _guard = lock_env();
@@ -11733,6 +12510,7 @@ mod tests {
         object.remove("starred");
         object.remove("responseBodyKind");
         object.remove("statusText");
+        object.remove("responseBodyTruncated");
         let field_count = object.len();
 
         let mut raw = serde_json::to_vec(&legacy).unwrap();
@@ -11744,6 +12522,7 @@ mod tests {
         assert!(!entry.starred);
         assert_eq!(entry.response_body_kind, ResponseBodyKind::Text);
         assert!(entry.status_text.is_empty());
+        assert!(!entry.response_body_truncated);
 
         // ...and the rest of the row arrived intact, not defaulted away.
         let reloaded = d07_json(&entry);

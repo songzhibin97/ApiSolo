@@ -4,6 +4,8 @@ import { useI18n } from "vue-i18n"
 
 import CodeEditor from "../editor/CodeEditor.vue"
 import KeyValueEditor from "./KeyValueEditor.vue"
+import { readFileAsBase64 } from "../../utils/file-reader"
+import { MAX_UPLOAD_FILE_BYTES, formatBytesAsMib } from "../../utils/limits"
 import type { BodyType, FormDataItem, KeyValuePair, RequestBody } from "../../types"
 
 const props = defineProps<{
@@ -164,12 +166,25 @@ function updateFormUrlencoded(rows: KeyValuePair[]) {
   updateBody({ content: serializeFormUrlencoded(rows) })
 }
 
+const uploadLimitLabel = formatBytesAsMib(MAX_UPLOAD_FILE_BYTES)
+const rejectedBinaryFile = ref<{ name: string; size: number } | null>(null)
+const rejectedFormDataFile = ref<{ rowId: string; name: string; size: number } | null>(null)
+
 async function updateBinaryFile(event: Event) {
   const file = (event.target as HTMLInputElement).files?.[0]
   if (!file) {
     updateBody({ binaryPath: "", binaryContent: undefined })
     return
   }
+
+  // §22: decided on File.size, BEFORE readFileAsBase64 — a rejected file must
+  // never enter WebView memory as a data URL, let alone the tab state. No
+  // emit on rejection: emitting and then saying "not added" would be a lie.
+  if (file.size > MAX_UPLOAD_FILE_BYTES) {
+    rejectedBinaryFile.value = { name: file.name, size: file.size }
+    return
+  }
+  rejectedBinaryFile.value = null
 
   updateBody({
     binaryPath: file.name,
@@ -206,6 +221,13 @@ async function updateFormDataFile(id: string, event: Event) {
   if (!file) {
     return
   }
+
+  // Same precheck as the binary exit — both exits or the gap just moves.
+  if (file.size > MAX_UPLOAD_FILE_BYTES) {
+    rejectedFormDataFile.value = { rowId: id, name: file.name, size: file.size }
+    return
+  }
+  rejectedFormDataFile.value = null
 
   updateFormDataRow(id, {
     valueType: "file",
@@ -255,19 +277,6 @@ function formatFormDataValue(item: FormDataItem) {
   return item.valueType === "file"
     ? item.fileName || t("body.noFileSelected")
     : item.value
-}
-
-function readFileAsBase64(file: File) {
-  return new Promise<string>((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => {
-      const result = String(reader.result ?? "")
-      const [, base64 = ""] = result.split(",", 2)
-      resolve(base64)
-    }
-    reader.onerror = () => reject(reader.error ?? new Error("Failed to read file"))
-    reader.readAsDataURL(file)
-  })
 }
 
 function buildBodyStateForType(type: BodyType, current: RequestBody): RequestBody {
@@ -427,15 +436,38 @@ function buildBodyStateForType(type: BodyType, current: RequestBody): RequestBod
             <option value="file">File</option>
           </select>
 
-          <div v-if="(row.valueType || 'text') === 'file'" class="flex min-w-0 items-center gap-2">
-            <label
-              class="inline-flex h-9 shrink-0 cursor-pointer items-center rounded border border-[var(--border)] bg-[var(--bg-primary)] px-3 text-sm text-[var(--text-primary)] transition hover:border-[color-mix(in_srgb,var(--accent)_60%,white)]"
+          <div v-if="(row.valueType || 'text') === 'file'" class="flex min-w-0 flex-col gap-0.5">
+            <div class="flex min-w-0 items-center gap-2">
+              <label
+                class="inline-flex h-9 shrink-0 cursor-pointer items-center rounded border border-[var(--border)] bg-[var(--bg-primary)] px-3 text-sm text-[var(--text-primary)] transition hover:border-[color-mix(in_srgb,var(--accent)_60%,white)]"
+              >
+                <input class="hidden" type="file" @change="updateFormDataFile(row.id, $event)" />
+                {{ t("body.selectFile") }}
+              </label>
+              <span class="truncate font-mono text-sm text-[var(--text-secondary)]">
+                {{ formatFormDataValue(row) }}
+              </span>
+            </div>
+            <!-- The rule is always on screen, not only after a rejection. -->
+            <span
+              class="truncate text-[11px] text-[var(--text-secondary)]"
+              data-testid="form-data-file-limit"
             >
-              <input class="hidden" type="file" @change="updateFormDataFile(row.id, $event)" />
-              {{ t("body.selectFile") }}
-            </label>
-            <span class="truncate font-mono text-sm text-[var(--text-secondary)]">
-              {{ formatFormDataValue(row) }}
+              {{ t("body.fileSizeLimit", { limit: uploadLimitLabel }) }}
+            </span>
+            <span
+              v-if="rejectedFormDataFile && rejectedFormDataFile.rowId === row.id"
+              data-testid="form-data-file-rejected"
+              class="truncate text-[11px] text-rose-400"
+              :title="rejectedFormDataFile.name"
+            >
+              {{
+                t("body.fileTooLarge", {
+                  name: rejectedFormDataFile.name,
+                  size: formatBytesAsMib(rejectedFormDataFile.size),
+                  limit: uploadLimitLabel,
+                })
+              }}
             </span>
           </div>
 
@@ -465,6 +497,11 @@ function buildBodyStateForType(type: BodyType, current: RequestBody): RequestBod
       class="flex min-h-[280px] flex-1 flex-col justify-center gap-3 rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)] p-4"
     >
       <div class="text-sm text-[var(--text-secondary)]">{{ t("body.chooseFile") }}</div>
+      <!-- The rule is always on screen, not only after a rejection: a limit
+           that only speaks when hit makes every user discover it the hard way. -->
+      <div class="text-xs text-[var(--text-secondary)]" data-testid="binary-file-limit">
+        {{ t("body.fileSizeLimit", { limit: uploadLimitLabel }) }}
+      </div>
       <div class="flex flex-wrap items-center gap-2">
         <label
           class="inline-flex h-8 cursor-pointer items-center rounded border border-[var(--border)] bg-[var(--bg-primary)] px-3 text-sm text-[var(--text-primary)] transition hover:border-[color-mix(in_srgb,var(--accent)_60%,white)]"
@@ -475,6 +512,19 @@ function buildBodyStateForType(type: BodyType, current: RequestBody): RequestBod
         <span class="font-mono text-sm text-[var(--text-secondary)]">
           {{ modelValue.binaryPath || t("body.noFileSelected") }}
         </span>
+      </div>
+      <div
+        v-if="rejectedBinaryFile"
+        data-testid="binary-file-rejected"
+        class="text-xs leading-5 text-rose-400"
+      >
+        {{
+          t("body.fileTooLarge", {
+            name: rejectedBinaryFile.name,
+            size: formatBytesAsMib(rejectedBinaryFile.size),
+            limit: uploadLimitLabel,
+          })
+        }}
       </div>
     </div>
   </div>

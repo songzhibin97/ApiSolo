@@ -98,6 +98,8 @@ export default {
     chooseFile: "Choose a file to send as the request body.",
     selectFile: "Select file",
     noFileSelected: "No file selected",
+    fileSizeLimit: "Up to {limit} per file.",
+    fileTooLarge: "\"{name}\" is {size}, over the {limit} per-file limit. It was not added.",
     tooltips: {
       none: "Do not send a request body",
       json: "Send JSON data (Content-Type: application/json)",
@@ -138,6 +140,8 @@ export default {
     treeView: "Tree",
     rawView: "Raw",
     largeBodyTruncated: "[Response too large, truncated]",
+    networkTruncated: "The response body exceeded {limit}; the network read stopped there. The rest was never received, and ApiSolo will not fetch it automatically.",
+    networkTruncatedBadge: "Incomplete",
     copied: "Copied",
     items: "items",
     headers: "Headers",

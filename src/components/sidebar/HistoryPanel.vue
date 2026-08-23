@@ -425,6 +425,16 @@ async function clearHistory() {
                     {{ summarizeResponseBody(entry.responseBody) }}
                   </span>
                 </span>
+                <!-- Network truncation: this row's stored body is the prefix of
+                     a body that was never fully received. Same key as the
+                     response panel's badge — they state the same fact. -->
+                <span
+                  v-if="entry.responseBodyTruncated"
+                  data-testid="history-truncated-badge"
+                  class="shrink-0 rounded border border-amber-500/40 px-1 text-[10px] leading-4 text-amber-500"
+                >
+                  {{ t("response.networkTruncatedBadge") }}
+                </span>
                 <StickyNote
                   v-if="entry.note"
                   data-testid="history-note-badge"

@@ -150,9 +150,12 @@ Release expectations:
 - The development bridge is behind the `dev-bridge` feature and is not part of the default release build.
 - `npm run tauri:build` sets `CI=true` so macOS automation environments do not need Finder access while decorating the DMG window.
 
-## Known Issues
+## Size Caps
 
-- Response bodies are read fully into memory with no size cap on the network read (only the decompressed output is capped). Very large responses can exhaust memory. Tracked as backlog D09.
+- The network read of a response body stops at a hard-coded, non-configurable cap of 16 MiB. A larger body is truncated at that point and explicitly marked as incomplete in the response panel and in history; the remainder is never received and ApiSolo will not fetch it automatically. There is no full-download escape hatch — when you need the complete body, use another tool such as `curl -o`.
+- The network cap (16 MiB) and the decompression cap (64 MiB) are two different numbers on purpose, and the network cap is the smaller one: the former limits how much comes in over the wire, the latter limits how much a compressed body may expand to in memory.
+- An upload over the cap fails with an error instead of being truncated: ApiSolo never sends a truncated request body. Each binary body or form-data file part may be at most 16 MiB after decoding, and the file picker refuses oversized files up front.
+- The dev bridge has an explicit inbound request-body cap (64 MiB) instead of inheriting the HTTP library's default, so `dev:web` and the packaged app give the same result for the same upload.
 
 ## License
 
