@@ -30,7 +30,9 @@ ApiSolo is a local-first desktop API client built with Tauri, Rust, Vue, and Pin
 - Environment variables with normal values plus user-selected secret storage: a local encrypted vault by default, or the operating system keychain if explicitly selected.
 - Pre-request and test scripts executed in a QuickJS WebAssembly sandbox with timeouts.
 - WebSocket connections with handshake headers, sent/received message history, and connection state. Deliberate boundaries: the handshake has a 30-second budget and can be cancelled while it is still in flight; a connection keeps its most recent 500 messages and shows how many were dropped; a single message is stored up to 65536 characters and is marked when cut; there is no automatic reconnect; and WebSocket frames are never written to request history.
-- Request history grouped by URL prefix, time, or method, with replay-friendly saved entries.
+- Request history grouped by URL prefix, time, or method, with replay-friendly saved entries. Entries can be annotated with a note and starred; starred entries survive automatic eviction. A response that hit the network cap is badged as incomplete in the list, not silently shortened.
+- Saving a request from history names the fields that were redacted before it lets you save: each one is listed with where it came from (header, query, form, body, auth), and files whose bytes history never kept are listed separately as "pick this file again".
+- A binary response is presented as a description of what came back rather than as mojibake or a literal placeholder string, both when it arrives and when the entry is reopened from history.
 - Built-in debug console for app, network, and script events.
 - Light/dark/system themes, English and Simplified Chinese UI, proxy, and TLS settings.
 
@@ -104,6 +106,8 @@ Prerequisites:
 - Node.js 22+
 - Rust 1.88+ stable
 - Platform dependencies required by Tauri 2
+
+Every Rust-touching npm script (`dev`, `dev:web:api`, `test:rust`, `audit:cargo`, `tauri:build`) prepends the rustup toolchain to `PATH` on purpose, because a package-manager rustc earlier than the `rust-version` in `src-tauri/Cargo.toml` may otherwise shadow it. Run these through npm rather than invoking `cargo` directly.
 
 Commands:
 
