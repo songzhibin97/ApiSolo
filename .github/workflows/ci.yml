@@ -9,7 +9,7 @@ on:
 
 jobs:
   test:
-    name: Test and audit
+    name: Test
     runs-on: macos-latest
 
     steps:
@@ -36,6 +36,29 @@ jobs:
 
       - name: Rust tests
         run: npm run test:rust
+
+  # Both audits are a known-red baseline (advisories reach us only transitively, via
+  # devDependencies and reqwest/quinn), so they sit in their own job instead of drowning
+  # out the test job's regression signal.
+  audit:
+    name: Dependency audit
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: npm ci
 
       - name: npm audit
         run: npm run audit
