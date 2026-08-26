@@ -11,7 +11,14 @@ import { isUntitledTabLabel, useTabsStore } from "../../stores/tabs";
 import { flattenCollectionFolders } from "../../utils/collection-options";
 import { exportCurl } from "../../utils/curl-export";
 import { parseCurl } from "../../utils/curl-parser";
-import { bannerFields, formatPendingField, pendingRefillFields } from "../../utils/pending-refill";
+import {
+  bannerFields,
+  formatPendingField,
+  pendingRefillFields,
+  refillFields,
+  unverifiableFields,
+  type PendingField,
+} from "../../utils/pending-refill";
 import { buildSavedRequest } from "../../utils/saved-request";
 import { buildUrlWithParams, syncParamsFromUrl } from "../../utils/url-params";
 import AuthEditor from "../request/AuthEditor.vue";
@@ -86,9 +93,24 @@ const saveBlocked = computed(() => saveGate.blocksSave(pendingFields.value));
  * whether the notice appears and what it says now change together.
  */
 const noticeFields = computed(() => bannerFields(pendingFields.value));
-const redactedFieldLabels = computed(() =>
-  noticeFields.value.map((field) => formatPendingField(field, t)).join(", "),
-);
+
+/**
+ * Split by class, using the save dialog's own filters. The two classes are not
+ * the same statement and must not be run together into one: "these need
+ * re-entering" is a claim we can only make about fields we can see are still
+ * blank. When the body will not parse we cannot see that, so saying it there
+ * would send the user to fill a field back in and leave the notice standing
+ * afterwards, with nothing on screen explaining why or how to clear it.
+ */
+const refillNotice = computed(() => refillFields(noticeFields.value));
+const unverifiableNotice = computed(() => unverifiableFields(noticeFields.value));
+
+function labelsOf(fields: PendingField[]) {
+  return fields.map((field) => formatPendingField(field, t)).join(", ");
+}
+
+const refillFieldLabels = computed(() => labelsOf(refillNotice.value));
+const unverifiableFieldLabels = computed(() => labelsOf(unverifiableNotice.value));
 
 function countEnabled(items: KeyValuePair[]) {
   return items.filter((item) => item.enabled && (item.key || item.value)).length;
@@ -371,12 +393,28 @@ onUnmounted(() => {
       @paste-curl="applyPastedCurl"
     />
 
+    <!--
+      Two sentences, each rendered only when its own class is present, and both
+      when both are. The list of names alone cannot tell the two apart: the same
+      "Body · token" row means "type this back in" in one state and "we cannot
+      tell whether you already did" in the other.
+    -->
     <div
       v-if="noticeFields.length > 0"
       data-testid="history-redacted-banner"
-      class="border-b border-amber-500/40 bg-amber-500/10 px-4 py-2 text-sm text-amber-300"
+      class="space-y-1 border-b border-amber-500/40 bg-amber-500/10 px-4 py-2 text-sm text-amber-300"
     >
-      {{ t("request.historyRedactedBanner", { fields: redactedFieldLabels }) }}
+      <p v-if="refillNotice.length > 0" data-testid="history-redacted-banner-refill">
+        {{ t("request.historyRedactedBanner", { fields: refillFieldLabels }) }}
+      </p>
+      <div v-if="unverifiableNotice.length > 0" data-testid="history-redacted-banner-unverifiable">
+        <p>{{ t("history.refillUnparseableBody", { count: unverifiableNotice.length }) }}</p>
+        <!--
+          The names still get listed. The user needs to know which fields the
+          message is about, and the sentence above only carries how many.
+        -->
+        <p class="font-mono">{{ unverifiableFieldLabels }}</p>
+      </div>
     </div>
 
     <div
