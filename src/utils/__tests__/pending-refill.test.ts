@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest"
 
-import { pendingRefillFields, reselectFileFields } from "../pending-refill"
+import {
+  formatPendingField,
+  identityTuple,
+  pendingRefillFields,
+  reselectFileFields,
+} from "../pending-refill"
 import type { PendingRefillSource } from "../pending-refill"
 import { REDACTION_SENTINEL } from "../redaction"
 import type { AuthConfig, KeyValuePair, RequestBody } from "../../types"
@@ -31,8 +36,8 @@ function request(overrides: Partial<PendingRefillSource> = {}): PendingRefillSou
   }
 }
 
-function paths(source: PendingRefillSource): string[] {
-  return pendingRefillFields(source).map((item) => item.path)
+function labels(source: PendingRefillSource): string[] {
+  return pendingRefillFields(source).map(formatPendingField)
 }
 
 describe("§7 every value history replaced is listed for re-entry", () => {
@@ -44,7 +49,8 @@ describe("§7 every value history replaced is listed for re-entry", () => {
       request({ auth: { type: "basic", basic: { username: "bob", password: "" } } as AuthConfig }),
     )
 
-    expect(fields).toEqual([{ kind: "refill", source: "auth", path: "Auth · Basic password" }])
+    expect(fields.map(identityTuple)).toEqual([["refill", "auth", "basic-password", ""]])
+    expect(fields.map(formatPendingField)).toEqual(["Auth · Basic password"])
   })
 
   it("lists a blanked Bearer token", () => {
@@ -52,7 +58,8 @@ describe("§7 every value history replaced is listed for re-entry", () => {
       request({ auth: { type: "bearer", bearer: { token: "" } } as AuthConfig }),
     )
 
-    expect(fields).toEqual([{ kind: "refill", source: "auth", path: "Auth · Bearer token" }])
+    expect(fields.map(identityTuple)).toEqual([["refill", "auth", "bearer-token", ""]])
+    expect(fields.map(formatPendingField)).toEqual(["Auth · Bearer token"])
   })
 
   it("lists a blanked API key value", () => {
@@ -65,14 +72,15 @@ describe("§7 every value history replaced is listed for re-entry", () => {
       }),
     )
 
-    expect(fields).toEqual([
-      { kind: "refill", source: "auth", path: "Auth · API key X-Api-Key" },
-    ])
+    // The key name is the user's own, so it stays out of the display text and
+    // in the identity: `name` is what the acknowledgement is keyed on.
+    expect(fields.map(identityTuple)).toEqual([["refill", "auth", "api-key", "X-Api-Key"]])
+    expect(fields.map(formatPendingField)).toEqual(["Auth · API key X-Api-Key"])
   })
 
   it("lists a placeholder in a header, a param, the url query, the body and a form row", () => {
     expect(
-      paths(
+      labels(
         request({
           url: `https://api.example.com/s?access_token=${REDACTION_SENTINEL}&page=2`,
           headers: [pair("Authorization", REDACTION_SENTINEL), pair("Accept", "*/*")],
@@ -93,7 +101,7 @@ describe("§7 every value history replaced is listed for re-entry", () => {
 
   it("lists a placeholder in a non-file form row", () => {
     expect(
-      paths(
+      labels(
         request({
           body: body({
             type: "form-data",
@@ -109,7 +117,7 @@ describe("§7 every value history replaced is listed for re-entry", () => {
   // replayable. Both spellings have to count.
   it("lists a row already cleared to a marker", () => {
     expect(
-      paths(request({ headers: [pair("Authorization", "", { redacted: true })] })),
+      labels(request({ headers: [pair("Authorization", "", { redacted: true })] })),
     ).toEqual(["Header · Authorization"])
   })
 
@@ -143,9 +151,10 @@ describe("§8 files are a separate class: nothing to refill, a file to re-pick",
   })
 
   it("lists a form file row as needing re-selection", () => {
-    expect(pendingRefillFields(fileOnly)).toEqual([
-      { kind: "reselect-file", source: "file", path: "Form · avatar" },
+    expect(pendingRefillFields(fileOnly).map(identityTuple)).toEqual([
+      ["reselect-file", "file", null, "avatar"],
     ])
+    expect(pendingRefillFields(fileOnly).map(formatPendingField)).toEqual(["Form · avatar"])
   })
 
   it("lists a binary body as needing re-selection", () => {
@@ -153,16 +162,15 @@ describe("§8 files are a separate class: nothing to refill, a file to re-pick",
       request({ body: body({ type: "binary", binaryPath: "photo.png" }) }),
     )
 
-    expect(fields).toEqual([
-      { kind: "reselect-file", source: "binary", path: "Body · photo.png" },
-    ])
+    expect(fields.map(identityTuple)).toEqual([["reselect-file", "binary", null, "photo.png"]])
+    expect(fields.map(formatPendingField)).toEqual(["Body · photo.png"])
     expect(reselectFileFields(fields)).toHaveLength(1)
   })
 })
 
 describe("§9 each entry says where it lives, not just what it is called", () => {
   it("tells three fields of the same name apart", () => {
-    const fields = paths(
+    const fields = labels(
       request({
         headers: [pair("password", REDACTION_SENTINEL)],
         body: body({ type: "json", content: `{"password":"${REDACTION_SENTINEL}"}` }),
@@ -176,7 +184,7 @@ describe("§9 each entry says where it lives, not just what it is called", () =>
 
   it("gives the auth slots a structural position rather than a bare name", () => {
     expect(
-      paths(request({ auth: { type: "basic", basic: { username: "u", password: "" } } as AuthConfig })),
+      labels(request({ auth: { type: "basic", basic: { username: "u", password: "" } } as AuthConfig })),
     ).toEqual(["Auth · Basic password"])
   })
 })
@@ -191,7 +199,7 @@ describe("§9 each entry says where it lives, not just what it is called", () =>
 describe("the query overlap collapses, a same-source repeat does not", () => {
   it("reports one entry when params and the url name the same parameter", () => {
     expect(
-      paths(
+      labels(
         request({
           url: `https://api.example.com/s?api_key=${REDACTION_SENTINEL}`,
           params: [pair("api_key", REDACTION_SENTINEL)],
@@ -202,7 +210,7 @@ describe("the query overlap collapses, a same-source repeat does not", () => {
 
   it("reports both entries for a repeated parameter name in the url", () => {
     expect(
-      paths(
+      labels(
         request({
           url: `https://api.example.com/s?tag=${REDACTION_SENTINEL}&tag=${REDACTION_SENTINEL}`,
         }),
@@ -212,7 +220,7 @@ describe("the query overlap collapses, a same-source repeat does not", () => {
 
   it("reports both entries for a repeated parameter name in the params", () => {
     expect(
-      paths(
+      labels(
         request({
           params: [pair("tag", REDACTION_SENTINEL), { ...pair("tag", REDACTION_SENTINEL), id: "tag-2" }],
         }),
@@ -223,7 +231,7 @@ describe("the query overlap collapses, a same-source repeat does not", () => {
   // Both sources carry the same repeated name: still two, not four and not one.
   it("keeps the count at the real number when both sources repeat it", () => {
     expect(
-      paths(
+      labels(
         request({
           url: `https://api.example.com/s?tag=${REDACTION_SENTINEL}&tag=${REDACTION_SENTINEL}`,
           params: [pair("tag", REDACTION_SENTINEL), { ...pair("tag", REDACTION_SENTINEL), id: "tag-2" }],

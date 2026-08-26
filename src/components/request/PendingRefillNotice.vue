@@ -3,7 +3,12 @@ import { computed } from "vue"
 import { useI18n } from "vue-i18n"
 
 import { useSaveGateStore } from "../../stores/save-gate"
-import { refillFields, reselectFileFields, type PendingField } from "../../utils/pending-refill"
+import {
+  formatPendingField,
+  refillFields,
+  reselectFileFields,
+  type PendingField,
+} from "../../utils/pending-refill"
 
 const props = defineProps<{
   fields: PendingField[]
@@ -38,8 +43,13 @@ function toggle(value: boolean) {
     >
       <div class="font-semibold">{{ t("history.refillTitle", { count: refill.length }) }}</div>
       <ul class="mt-2 max-h-32 space-y-1 overflow-auto">
-        <li v-for="field in refill" :key="`refill-${field.path}`" class="font-mono">
-          {{ field.path }}
+        <!--
+          Keyed by position, not by text: the same key redacted twice is two
+          entries the user has to refill, and collapsing them would promise
+          fewer fields than there are.
+        -->
+        <li v-for="(field, index) in refill" :key="`refill-${index}`" class="font-mono">
+          {{ formatPendingField(field) }}
         </li>
       </ul>
     </div>
@@ -52,8 +62,8 @@ function toggle(value: boolean) {
         {{ t("history.reselectFileTitle", { count: reselect.length }) }}
       </div>
       <ul class="mt-2 max-h-32 space-y-1 overflow-auto">
-        <li v-for="field in reselect" :key="`reselect-${field.path}`" class="font-mono">
-          {{ field.path }}
+        <li v-for="(field, index) in reselect" :key="`reselect-${index}`" class="font-mono">
+          {{ formatPendingField(field) }}
         </li>
       </ul>
     </div>

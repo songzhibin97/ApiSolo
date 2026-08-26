@@ -18,7 +18,12 @@ import { useProjectsStore } from "../../stores/projects"
 import { useSaveGateStore } from "../../stores/save-gate"
 import { useTabsStore } from "../../stores/tabs"
 import { historyEntryToRequest } from "../../utils/history-to-request"
-import { pendingRefillFields, type PendingField } from "../../utils/pending-refill"
+import {
+  formatPendingField,
+  identityTuple,
+  pendingRefillFields,
+  type PendingField,
+} from "../../utils/pending-refill"
 import { REDACTION_SENTINEL } from "../../utils/redaction"
 import type { AuthConfig, HistoryEntry, KeyValuePair } from "../../types"
 
@@ -242,10 +247,13 @@ describe("§6 the existing save button is gated by the same check as the new one
     const fromPanel = wrapper.findComponent(PendingRefillNotice).props("fields") as PendingField[]
     const fromHistory = pendingRefillFields(historyEntryToRequest(source))
 
+    // Compared on identity, not on display text: the two lists have to agree on
+    // what is pending, and that answer must not move with the interface language.
+    const identity = (fields: PendingField[]) =>
+      fields.map((field) => JSON.stringify(identityTuple(field))).sort()
+
     expect(fromPanel).toHaveLength(3)
-    expect([...fromPanel].sort((a, b) => a.path.localeCompare(b.path))).toEqual(
-      [...fromHistory].sort((a, b) => a.path.localeCompare(b.path)),
-    )
+    expect(identity(fromPanel)).toEqual(identity(fromHistory))
   })
 
   /**
@@ -273,9 +281,9 @@ describe("§6 the existing save button is gated by the same check as the new one
     await openSaveDialog(wrapper)
 
     const fromPanel = wrapper.findComponent(PendingRefillNotice).props("fields") as PendingField[]
-    expect(fromPanel.map((field) => field.path)).toEqual(["Body · request body"])
-    expect(pendingRefillFields(historyEntryToRequest(source)).map((field) => field.path)).toEqual([
-      "Body · password",
-    ])
+    expect(fromPanel.map(formatPendingField)).toEqual(["Body · request body"])
+    expect(
+      pendingRefillFields(historyEntryToRequest(source)).map(formatPendingField),
+    ).toEqual(["Body · password"])
   })
 })

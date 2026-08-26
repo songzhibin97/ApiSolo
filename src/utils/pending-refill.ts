@@ -3,11 +3,38 @@ import { REDACTION_SENTINEL, bodyKindFromBodyType, sentinelBodyFields } from "./
 
 export type PendingKind = "refill" | "reselect-file"
 export type PendingSource = "header" | "query" | "form" | "body" | "auth" | "file" | "binary"
+export type NonAuthSource = Exclude<PendingSource, "auth">
 
-export interface PendingField {
-  kind: PendingKind
-  source: PendingSource
-  path: string
+/**
+ * Which auth slot a pending entry sits in, as a value the user cannot supply.
+ * The three auth entries share one `source`, so without this they would only be
+ * told apart by `name` -- and the API key entry's name is the user's own key,
+ * so naming a key `Bearer token` would collide two different pending items into
+ * one acknowledgement.
+ */
+export type AuthSlot = "basic-password" | "bearer-token" | "api-key"
+
+/**
+ * `name` is the raw position, never display text: the user's own key, or "" for
+ * a slot that has no user-supplied name. Display text is derived at render time
+ * by `formatPendingField`. Keeping the two apart is what lets an acknowledgement
+ * survive a language switch -- a localized string in here would make the
+ * signature change with the interface language.
+ */
+export type PendingField =
+  | { kind: PendingKind; source: NonAuthSource; name: string }
+  | { kind: PendingKind; source: "auth"; slot: AuthSlot; name: string }
+
+export type IdentityTuple = readonly [PendingKind, PendingSource, AuthSlot | null, string]
+
+/**
+ * The one place the four identity components are read off a field. Everything
+ * that needs them -- the save gate's signature, the renderer, the tests -- calls
+ * this rather than destructuring the union again, because a second copy of the
+ * discriminant is a second thing to keep in step.
+ */
+export function identityTuple(f: PendingField): IdentityTuple {
+  return [f.kind, f.source, f.source === "auth" ? f.slot : null, f.name] as const
 }
 
 /**
@@ -37,10 +64,39 @@ const SOURCE_LABEL: Record<PendingSource, string> = {
   binary: "Body",
 }
 
-function field(kind: PendingKind, source: PendingSource, name: string): PendingField {
-  // A bare field name cannot be located: `password` can be a header, a form
-  // row, and a JSON key on the same request.
-  return { kind, source, path: `${SOURCE_LABEL[source]} · ${name}` }
+const AUTH_SLOT_LABEL: Record<AuthSlot, string> = {
+  "basic-password": "Basic password",
+  "bearer-token": "Bearer token",
+  "api-key": "API key",
+}
+
+/**
+ * The only place a pending entry turns into text on screen. A bare field name
+ * cannot be located -- `password` can be a header, a form row and a JSON key on
+ * the same request -- so the position is spelled out here rather than stored on
+ * the field.
+ */
+export function formatPendingField(f: PendingField): string {
+  const [, source, slot, name] = identityTuple(f)
+
+  if (slot === "api-key") {
+    return `${SOURCE_LABEL[source]} · ${AUTH_SLOT_LABEL[slot]} ${name || "value"}`
+  }
+
+  return `${SOURCE_LABEL[source]} · ${slot ? AUTH_SLOT_LABEL[slot] : name}`
+}
+
+function field(kind: PendingKind, source: NonAuthSource, name: string): PendingField {
+  return { kind, source, name }
+}
+
+/**
+ * Auth entries get their own constructor so the slot cannot be forgotten: it is
+ * a required positional argument here and a required member on the union, which
+ * makes "an auth entry with no slot" unrepresentable rather than merely untested.
+ */
+function authField(kind: PendingKind, slot: AuthSlot, name: string): PendingField {
+  return { kind, source: "auth", slot, name }
 }
 
 /**
@@ -53,7 +109,7 @@ function needsRefill(item: KeyValuePair): boolean {
   return item.value.trim() === REDACTION_SENTINEL || (item.redacted === true && item.value === "")
 }
 
-function pairFields(items: KeyValuePair[], source: PendingSource): PendingField[] {
+function pairFields(items: KeyValuePair[], source: NonAuthSource): PendingField[] {
   return items.filter(needsRefill).map((item) => field("refill", source, item.key))
 }
 
@@ -97,15 +153,15 @@ function urlQueryFields(rawUrl: string): PendingField[] {
  */
 function authFields(auth: AuthConfig): PendingField[] {
   if (auth.type === "basic" && !auth.basic?.password) {
-    return [field("refill", "auth", "Basic password")]
+    return [authField("refill", "basic-password", "")]
   }
 
   if (auth.type === "bearer" && !auth.bearer?.token) {
-    return [field("refill", "auth", "Bearer token")]
+    return [authField("refill", "bearer-token", "")]
   }
 
   if (auth.type === "api-key" && !auth.apiKey?.value) {
-    return [field("refill", "auth", `API key ${auth.apiKey?.key || "value"}`)]
+    return [authField("refill", "api-key", auth.apiKey?.key || "")]
   }
 
   return []
@@ -168,11 +224,13 @@ function fileFields(body: RequestBody): PendingField[] {
  */
 function queryFields(source: PendingRefillSource): PendingField[] {
   const fromParams = pairFields(source.params, "query")
-  const named = new Set(fromParams.map((field) => field.path))
+  // Both sides carry the same kind and source, so the parameter name is the
+  // whole of what tells two query entries apart.
+  const named = new Set(fromParams.map((field) => field.name))
 
   return [
     ...fromParams,
-    ...urlQueryFields(source.url).filter((field) => !named.has(field.path)),
+    ...urlQueryFields(source.url).filter((field) => !named.has(field.name)),
   ]
 }
 
