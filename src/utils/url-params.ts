@@ -16,13 +16,36 @@ export function toParsableUrl(rawUrl: string) {
 export function syncParamsFromUrl(rawUrl: string, currentParams: KeyValuePair[]) {
   try {
     const parsed = new URL(toParsableUrl(rawUrl))
-    const params = [...parsed.searchParams.entries()].map(([key, value]) => ({
-      id: crypto.randomUUID(),
-      enabled: true,
-      key,
-      value,
-      description: "",
-    }))
+    /**
+     * Rebuilt rows are lined up against the existing ones by key and by which
+     * occurrence of that key they are, so that a row can carry forward what it
+     * was holding. Only the redaction marker is carried, and only while the
+     * value is still blank.
+     *
+     * Without this, editing any part of the url dropped the marker, and with it
+     * the save gate on a credential history had blanked: changing the path of
+     * `?apikey=` was enough to let an empty API key be saved unannounced. The
+     * marker records that history took the value away — not that the url has
+     * not been touched since — so an edit elsewhere must not clear it. Typing a
+     * value in does clear it, which is the same rule the params table follows.
+     */
+    const enabled = currentParams.filter((item) => item.enabled)
+    const seen = new Map<string, number>()
+
+    const params = [...parsed.searchParams.entries()].map(([key, value]) => {
+      const occurrence = seen.get(key) ?? 0
+      seen.set(key, occurrence + 1)
+      const previous = enabled.filter((item) => item.key === key)[occurrence]
+
+      return {
+        id: crypto.randomUUID(),
+        enabled: true,
+        key,
+        value,
+        description: "",
+        ...(value === "" && previous?.redacted === true ? { redacted: true } : {}),
+      }
+    })
     // Store URL without query string — params are the source of truth
     const { baseUrl, hash } = splitUrlParts(rawUrl)
     return {

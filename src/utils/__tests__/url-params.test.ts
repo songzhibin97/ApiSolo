@@ -313,3 +313,91 @@ describe("§13 a draft never leaks across tabs", () => {
     expect(reconcileUrlBarValue(null, { tabId: "tab-a", revision: 0, url: BASE })).toBe(BASE)
   })
 })
+
+/**
+ * A row whose value history blanked carries a marker, and the marker is the
+ * only thing left holding the save gate — the placeholder itself is stripped
+ * when the tab loads. Rebuilding the rows from the url text used to discard it,
+ * so editing the path was enough to let an empty credential be saved with no
+ * warning. Rows are lined up by key and occurrence so the marker survives an
+ * edit that is not about that value.
+ */
+describe("rebuilding params from the url keeps a still-blank row's marker", () => {
+  const redacted = (key: string): KeyValuePair => ({
+    id: `${key}-r`,
+    enabled: true,
+    key,
+    value: "",
+    description: "",
+    redacted: true,
+  })
+
+  it("keeps the marker when an unrelated part of the url changes", () => {
+    const synced = syncParamsFromUrl("https://api.example.com/admins?apikey=&page=1", [
+      redacted("apikey"),
+      pair("page", "1"),
+    ])
+
+    expect(synced.params.find((item) => item.key === "apikey")).toEqual(
+      expect.objectContaining({ value: "", redacted: true }),
+    )
+  })
+
+  it("drops the marker once a value is typed in", () => {
+    const synced = syncParamsFromUrl(`${BASE}?apikey=REAL`, [redacted("apikey")])
+
+    expect(synced.params.find((item) => item.key === "apikey")?.redacted).toBeUndefined()
+  })
+
+  it("drops the row entirely when the parameter is deleted from the url", () => {
+    const synced = syncParamsFromUrl(`${BASE}?page=1`, [redacted("apikey"), pair("page", "1")])
+
+    expect(synced.params.map((item) => item.key)).toEqual(["page"])
+  })
+
+  it("never invents a marker for a row that never had one", () => {
+    const synced = syncParamsFromUrl(`${BASE}?apikey=`, [pair("apikey", "")])
+
+    expect(synced.params[0].redacted).toBeUndefined()
+  })
+
+  /**
+   * Repeats are matched by position, not by name. `?tag=a&tag=` with only the
+   * second one blanked must not hand its marker to the first, and matching on
+   * name alone would do exactly that.
+   */
+  it("lines up repeats by occurrence rather than by name", () => {
+    const synced = syncParamsFromUrl(`${BASE}?tag=kept&tag=`, [
+      pair("tag", "kept"),
+      redacted("tag"),
+    ])
+
+    expect(synced.params.map((item) => [item.value, item.redacted])).toEqual([
+      ["kept", undefined],
+      ["", true],
+    ])
+  })
+
+  it("does not shift a marker onto a different key with the same position", () => {
+    const synced = syncParamsFromUrl(`${BASE}?other=`, [redacted("apikey")])
+
+    expect(synced.params).toEqual([expect.objectContaining({ key: "other", value: "" })])
+    expect(synced.params[0].redacted).toBeUndefined()
+  })
+
+  it("ignores disabled rows when lining up occurrences", () => {
+    // A disabled row is not in the url at all, so counting it would offset
+    // every match after it.
+    //
+    // The two rows must differ in the marker for this to prove anything: with
+    // both of them marked, counting the disabled one still lands on a marked
+    // row and the assertion holds either way. That version of this fixture
+    // existed first and let the mutation through.
+    const synced = syncParamsFromUrl(`${BASE}?apikey=`, [
+      { ...pair("apikey", ""), enabled: false },
+      redacted("apikey"),
+    ])
+
+    expect(synced.params[0]).toEqual(expect.objectContaining({ value: "", redacted: true }))
+  })
+})

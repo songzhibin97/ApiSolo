@@ -511,3 +511,99 @@ describe("§4 §9 §12 §13 §16 §18 the gate survives the body editor doing it
    * because the history side acknowledges the raw identity.
    */
 })
+
+/**
+ * The same fault as the body one, on the url side, found in implementation
+ * review. A tab opened from history keeps its query gate on the parameter row's
+ * marker, because the placeholder itself is stripped on load. Rebuilding those
+ * rows from the url text threw the marker away, so editing a completely
+ * unrelated part of the url — the path — dropped the gate on an empty API key
+ * and the save went through.
+ *
+ * The rule is the same one §5 states for the body: an edit elsewhere must not
+ * clear a field that is still blank.
+ */
+describe("editing an unrelated part of the url keeps the query gate", () => {
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+  })
+
+  function openedWithRedactedQuery() {
+    const tabs = useTabsStore()
+    tabs.openHistoryEntry({
+      id: "h-3",
+      method: "GET",
+      url: `https://api.example.com/users?apikey=${REDACTION_SENTINEL}&page=1`,
+      status: 200,
+      time: 10,
+      size: 10,
+      timestamp: "2026-03-27T10:00:00Z",
+      contentType: "application/json",
+      requestHeaders: [],
+      requestParams: [],
+      requestBodyType: "none",
+      requestBodyFormData: [],
+    } as HistoryEntry)
+    return tabs
+  }
+
+  it("the fixture starts out gated on the parameter row's marker", () => {
+    const tabs = openedWithRedactedQuery()
+    const row = tabs.activeTab.params.find((item) => item.key === "apikey")
+
+    // Self-check: if the placeholder were still in the url the gate would come
+    // from the url scan instead, and this whole test would prove nothing.
+    expect(tabs.activeTab.url).not.toContain(REDACTION_SENTINEL)
+    expect(row).toEqual(expect.objectContaining({ value: "", redacted: true }))
+    expect(pendingRefillFields(tabs.activeTab).map(identityTuple)).toEqual([
+      ["refill", "query", null, "apikey"],
+    ])
+  })
+
+  it("keeps the list, the notice and the disabled save after the path is edited", async () => {
+    const projects = useProjectsStore()
+    projects.activeProject = "My API"
+    const tabs = openedWithRedactedQuery()
+    const wrapper = mount(RequestPanel, { global: { plugins: [pinia] } })
+    await nextTick()
+
+    await wrapper
+      .findComponent(UrlBar)
+      .vm.$emit("update:url", "https://api.example.com/admins?apikey=&page=1")
+    await nextTick()
+
+    expect(pendingRefillFields(tabs.activeTab).map(identityTuple)).toEqual([
+      ["refill", "query", null, "apikey"],
+    ])
+    expect(wrapper.find("[data-testid=\"history-redacted-banner\"]").exists()).toBe(true)
+
+    const save = wrapper.findAll("button").find((b) => b.text().includes("request.save"))
+    await save!.trigger("click")
+    expect(
+      (wrapper.find("[data-testid=\"request-save-submit\"]").element as HTMLButtonElement).disabled,
+    ).toBe(true)
+  })
+
+  /**
+   * A positive control, not an independently load-bearing assertion, and
+   * labelled as one rather than counted twice. `needsRefill` already requires an
+   * empty value, so carrying the marker forward too eagerly cannot make this go
+   * red — the mutation that does is
+   * "drops the marker once a value is typed in" in url-params.test.ts. What this
+   * rules out is the gate getting permanently stuck, which the two tests above
+   * would not notice.
+   */
+  it("releases the gate once the value is actually typed back in", async () => {
+    const tabs = openedWithRedactedQuery()
+    const wrapper = mount(RequestPanel, { global: { plugins: [pinia] } })
+    await nextTick()
+
+    await wrapper
+      .findComponent(UrlBar)
+      .vm.$emit("update:url", "https://api.example.com/admins?apikey=REAL&page=1")
+    await nextTick()
+
+    expect(pendingRefillFields(tabs.activeTab)).toEqual([])
+  })
+})

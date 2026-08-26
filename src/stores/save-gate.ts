@@ -7,10 +7,11 @@ import { identityTuple, type PendingField } from "../utils/pending-refill"
  * Identifies a set of pending fields by what is pending, not by which button
  * asked. A field's identity is four components -- `kind`, `source`, `slot` and
  * `name` -- and nothing else; `name` is the raw position, so the signature does
- * not move when the interface language does. A different request produces a
- * different signature and has to be acknowledged on its own: a single global
- * "yes" would let the second request through unannounced, which is the failure
- * this gate exists to stop.
+ * not move when the interface language does. A different pending list produces
+ * a different signature and has to be acknowledged on its own: a single global
+ * "yes" would let the next list through unannounced, which is the failure this
+ * gate exists to stop. Two requests whose pending fields are identical do share
+ * one acknowledgement -- what is confirmed is the list, not the request.
  *
  * Two entry points looking at the same request produce the same list and
  * therefore the same signature. That sentence stood here while it was false:
