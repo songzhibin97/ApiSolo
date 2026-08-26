@@ -543,13 +543,31 @@ describe("§19 every source value has wording in both locales", () => {
 })
 
 describe("§20 the two nameless fallbacks read as sentences, not placeholders", () => {
-  const unnamedBinary: PendingField = { kind: "reselect-file", source: "binary", name: "" }
-  const unnamedApiKey: PendingField = {
-    kind: "refill",
-    source: "auth",
-    slot: "api-key",
-    name: "",
+  /**
+   * Both fixtures come out of `pendingRefillFields`, not out of an object
+   * literal. Hand-built ones assert only that the renderer handles an empty
+   * `name` -- they say nothing about whether the two producers still hand it
+   * one. Both producers used to put an English word there instead, and putting
+   * that word back survived a fixture written by hand.
+   */
+  function onlyPendingField(source: PendingRefillSource): PendingField {
+    const fields = pendingRefillFields(source)
+
+    if (fields.length !== 1) {
+      throw new Error(`fixture produced ${fields.length} pending fields, expected exactly 1`)
+    }
+
+    return fields[0]
   }
+
+  const unnamedBinary = onlyPendingField(
+    request({ body: body({ type: "binary", binaryPath: "", binaryContent: undefined }) }),
+  )
+  const unnamedApiKey = onlyPendingField(
+    request({
+      auth: { type: "api-key", apiKey: { key: "", value: "", addTo: "header" } } as AuthConfig,
+    }),
+  )
 
   it("names a binary body with no file name", () => {
     expect(formatPendingField(unnamedBinary, translator("en"))).toBe("Body · no file selected")
