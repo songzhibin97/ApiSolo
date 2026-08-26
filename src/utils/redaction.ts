@@ -807,14 +807,22 @@ export function isUnverifiableBody(kind: BodyKind, content: string): boolean {
 }
 
 /**
- * Clearing the marker is tied to the value alone. Toggling `enabled`, editing
- * the key or the description must keep it — otherwise the row goes back to
- * looking normal while still holding no value.
+ * The marker is cleared only when the value becomes non-empty. Toggling
+ * `enabled`, editing the key or the description must keep it — otherwise the row
+ * goes back to looking normal while still holding no value — and so must an edit
+ * that leaves the value empty, for exactly the same reason: an empty credential
+ * is still empty after someone has clicked into its box.
+ *
+ * What this does not recover: typing into a marked row and then deleting what
+ * was typed. The marker was legitimately cleared on the first keystroke and
+ * nothing brings it back, so that row ends up blank and ungated. Restoring it
+ * needs a per-row record of "this was blanked" that outlives the value itself,
+ * which is more state than this function is given.
  */
 export function applyPairEdit<T extends KeyValuePair>(rows: T[], id: string, patch: Partial<T>): T[] {
+  const becomesNonEmpty = patch.value !== undefined && patch.value !== ""
+
   return rows.map((row) =>
-    row.id === id
-      ? { ...row, ...patch, ...("value" in patch ? { redacted: false } : {}) }
-      : row,
+    row.id === id ? { ...row, ...patch, ...(becomesNonEmpty ? { redacted: false } : {}) } : row,
   )
 }

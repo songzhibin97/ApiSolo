@@ -319,9 +319,18 @@ describe("§13 a draft never leaks across tabs", () => {
  * only thing left holding the save gate — the placeholder itself is stripped
  * when the tab loads. Rebuilding the rows from the url text used to discard it,
  * so editing the path was enough to let an empty credential be saved with no
- * warning. Each rebuilt row is now reconciled back to the row it came from —
- * same value first, then in order — and inherits the marker only if it matched
- * a marked row and is still blank.
+ * warning. The marker now travels by key rather than by row: if any blank row
+ * of a key is still marked, every blank row of that key in the rebuilt list is
+ * marked. Row identity is reused only where it is unambiguous — key and a
+ * non-empty value both still present — so blank rows are deliberately not
+ * matched at all and simply get a fresh handle.
+ *
+ * Reading this as a per-row rule is how the rejected versions were written.
+ * Matching blank rows to marked ones by order, by ordinal among same-named
+ * keys, or by anything else answers "which blank `apikey` is the blanked one",
+ * and a url holds no fact that decides it: the marker lands on a row the user
+ * just added, and filling in the value that really was blanked leaves the
+ * notice up on a complete request.
  */
 describe("rebuilding params from the url keeps a still-blank row's marker", () => {
   const redacted = (key: string): KeyValuePair => ({

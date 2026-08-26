@@ -53,6 +53,14 @@ describe("§3 redacted marker lifecycle", () => {
   it("clears the marker when value changes", () => {
     expect(applyPairEdit(marked, "Cookie-1", { value: "sid=1" })[0].redacted).toBe(false)
   })
+
+  // Touching the box is not filling it in. A rule keyed on "was the value part
+  // of this edit" rather than on what the value became lets a click-in,
+  // click-out — or a paste of nothing — drop the gate on a row that still holds
+  // no credential.
+  it("keeps the marker when the value is edited to empty", () => {
+    expect(applyPairEdit(marked, "Cookie-1", { value: "" })[0].redacted).toBe(true)
+  })
 })
 
 describe("§4 clearing a body says which keys it emptied", () => {
