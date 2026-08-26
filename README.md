@@ -161,6 +161,15 @@ Release expectations:
 - An upload over the cap fails with an error instead of being truncated: ApiSolo never sends a truncated request body. Each binary body or form-data file part may be at most 16 MiB after decoding, and the file picker refuses oversized files up front.
 - The dev bridge has an explicit inbound request-body cap (64 MiB) instead of inheriting the HTTP library's default, so `dev:web` and the packaged app give the same result for the same upload.
 
+## Known issues
+
+- **The "reveal secret value" button in the environment panel is off-screen at the default sidebar width, and whether you can drag it into view depends on your window width.** That button sits in the variable table's header row, which does not scroll horizontally with the content — so once the sidebar edge clips it, **scrolling does not help**; only widening the sidebar does. Whether widening is enough depends on the window:
+  - Window width **≥ ~1215px**: dragging the sidebar close to its rightmost position reveals the button in full.
+  - Window width **~1130–1215px**: dragging all the way right yields only a squashed button (roughly 15–31px — clickable, but visibly not full size).
+  - Window width **< ~1130px** (including 1024×768): **no amount of dragging reveals it**; the entry point is unreachable until this is fixed.
+
+  The "secret" toggle and the delete button in the same table are likewise outside the visible area at the default width, but they live in the horizontally scrollable list area, so **scrolling does reach them**. Secret values themselves are unaffected: they still resolve normally when a request is sent — what is unreachable is the read-only "show me what it is" entry point.
+
 ## License
 
 Apache-2.0. See [LICENSE](./LICENSE).
