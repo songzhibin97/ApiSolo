@@ -52,7 +52,6 @@ export default {
     urlRequired: "请输入请求 URL",
     historyRedactedBanner:
       "此请求来自历史记录，以下内容在保存时已被脱敏，需要重新填写：{fields}。留空则按空值发送。",
-    historyRedactedBody: "请求体",
     containsVariables: "包含变量：",
     params: "参数",
     headers: "请求头",
@@ -234,6 +233,8 @@ export default {
     saveToCollection: "保存到集合",
     saveNeedsProject: "先选择一个项目，集合保存在项目里。",
     refillTitle: "以下 {count} 个字段在历史中已脱敏，保存后为空，需要重新填写：",
+    refillUnparseableBody:
+      "请求体不是合法 JSON，无法确认其中 {count} 个已脱敏的字段是否已经重新填写。把请求体改成合法 JSON，或换一个请求体类型，这条提示就会消失。",
     reselectFileTitle: "以下 {count} 个文件需要重新选择——历史不保存文件内容：",
     refillAck: "我知道保存下来的请求需要重填这些字段",
     deleteEntry: "删除这条记录",
@@ -249,6 +250,22 @@ export default {
     thisWeek: "本周",
     thisMonth: "本月",
     older: "更早",
+  },
+  // Names for the structural positions a pending field can sit in. Kept apart
+  // from the request panel's own section labels on purpose: those are tab
+  // titles, and reusing them would mean renaming a tab silently rewrote every
+  // field path. The wording matches the auth editor's, the keys do not.
+  pendingField: {
+    sourceHeader: "请求头",
+    sourceQuery: "查询参数",
+    sourceForm: "表单",
+    sourceBody: "请求体",
+    sourceAuth: "认证",
+    authBasicPassword: "Basic 密码",
+    authBearerToken: "Bearer 令牌",
+    authApiKeyNamed: "API Key {key}",
+    authApiKeyUnnamed: "API Key（未填键名）",
+    binaryBodyUnnamed: "未选择文件",
   },
   environment: {
     selectProjectFirst: "请先选择项目",

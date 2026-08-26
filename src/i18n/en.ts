@@ -53,7 +53,6 @@ export default {
     urlRequired: "Please enter a request URL",
     historyRedactedBanner:
       "This request came from history. These were redacted when it was saved and need re-entering: {fields}. Left empty, they are sent empty.",
-    historyRedactedBody: "request body",
     containsVariables: "Contains variables:",
     params: "Params",
     headers: "Headers",
@@ -236,6 +235,8 @@ export default {
     saveNeedsProject: "Select a project first — collections live inside a project.",
     refillTitle:
       "These {count} fields were redacted in history and will be saved empty. They must be re-entered:",
+    refillUnparseableBody:
+      "The request body is not valid JSON, so ApiSolo cannot tell whether the {count} redacted fields in it have been re-entered. Make the body valid JSON, or switch the body type, and this notice goes away.",
     reselectFileTitle:
       "These {count} files must be re-selected — history does not store file contents:",
     refillAck: "I understand the saved request needs these fields re-entered",
@@ -253,6 +254,25 @@ export default {
     thisWeek: "This Week",
     thisMonth: "This Month",
     older: "Older",
+  },
+  // Names for the structural positions a pending field can sit in. Kept apart
+  // from the request panel's own section labels on purpose: those are tab
+  // titles, and reusing them would mean renaming a tab silently rewrote every
+  // field path.
+  pendingField: {
+    sourceHeader: "Header",
+    sourceQuery: "Query",
+    sourceForm: "Form",
+    sourceBody: "Body",
+    sourceAuth: "Auth",
+    authBasicPassword: "Basic password",
+    authBearerToken: "Bearer token",
+    authApiKeyNamed: "API key {key}",
+    authApiKeyUnnamed: "API key (no key name)",
+    // Deliberately not the words the code used to hard-code: if this read
+    // "binary body" an English assertion would pass whether or not the
+    // fallback was wired up at all.
+    binaryBodyUnnamed: "no file selected",
   },
   environment: {
     selectProjectFirst: "Select a project first",

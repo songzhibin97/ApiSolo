@@ -1,7 +1,20 @@
 import type { AuthConfig, KeyValuePair, RequestBody } from "../types"
-import { REDACTION_SENTINEL, bodyKindFromBodyType, sentinelBodyFields } from "./redaction"
+import {
+  REDACTION_SENTINEL,
+  bodyKindFromBodyType,
+  isUnverifiableBody,
+  remainingRedactedBodyFields,
+  sentinelBodyFields,
+} from "./redaction"
 
-export type PendingKind = "refill" | "reselect-file"
+/**
+ * `refill-unverifiable` is its own class rather than a flag beside the list: it
+ * has to travel with the fields so that both save entry points describe the
+ * same request the same way. A flag returned alongside would only exist on the
+ * panel side, the two signatures would diverge, and the user would be asked to
+ * confirm the same request twice.
+ */
+export type PendingKind = "refill" | "reselect-file" | "refill-unverifiable"
 export type PendingSource = "header" | "query" | "form" | "body" | "auth" | "file" | "binary"
 export type NonAuthSource = Exclude<PendingSource, "auth">
 
@@ -51,39 +64,76 @@ export interface PendingRefillSource {
   params: KeyValuePair[]
   body: RequestBody
   auth: AuthConfig
-  bodyRedacted?: boolean
+  bodyRedactedFields?: string[]
 }
 
-const SOURCE_LABEL: Record<PendingSource, string> = {
-  header: "Header",
-  query: "Query",
-  form: "Form",
-  body: "Body",
-  auth: "Auth",
-  file: "Form",
-  binary: "Body",
+/**
+ * `Record`, not `Partial`: adding a source without giving it a word stops
+ * compiling rather than reaching a screen as a raw key.
+ */
+const SOURCE_KEY: Record<PendingSource, string> = {
+  header: "pendingField.sourceHeader",
+  query: "pendingField.sourceQuery",
+  form: "pendingField.sourceForm",
+  body: "pendingField.sourceBody",
+  auth: "pendingField.sourceAuth",
+  file: "pendingField.sourceForm",
+  binary: "pendingField.sourceBody",
 }
 
-const AUTH_SLOT_LABEL: Record<AuthSlot, string> = {
-  "basic-password": "Basic password",
-  "bearer-token": "Bearer token",
-  "api-key": "API key",
+const AUTH_SLOT_KEY: Record<AuthSlot, string> = {
+  "basic-password": "pendingField.authBasicPassword",
+  "bearer-token": "pendingField.authBearerToken",
+  "api-key": "pendingField.authApiKeyNamed",
+}
+
+const GROUP_TITLE_KEY: Record<PendingKind, string> = {
+  refill: "history.refillTitle",
+  "refill-unverifiable": "history.refillUnparseableBody",
+  "reselect-file": "history.reselectFileTitle",
+}
+
+export type TranslateFn = (key: string, named?: Record<string, unknown>) => string
+
+export function pendingGroupTitleKey(kind: PendingKind): string {
+  return GROUP_TITLE_KEY[kind]
+}
+
+function positionName(
+  source: PendingSource,
+  slot: AuthSlot | null,
+  name: string,
+  t: TranslateFn,
+): string {
+  if (slot === "api-key") {
+    return name ? t(AUTH_SLOT_KEY[slot], { key: name }) : t("pendingField.authApiKeyUnnamed")
+  }
+
+  if (slot) {
+    return t(AUTH_SLOT_KEY[slot])
+  }
+
+  // Names the user wrote are shown as written; only structural positions are
+  // translated. The binary body has no user-supplied name to show when history
+  // kept no file name for it.
+  if (source === "binary" && !name) {
+    return t("pendingField.binaryBodyUnnamed")
+  }
+
+  return name
 }
 
 /**
  * The only place a pending entry turns into text on screen. A bare field name
  * cannot be located -- `password` can be a header, a form row and a JSON key on
  * the same request -- so the position is spelled out here rather than stored on
- * the field.
+ * the field, where it would follow the acknowledgement around and break it on a
+ * language switch.
  */
-export function formatPendingField(f: PendingField): string {
+export function formatPendingField(f: PendingField, t: TranslateFn): string {
   const [, source, slot, name] = identityTuple(f)
 
-  if (slot === "api-key") {
-    return `${SOURCE_LABEL[source]} · ${AUTH_SLOT_LABEL[slot]} ${name || "value"}`
-  }
-
-  return `${SOURCE_LABEL[source]} · ${slot ? AUTH_SLOT_LABEL[slot] : name}`
+  return `${t(SOURCE_KEY[source])} · ${positionName(source, slot, name, t)}`
 }
 
 function field(kind: PendingKind, source: NonAuthSource, name: string): PendingField {
@@ -181,14 +231,26 @@ function bodyFields(source: PendingRefillSource): PendingField[] {
     return []
   }
 
-  const named = sentinelBodyFields(bodyKindFromBodyType(body.type), body.content)
+  const kind = bodyKindFromBodyType(body.type)
+  // A property of the body text, worked out once and stamped on whichever
+  // branch below produces the names. Deciding it per branch would give the two
+  // save entry points different answers for the same request.
+  const pendingKind: PendingKind = isUnverifiableBody(kind, body.content)
+    ? "refill-unverifiable"
+    : "refill"
+
+  const named = sentinelBodyFields(kind, body.content)
   if (named.length > 0) {
-    return named.map((name) => field("refill", "body", name))
+    return named.map((name) => field(pendingKind, "body", name))
   }
 
-  // Replaying already stripped the placeholders out of the body text, so the
-  // individual key names are gone and only the marker survives.
-  return source.bodyRedacted ? [field("refill", "body", "request body")] : []
+  // Replay already stripped the placeholders out of the body text, so the keys
+  // cannot be found there any more. They were written down when they were
+  // cleared; which of them still need typing back in is decided by what the
+  // body holds now, not by whether anything has been edited since.
+  return remainingRedactedBodyFields(kind, body.content, source.bodyRedactedFields ?? []).map(
+    (name) => field(pendingKind, "body", name),
+  )
 }
 
 /**
@@ -205,7 +267,9 @@ function fileFields(body: RequestBody): PendingField[] {
   }
 
   if (body.type === "binary" && !body.binaryContent) {
-    return [field("reselect-file", "binary", body.binaryPath || "binary body")]
+    // No fallback word here: an empty name is the fact, and the renderer is
+    // where it turns into something the user can read in their own language.
+    return [field("reselect-file", "binary", body.binaryPath)]
   }
 
   return []
@@ -250,6 +314,25 @@ export function refillFields(fields: PendingField[]): PendingField[] {
   return fields.filter((item) => item.kind === "refill")
 }
 
+export function unverifiableFields(fields: PendingField[]): PendingField[] {
+  return fields.filter((item) => item.kind === "refill-unverifiable")
+}
+
 export function reselectFileFields(fields: PendingField[]): PendingField[] {
   return fields.filter((item) => item.kind === "reselect-file")
+}
+
+/**
+ * What the always-on notice above the request says. It is the save gate's own
+ * list minus the files, so the two cannot contradict each other -- they used to
+ * be derived separately, and by the time anyone looked the gate was holding
+ * saves for a blanked Bearer token that the notice never mentioned.
+ *
+ * Files are left out on a criterion, not for convenience: a dropped upload
+ * already shows as "no file selected" in the body editor, so the notice would
+ * be repeating a message the screen is carrying. A blanked auth slot or body
+ * key has nothing on screen pointing at it.
+ */
+export function bannerFields(fields: PendingField[]): PendingField[] {
+  return fields.filter((item) => item.kind !== "reselect-file")
 }

@@ -11,8 +11,7 @@ import { isUntitledTabLabel, useTabsStore } from "../../stores/tabs";
 import { flattenCollectionFolders } from "../../utils/collection-options";
 import { exportCurl } from "../../utils/curl-export";
 import { parseCurl } from "../../utils/curl-parser";
-import { pendingRefillFields } from "../../utils/pending-refill";
-import { hasPendingRedactedFields, pendingRedactedFieldNames } from "../../utils/redaction";
+import { bannerFields, formatPendingField, pendingRefillFields } from "../../utils/pending-refill";
 import { buildSavedRequest } from "../../utils/saved-request";
 import { buildUrlWithParams, syncParamsFromUrl } from "../../utils/url-params";
 import AuthEditor from "../request/AuthEditor.vue";
@@ -65,13 +64,6 @@ const sections = computed(() => {
   ];
 });
 
-const redactedFieldLabels = computed(() =>
-  [
-    ...pendingRedactedFieldNames(activeTab.value),
-    ...(activeTab.value.bodyRedacted ? [t("request.historyRedactedBody")] : []),
-  ].join(", "),
-);
-
 const collectionOptions = computed(() => [
   { label: t("common.rootCollection"), value: "" },
   ...flattenCollectionFolders(collectionTree.value),
@@ -85,6 +77,18 @@ const collectionOptions = computed(() => [
  */
 const pendingFields = computed(() => pendingRefillFields(activeTab.value));
 const saveBlocked = computed(() => saveGate.blocksSave(pendingFields.value));
+
+/**
+ * The always-on notice reads the save gate's own list. It used to derive the
+ * same fact separately, and the two had drifted: the gate would hold a save for
+ * a blanked Bearer token while the notice said nothing at all, and the user's
+ * next move is Send, not Save. One derivation means they cannot disagree —
+ * whether the notice appears and what it says now change together.
+ */
+const noticeFields = computed(() => bannerFields(pendingFields.value));
+const redactedFieldLabels = computed(() =>
+  noticeFields.value.map((field) => formatPendingField(field, t)).join(", "),
+);
 
 function countEnabled(items: KeyValuePair[]) {
   return items.filter((item) => item.enabled && (item.key || item.value)).length;
@@ -160,9 +164,14 @@ function updateHeaders(headers: KeyValuePair[]) {
   updateActiveTab({ headers });
 }
 
+// No bookkeeping here on purpose. This used to clear the redaction marker
+// whenever the body text changed, which meant the body editor reformatting a
+// compact JSON payload for display wiped the gate — the values were untouched,
+// but the record of what had been blanked was gone. Nothing outside
+// `openHistoryEntry` writes that record any more; what still needs re-entering
+// is recomputed from the body each time it is asked.
 function updateBody(body: RequestBody) {
-  const contentChanged = body.content !== activeTab.value.body.content;
-  updateActiveTab({ body, ...(contentChanged ? { bodyRedacted: false } : {}) });
+  updateActiveTab({ body });
 }
 
 function updateAuth(auth: AuthConfig) {
@@ -363,7 +372,8 @@ onUnmounted(() => {
     />
 
     <div
-      v-if="hasPendingRedactedFields(activeTab)"
+      v-if="noticeFields.length > 0"
+      data-testid="history-redacted-banner"
       class="border-b border-amber-500/40 bg-amber-500/10 px-4 py-2 text-sm text-amber-300"
     >
       {{ t("request.historyRedactedBanner", { fields: redactedFieldLabels }) }}

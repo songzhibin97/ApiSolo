@@ -1,7 +1,8 @@
 // @vitest-environment happy-dom
 import { beforeEach, describe, expect, it, vi } from "vitest"
-import { shallowMount } from "@vue/test-utils"
+import { mount, shallowMount } from "@vue/test-utils"
 import { createPinia, setActivePinia } from "pinia"
+import { nextTick } from "vue"
 
 // Partial: the store chain pulls in src/i18n/index.ts, which needs the real
 // createI18n. Only the composable is replaced, so `t` is observable.
@@ -18,12 +19,7 @@ import { useProjectsStore } from "../../stores/projects"
 import { useSaveGateStore } from "../../stores/save-gate"
 import { useTabsStore } from "../../stores/tabs"
 import { historyEntryToRequest } from "../../utils/history-to-request"
-import {
-  formatPendingField,
-  identityTuple,
-  pendingRefillFields,
-  type PendingField,
-} from "../../utils/pending-refill"
+import { identityTuple, pendingRefillFields, type PendingField } from "../../utils/pending-refill"
 import { REDACTION_SENTINEL } from "../../utils/redaction"
 import type { AuthConfig, HistoryEntry, KeyValuePair } from "../../types"
 
@@ -257,14 +253,16 @@ describe("§6 the existing save button is gated by the same check as the new one
   })
 
   /**
-   * The one class where the two lists differ, written down rather than left to
-   * be discovered. Replay clears the placeholders out of the body text, so by
-   * the time a tab exists the individual key names are gone and only a marker
-   * survives; a history row still has them. Both lists name the body and both
-   * hold the save, so the gate works from either side — but the acknowledgement
-   * does not carry across for this class, and the user confirms twice.
+   * This used to be the one documented class where the two lists disagreed:
+   * replay emptied the body text, the key names went with it, and the panel
+   * could only report a catch-all "request body" entry — so the same request
+   * had two signatures and had to be confirmed twice.
+   *
+   * D11 removes the exception rather than restating it. The fix is not to make
+   * the panel guess: the key names are written down at the moment they are
+   * emptied, so both sides can name the same key.
    */
-  it("names body fields less precisely once the request has been replayed", async () => {
+  it("names the same body key from either entry point", async () => {
     const projects = useProjectsStore()
     projects.activeProject = "My API"
     const source = entry({
@@ -281,9 +279,235 @@ describe("§6 the existing save button is gated by the same check as the new one
     await openSaveDialog(wrapper)
 
     const fromPanel = wrapper.findComponent(PendingRefillNotice).props("fields") as PendingField[]
-    expect(fromPanel.map(formatPendingField)).toEqual(["Body · request body"])
-    expect(
-      pendingRefillFields(historyEntryToRequest(source)).map(formatPendingField),
-    ).toEqual(["Body · password"])
+
+    expect(fromPanel.map(identityTuple)).toEqual([["refill", "body", null, "password"]])
+    expect(pendingRefillFields(historyEntryToRequest(source)).map(identityTuple)).toEqual(
+      fromPanel.map(identityTuple),
+    )
   })
+
+  it("carries one acknowledgement across both entry points for a body field", async () => {
+    const projects = useProjectsStore()
+    projects.activeProject = "My API"
+    const source = entry({
+      requestHeaders: [],
+      url: "https://api.example.com/users",
+      requestAuth: undefined,
+      requestBodyType: "json",
+      requestBodyContent: `{"password":"${REDACTION_SENTINEL}"}`,
+    })
+    const tabs = useTabsStore()
+    tabs.openHistoryEntry(source)
+    const gate = useSaveGateStore()
+
+    // Acknowledged on the history side, where the row still holds the
+    // placeholder. The panel must accept it without asking again.
+    gate.acknowledge(pendingRefillFields(historyEntryToRequest(source)))
+
+    const wrapper = mountPanel()
+    await openSaveDialog(wrapper)
+
+    expect(
+      (wrapper.find("[data-testid=\"request-save-submit\"]").element as HTMLButtonElement).disabled,
+    ).toBe(false)
+  })
+})
+
+/**
+ * These mount for real rather than stubbing the children, and that is the whole
+ * point of them. The defect this slice fixes lived in the body editor's own
+ * startup behaviour — it reformats a compact JSON payload for display — and
+ * under `shallowMount` that component is never instantiated, so the existing
+ * suite stayed green through an entire release while the gate was gone in the
+ * browser.
+ *
+ * Assertions stay inside the component whitelist: props handed to children,
+ * whether a `v-if` block exists, how many `v-for` rows it has, and the disabled
+ * binding. No DOM text is asserted here; the wording is a pure function's
+ * return value and is checked as one.
+ */
+describe("§4 §9 §12 §13 §16 §18 the gate survives the body editor doing its job", () => {
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+  })
+
+  function historyWithCompactJson(overrides: Partial<HistoryEntry> = {}): HistoryEntry {
+    return {
+      id: "h-2",
+      method: "POST",
+      url: "https://api.example.com/users",
+      status: 200,
+      time: 10,
+      size: 10,
+      timestamp: "2026-03-27T10:00:00Z",
+      contentType: "application/json",
+      requestHeaders: [],
+      requestParams: [],
+      requestBodyType: "json",
+      // Compact on purpose: the editor reformats it on mount, which is the
+      // write that used to wipe the record of what had been blanked.
+      requestBodyContent: `{"token":"${REDACTION_SENTINEL}","keep":"v"}`,
+      requestBodyFormData: [],
+      ...overrides,
+    } as HistoryEntry
+  }
+
+  function mountFull() {
+    return mount(RequestPanel, { global: { plugins: [pinia] } })
+  }
+
+  async function openSaveDialog(wrapper: ReturnType<typeof mountFull>) {
+    const save = wrapper.findAll("button").find((b) => b.text().includes("request.save"))
+    expect(save, "the save button is not rendered").toBeDefined()
+    await save!.trigger("click")
+  }
+
+  it("the fixture really is reformatted by the editor, not left alone", async () => {
+    // P6/P12: without this the two tests below would also pass on a payload the
+    // editor never touches — the safe shape the defect happens to miss.
+    const tabs = useTabsStore()
+    const source = historyWithCompactJson()
+    tabs.openHistoryEntry(source)
+    const afterLoad = tabs.activeTab.body.content
+
+    mountFull()
+    await nextTick()
+
+    expect(afterLoad).toBe(`{"token":"","keep":"v"}`)
+    expect(tabs.activeTab.body.content).not.toBe(afterLoad)
+    expect(tabs.activeTab.body.content).toContain("\n")
+  })
+
+  it("§4 keeps the body field pending after the editor reformats the body", async () => {
+    const projects = useProjectsStore()
+    projects.activeProject = "My API"
+    const tabs = useTabsStore()
+    tabs.openHistoryEntry(historyWithCompactJson())
+
+    const wrapper = mountFull()
+    await nextTick()
+    await openSaveDialog(wrapper)
+
+    const fields = wrapper.findComponent(PendingRefillNotice).props("fields") as PendingField[]
+
+    expect(fields.map(identityTuple)).toEqual([["refill", "body", null, "token"]])
+    expect(
+      (wrapper.find("[data-testid=\"request-save-submit\"]").element as HTMLButtonElement).disabled,
+    ).toBe(true)
+  })
+
+  /**
+   * Two directions, not one. The editor's reformat is driven by a watch on the
+   * selected body type, so opening a JSON request from a tab that was already
+   * JSON does not fire it — before the fix, that path kept its gate and the
+   * other lost it. A single case would land on one of the two at random.
+   */
+  it.each([
+    ["none", "none"],
+    ["json", `{"a":1}`],
+  ])("§9 holds the gate when the previous tab's body was %s", async (type, content) => {
+    const projects = useProjectsStore()
+    projects.activeProject = "My API"
+    const tabs = useTabsStore()
+    tabs.updateTab(tabs.activeTab.id, {
+      body: { ...tabs.activeTab.body, type: type as never, content },
+    })
+
+    const wrapper = mountFull()
+    await nextTick()
+    tabs.openHistoryEntry(historyWithCompactJson())
+    await nextTick()
+    await openSaveDialog(wrapper)
+
+    const fields = wrapper.findComponent(PendingRefillNotice).props("fields") as PendingField[]
+
+    expect(fields.map(identityTuple)).toEqual([["refill", "body", null, "token"]])
+  })
+
+  it("§10 §11 shows the standing notice for a blanked auth slot", async () => {
+    const tabs = useTabsStore()
+    tabs.openHistoryEntry(
+      historyWithCompactJson({
+        requestBodyType: "none",
+        requestBodyContent: undefined,
+        requestAuth: { type: "bearer", bearer: { token: "" } } as AuthConfig,
+      }),
+    )
+
+    const wrapper = mountFull()
+    await nextTick()
+
+    // The gate alone cannot save this user: it only speaks when they press
+    // Save, and their next move is Send.
+    expect(wrapper.find("[data-testid=\"history-redacted-banner\"]").exists()).toBe(true)
+  })
+
+  it("§12 shows no standing notice for a request with nothing pending", async () => {
+    const tabs = useTabsStore()
+    tabs.updateTab(tabs.activeTab.id, { url: "https://api.example.com/ok" })
+
+    const wrapper = mountFull()
+    await nextTick()
+
+    expect(wrapper.find("[data-testid=\"history-redacted-banner\"]").exists()).toBe(false)
+  })
+
+  it("§10 shows no standing notice when only a file needs re-picking", async () => {
+    const tabs = useTabsStore()
+    tabs.openHistoryEntry(
+      historyWithCompactJson({
+        requestBodyType: "binary",
+        requestBodyContent: undefined,
+        requestBodyBinaryPath: "photo.png",
+      }),
+    )
+
+    const wrapper = mountFull()
+    await nextTick()
+
+    // The body editor already says "no file selected"; repeating it here would
+    // be the notice restating what the screen is carrying.
+    expect(wrapper.find("[data-testid=\"history-redacted-banner\"]").exists()).toBe(false)
+  })
+
+  it("§13 §16 saves a url and values with no placeholder left in them", async () => {
+    const projects = useProjectsStore()
+    projects.activeProject = "My API"
+    const saveRequest = vi.spyOn(projects, "saveRequest").mockResolvedValue(undefined)
+    const tabs = useTabsStore()
+    tabs.openHistoryEntry(
+      historyWithCompactJson({
+        url: `https://api.example.com/users?apikey=${REDACTION_SENTINEL}&page=1`,
+      }),
+    )
+    const gate = useSaveGateStore()
+
+    const wrapper = mountFull()
+    await nextTick()
+    await openSaveDialog(wrapper)
+
+    gate.acknowledge(wrapper.findComponent(PendingRefillNotice).props("fields") as PendingField[])
+    await nextTick()
+    await wrapper.find("[data-testid=\"request-save-submit\"]").trigger("click")
+
+    expect(saveRequest).toHaveBeenCalledTimes(1)
+    const saved = JSON.stringify(saveRequest.mock.calls[0])
+    expect(saved).not.toContain(REDACTION_SENTINEL)
+  })
+
+  /**
+   * §18 is not asserted here. This file replaces `useI18n` with a passthrough
+   * stub, so rendered text is the message key and does not move when the locale
+   * does — a language-switch assertion in this file could not fail and would be
+   * a comment wearing an assertion's clothes.
+   *
+   * It is covered where real messages are available: `pending-refill.test.ts`
+   * shows the display text changing with the locale while the identity does
+   * not, and `save-gate.test.ts` shows the gate keyed on the identity. The
+   * wiring half — this panel passing raw fields to the gate rather than fields
+   * with display text glued into them — is what
+   * "carries one acknowledgement across both entry points" above catches,
+   * because the history side acknowledges the raw identity.
+   */
 })

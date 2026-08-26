@@ -38,10 +38,10 @@ import {
   useRequestStore,
 } from "../request"
 import { useTabsStore } from "../tabs"
+import { pendingRefillFields } from "../../utils/pending-refill"
 import {
   REDACTION_SENTINEL,
   findSentinelFields,
-  hasPendingRedactedFields,
   sanitizeHistoryEntry,
 } from "../../utils/redaction"
 import type { HistoryEntry, HttpResponse, KeyValuePair, SavedRequest, Tab } from "../../types"
@@ -1020,7 +1020,10 @@ describe("credentials under non-sensitive field names", () => {
 
       expect(opened.body.content).toBe(content)
       expect(opened.headers[0].value).toBe("password: hunter2")
-      expect(hasPendingRedactedFields(opened)).toBe(false)
+      // Nothing about this request was redacted, so nothing may be listed as
+      // pending. Asking for the whole list rather than a boolean makes a false
+      // positive name itself instead of just flipping a flag.
+      expect(pendingRefillFields(opened)).toEqual([])
       expect(findSentinelFields(opened)).toEqual([])
 
       await requestStore.sendRequest(opened)

@@ -116,7 +116,12 @@ export function buildSavedRequestFromHistory(entry: HistoryEntry, name: string):
   )
 }
 
-function clearUrlSentinels(rawUrl: string): string {
+/**
+ * Shared with the tab loader rather than written twice: a placeholder must
+ * never reach a collection file, and both entry points have to strip it from
+ * the same place or one of them will drift.
+ */
+export function clearUrlSentinels(rawUrl: string): string {
   const hashIndex = rawUrl.indexOf("#")
   const hash = hashIndex === -1 ? "" : rawUrl.slice(hashIndex)
   const before = hashIndex === -1 ? rawUrl : rawUrl.slice(0, hashIndex)

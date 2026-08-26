@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest"
 import { createPinia, setActivePinia } from "pinia"
 
 import { useSaveGateStore } from "../save-gate"
-import { formatPendingField, type PendingField } from "../../utils/pending-refill"
+import { identityTuple, type PendingField, type PendingSource } from "../../utils/pending-refill"
 
 beforeEach(() => {
   setActivePinia(createPinia())
@@ -21,16 +21,41 @@ function merges(a: PendingField[], b: PendingField[]): boolean {
 }
 
 /**
- * The encoding this slice replaced: three components joined with `|`, where the
- * third was the display text. It is reconstructed here because the production
- * copy is gone, and it is reconstructed *out of the current renderer* rather
- * than from memory -- `formatPendingField` still produces the same text the old
- * `path` field held, which the first test below pins down before anything else
- * relies on it.
+ * A frozen copy of the encoding this slice replaced: three components joined
+ * with `|`, the third being the display text.
+ *
+ * It is written out here rather than derived from the current renderer because
+ * the renderer's output is deliberately different now -- the labels are
+ * localized. It was checked against the live renderer, string for string, in
+ * 32705ac, the commit that introduced this file while the old text was still
+ * being produced. From here on it is a historical constant and must not be
+ * updated to follow the renderer: that is the whole point of comparing to it.
  */
+const LEGACY_SOURCE_LABEL: Record<PendingSource, string> = {
+  header: "Header",
+  query: "Query",
+  form: "Form",
+  body: "Body",
+  auth: "Auth",
+  file: "Form",
+  binary: "Body",
+}
+
+function legacyPath(f: PendingField): string {
+  const [, source, slot, name] = identityTuple(f)
+  const label = LEGACY_SOURCE_LABEL[source]
+
+  if (slot === "basic-password") return `${label} · Basic password`
+  if (slot === "bearer-token") return `${label} · Bearer token`
+  if (slot === "api-key") return `${label} · API key ${name || "value"}`
+  if (source === "binary" && !name) return `${label} · binary body`
+
+  return `${label} · ${name}`
+}
+
 function legacySignature(fields: PendingField[]): string {
   return fields
-    .map((f) => `${f.kind}|${f.source}|${formatPendingField(f)}`)
+    .map((f) => `${f.kind}|${f.source}|${legacyPath(f)}`)
     .sort()
     .join("\n")
 }
@@ -58,17 +83,17 @@ const apiKey = (name: string): PendingField => ({
 })
 
 describe("the reference encoding this suite compares against is the real old one", () => {
-  // P6/P2: the legacy helper is only trustworthy while these hold. If the
-  // renderer's output drifts, this fails here rather than silently turning the
-  // equivalence tests below into a comparison of two new encodings.
-  it("reproduces the display strings the replaced `path` field held", () => {
-    expect(formatPendingField(header("Authorization"))).toBe("Header · Authorization")
-    expect(formatPendingField(query("apikey"))).toBe("Query · apikey")
-    expect(formatPendingField(body("token"))).toBe("Body · token")
-    expect(formatPendingField(basic())).toBe("Auth · Basic password")
-    expect(formatPendingField(bearer())).toBe("Auth · Bearer token")
-    expect(formatPendingField(apiKey("X-Api-Key"))).toBe("Auth · API key X-Api-Key")
-    expect(formatPendingField(apiKey(""))).toBe("Auth · API key value")
+  // Pins the frozen constant so a later edit cannot quietly make it agree with
+  // whatever the renderer does today, which would turn every comparison below
+  // into a comparison of the new encoding with itself.
+  it("still spells out the strings the replaced `path` field held", () => {
+    expect(legacyPath(header("Authorization"))).toBe("Header · Authorization")
+    expect(legacyPath(query("apikey"))).toBe("Query · apikey")
+    expect(legacyPath(body("token"))).toBe("Body · token")
+    expect(legacyPath(basic())).toBe("Auth · Basic password")
+    expect(legacyPath(bearer())).toBe("Auth · Bearer token")
+    expect(legacyPath(apiKey("X-Api-Key"))).toBe("Auth · API key X-Api-Key")
+    expect(legacyPath(apiKey(""))).toBe("Auth · API key value")
   })
 })
 

@@ -4,6 +4,7 @@ import { defineStore } from "pinia";
 import i18n from "../i18n";
 import { recordConsoleEntry } from "./console"
 import { useWebSocketStore } from "./websocket"
+import { clearUrlSentinels } from "../utils/history-to-request"
 import {
   bodyKindFromBodyType,
   clearSentinelBody,
@@ -400,7 +401,10 @@ export const useTabsStore = defineStore("tabs", () => {
     const tab = createEmptyTab(tabs.value.length + 1)
     tab.method = normalizedMethod
     tab.url = entry.url
-    tab.label = deriveHistoryLabel(entry.url)
+    // Cleared here too, not just on `tab.url`: the label is the save dialog's
+    // default name, so a placeholder left in it lands in the collection file as
+    // the request's name and leaves with any export.
+    tab.label = deriveHistoryLabel(clearUrlSentinels(entry.url))
 
     tab.params = entry.requestParams?.length
       ? createEditablePairs(entry.requestParams)
@@ -469,7 +473,12 @@ export const useTabsStore = defineStore("tabs", () => {
     tab.body.formData = clearSentinelPairs(tab.body.formData)
     const cleared = clearSentinelBody(bodyKindFromBodyType(tab.body.type), tab.body.content)
     tab.body.content = cleared.content
-    tab.bodyRedacted = cleared.cleared
+    tab.bodyRedactedFields = cleared.fields
+    // Has to stay below `deriveParamsFromUrl` above: rows derived from the url
+    // are what carries the marker for history rows that predate a separate
+    // params field, and deriving them from an already-cleared url would hand
+    // them empty values with nothing to mark.
+    tab.url = clearUrlSentinels(tab.url)
 
     const matchingEmptyTab = tabs.value.find(
       (candidate) =>

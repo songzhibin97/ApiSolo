@@ -2,7 +2,8 @@ import { beforeEach, describe, expect, it } from "vitest"
 import { createPinia, setActivePinia } from "pinia"
 
 import { useTabsStore } from "../tabs"
-import { REDACTION_SENTINEL, hasPendingRedactedFields } from "../../utils/redaction"
+import { identityTuple, pendingRefillFields } from "../../utils/pending-refill"
+import { REDACTION_SENTINEL } from "../../utils/redaction"
 import type { HistoryEntry, KeyValuePair } from "../../types"
 
 function pair(key: string, value: string): KeyValuePair {
@@ -387,20 +388,26 @@ describe("useTabsStore.openHistoryEntry", () => {
       expect(rows[0]).toEqual(expect.objectContaining({ key: "Cookie", value: "", redacted: true }))
       expect(rows[1]).toEqual(expect.objectContaining({ key: "page", value: "1" }))
       expect(rows[1].redacted).toBeUndefined()
-      expect(hasPendingRedactedFields(opened)).toBe(true)
+      expect(pendingRefillFields(opened).length).toBeGreaterThan(0)
     })
   })
 
   describe("§2 sentinel bodies are structurally cleared", () => {
     it.each([
-      ["json", `{"user":"bob","password":"${REDACTION_SENTINEL}"}`, '{"user":"bob","password":""}'],
+      [
+        "json",
+        `{"user":"bob","password":"${REDACTION_SENTINEL}"}`,
+        '{"user":"bob","password":""}',
+        ["password"],
+      ],
       [
         "form-urlencoded",
         `user=bob&password=${REDACTION_SENTINEL}`,
         "user=bob&password=",
+        ["password"],
       ],
-      ["raw", `Cookie: ${REDACTION_SENTINEL}`, "Cookie: "],
-    ])("clears sentinel body for %s body", (bodyType, content, expected) => {
+      ["raw", `Cookie: ${REDACTION_SENTINEL}`, "Cookie: ", ["Cookie"]],
+    ])("clears sentinel body for %s body", (bodyType, content, expected, names) => {
       const store = useTabsStore()
 
       store.openHistoryEntry(
@@ -408,8 +415,11 @@ describe("useTabsStore.openHistoryEntry", () => {
       )
 
       expect(store.activeTab.body.content).toBe(expected)
-      expect(store.activeTab.bodyRedacted).toBe(true)
-      expect(hasPendingRedactedFields(store.activeTab)).toBe(true)
+      // The names are the deliverable, not a flag: the panel save dialog has to
+      // be able to say which keys need typing back in, and by this point the
+      // body text no longer holds anything to find them by.
+      expect(store.activeTab.bodyRedactedFields).toEqual(names)
+      expect(pendingRefillFields(store.activeTab).length).toBeGreaterThan(0)
     })
 
     it("leaves a body whose prose merely mentions the sentinel alone", () => {
@@ -421,8 +431,8 @@ describe("useTabsStore.openHistoryEntry", () => {
       )
 
       expect(store.activeTab.body.content).toBe(content)
-      expect(store.activeTab.bodyRedacted).toBe(false)
-      expect(hasPendingRedactedFields(store.activeTab)).toBe(false)
+      expect(store.activeTab.bodyRedactedFields).toEqual([])
+      expect(pendingRefillFields(store.activeTab)).toEqual([])
     })
   })
 
@@ -465,8 +475,78 @@ describe("useTabsStore.openHistoryEntry", () => {
       expect(opened.headers).toEqual([])
       expect(opened.params).toEqual([])
       expect(opened.body.type).toBe("none")
-      expect(opened.bodyRedacted).toBe(false)
-      expect(hasPendingRedactedFields(opened)).toBe(false)
+      expect(opened.bodyRedactedFields).toEqual([])
+      expect(pendingRefillFields(opened)).toEqual([])
     })
+  })
+})
+
+/**
+ * §13-§14 — a placeholder must not survive into a tab, because the panel's save
+ * writes the url straight into the collection file and it would leave with the
+ * export. Clearing it does not weaken the gate: the parameter rows carry the
+ * marker, and they are what the list is built from.
+ */
+describe("§14 the url loses its placeholders on load, the gate does not", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+  })
+
+  it("clears the placeholder out of the url and still lists the parameter", () => {
+    const store = useTabsStore()
+
+    store.openHistoryEntry(
+      makeHistoryEntry({
+        url: `https://api.example.com/users?apikey=${REDACTION_SENTINEL}&page=1`,
+        requestParams: undefined,
+        requestBodyType: "none",
+        requestBodyContent: undefined,
+      }),
+    )
+
+    const opened = store.activeTab
+
+    expect(opened.url).not.toContain(REDACTION_SENTINEL)
+    expect(opened.url).toBe("https://api.example.com/users?apikey=&page=1")
+    expect(pendingRefillFields(opened).map(identityTuple)).toContainEqual([
+      "refill",
+      "query",
+      null,
+      "apikey",
+    ])
+  })
+
+  /**
+   * The order the two steps run in is load-bearing. Rows are derived from the
+   * url for history entries written before parameters were stored separately;
+   * derive them from an already-cleared url and they arrive empty with nothing
+   * to mark, and that whole generation of entries loses its gate silently.
+   */
+  it("still marks rows derived from the url rather than stored beside it", () => {
+    const store = useTabsStore()
+
+    store.openHistoryEntry(
+      makeHistoryEntry({
+        url: `https://api.example.com/users?apikey=${REDACTION_SENTINEL}`,
+        requestParams: undefined,
+        requestBodyType: "none",
+        requestBodyContent: undefined,
+      }),
+    )
+
+    const row = store.activeTab.params.find((item) => item.key === "apikey")
+
+    expect(row).toEqual(expect.objectContaining({ value: "", redacted: true }))
+  })
+
+  it("leaves a url with nothing redacted in it untouched", () => {
+    const store = useTabsStore()
+    const url = "https://api.example.com/users?page=1"
+
+    store.openHistoryEntry(
+      makeHistoryEntry({ url, requestBodyType: "none", requestBodyContent: undefined }),
+    )
+
+    expect(store.activeTab.url).toBe(url)
   })
 })

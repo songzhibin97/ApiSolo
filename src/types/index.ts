@@ -116,8 +116,13 @@ export interface Tab {
   responseError?: string | null
   scriptResult?: ScriptResult | null
   isLoading?: boolean
-  /** In-memory only: the body was redacted in history and needs re-entering. */
-  bodyRedacted?: boolean
+  /**
+   * In-memory only: which body keys history had redacted, in order and with
+   * repeats. It records where the blanks came from, never how far the user has
+   * got filling them in -- that is recomputed from the body text, so there is
+   * no progress here to keep up to date.
+   */
+  bodyRedactedFields?: string[]
   /**
    * In-memory only: bumped by every write to `url` or `params` that did not
    * come from the URL bar itself. The URL bar uses it to tell its own echo
