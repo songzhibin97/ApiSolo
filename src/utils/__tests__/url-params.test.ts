@@ -422,9 +422,13 @@ describe("rebuilding params from the url keeps a still-blank row's marker", () =
   })
 
   /**
-   * Repeats are told apart by how many are still outstanding, not by name
-   * alone: `?tag=kept&tag=` with only the second one blanked must end up with
-   * exactly one marked row, and it must be the blank one.
+   * The marker travels by key, so within that key it is the value that decides
+   * which repeats take it: a row still empty does, a row holding a value does
+   * not. `?tag=kept&tag=` with `tag` blanked ends up with exactly one marked
+   * row and it is the blank one — not because anything counted how many were
+   * outstanding or worked out which repeat was which, but because the filled
+   * row is not empty. Both of those were earlier rules here, and each failed in
+   * one direction or the other.
    */
   it("marks the blank repeat and not the filled one", () => {
     const synced = syncParamsFromUrl(`${BASE}?tag=kept&tag=`, [
