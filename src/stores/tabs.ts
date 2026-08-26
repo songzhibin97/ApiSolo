@@ -6,6 +6,7 @@ import { recordConsoleEntry } from "./console"
 import { useWebSocketStore } from "./websocket"
 import { clearUrlSentinels } from "../utils/history-to-request"
 import {
+  REDACTION_SENTINEL,
   bodyKindFromBodyType,
   clearSentinelBody,
   clearSentinelPairs,
@@ -173,7 +174,7 @@ function sanitizeHistoryFormData(items: Tab["body"]["formData"]) {
   )
 }
 
-function deriveParamsFromUrl(url: string) {
+function deriveParamsFromUrl(url: string): KeyValuePair[] {
   try {
     return [...new URL(url).searchParams.entries()].map(([key, value]) => ({
       id: crypto.randomUUID(),
@@ -185,6 +186,71 @@ function deriveParamsFromUrl(url: string) {
   } catch {
     return []
   }
+}
+
+/**
+ * The query rows a history entry describes. It records its query twice and
+ * neither copy is a superset of the other, so this reads both rather than
+ * picking one:
+ *
+ *   - `requestParams` holds the rows that actually went on the wire — the send
+ *     path strips the url's own query and sends this list — but it did not
+ *     exist for early entries.
+ *   - The url holds the query as the tab was displaying it, which is where an
+ *     early entry's parameters live, and where a parameter can appear that the
+ *     params copy never had.
+ *
+ * Taking one and discarding the other was the defect. Discarding the url lost
+ * a url-only parameter outright: it is not merely hidden, because the rows are
+ * what gets sent, so a parameter missing from this list is a parameter that
+ * never goes out — and since `openHistoryEntry` goes on to clear the
+ * placeholder out of the url, it disappeared without leaving a mark on screen
+ * either.
+ *
+ * The overlap is resolved per key: rows the params copy already has are kept as
+ * they are, and the url contributes only keys it does not have. This is the
+ * same rule the history row's own gate uses to avoid counting one parameter
+ * twice (`queryFields` in `pending-refill.ts`), which is what makes the two
+ * agree rather than merely making this one less wrong.
+ *
+ * The url is read for one more thing: which keys this entry blanked. The two
+ * copies do not spell that out the same way — the url redactor stamps a
+ * placeholder on any sensitive key, while the pair redactor leaves an already
+ * empty value alone — so a row can arrive blank here with only the url saying
+ * it was blanked. Marked per key rather than per row, for the reason set out
+ * above `syncParamsFromUrl`: two identical blank parameters hold no fact saying
+ * which is which. And only for keys the params copy does not itself report as
+ * blanked, again matching `queryFields`, so a key that already names its own
+ * blanked rows is not counted a second time through the url.
+ */
+function historyQueryRows(entry: HistoryEntry): KeyValuePair[] {
+  const stored: KeyValuePair[] = createEditablePairs(entry.requestParams ?? [])
+  // Read before `clearUrlSentinels` runs on the url: afterwards the
+  // placeholders are gone and there is nothing left to recognise them by.
+  const fromUrl = deriveParamsFromUrl(entry.url)
+  const isBlanked = (item: KeyValuePair) => item.value.trim() === REDACTION_SENTINEL
+
+  const storedKeys = new Set(stored.map((item) => item.key))
+  const storedBlanked = new Set(stored.filter(isBlanked).map((item) => item.key))
+  const urlBlanked = new Set(
+    fromUrl
+      .filter((item) => isBlanked(item) && !storedBlanked.has(item.key))
+      .map((item) => item.key),
+  )
+
+  return [...stored, ...fromUrl.filter((item) => !storedKeys.has(item.key))].map((item) =>
+    // `value === ""` cannot be killed by a test and is not load-bearing today,
+    // stated rather than left for the next reviewer to rediscover. For an entry
+    // this app wrote it is always true where it is reached: the url only blanks
+    // sensitive keys, and the pair redactor turns a sensitive key's non-empty
+    // value into the placeholder, which would have put that key in
+    // `storedBlanked` and out of `urlBlanked`. It stays because the input is a
+    // file on disk that outlives the version that wrote it — the `?? ""`
+    // fallbacks in `openHistoryEntry` exist for the same reason — and because
+    // the marker means "this blank came from history". Putting it on a row that
+    // holds a value would be inventing it.
+    item.value === "" && urlBlanked.has(item.key) ? { ...item, redacted: true } : item,
+  )
 }
 
 export const useTabsStore = defineStore("tabs", () => {
@@ -406,9 +472,7 @@ export const useTabsStore = defineStore("tabs", () => {
     // the request's name and leaves with any export.
     tab.label = deriveHistoryLabel(clearUrlSentinels(entry.url))
 
-    tab.params = entry.requestParams?.length
-      ? createEditablePairs(entry.requestParams)
-      : deriveParamsFromUrl(entry.url)
+    tab.params = historyQueryRows(entry)
 
     if (entry.requestHeaders?.length) {
       tab.headers = createEditablePairs(entry.requestHeaders)
@@ -474,10 +538,10 @@ export const useTabsStore = defineStore("tabs", () => {
     const cleared = clearSentinelBody(bodyKindFromBodyType(tab.body.type), tab.body.content)
     tab.body.content = cleared.content
     tab.bodyRedactedFields = cleared.fields
-    // Has to stay below `deriveParamsFromUrl` above: rows derived from the url
-    // are what carries the marker for history rows that predate a separate
-    // params field, and deriving them from an already-cleared url would hand
-    // them empty values with nothing to mark.
+    // Has to stay below `historyQueryRows` above: that is where the url's copy
+    // of the query is read, both for rows the params copy does not have and for
+    // which keys were blanked. Reading an already-cleared url hands it empty
+    // values with nothing left to recognise as a placeholder.
     tab.url = clearUrlSentinels(tab.url)
 
     const matchingEmptyTab = tabs.value.find(

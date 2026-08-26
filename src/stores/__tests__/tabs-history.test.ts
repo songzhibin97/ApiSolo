@@ -2,9 +2,11 @@ import { beforeEach, describe, expect, it } from "vitest"
 import { createPinia, setActivePinia } from "pinia"
 
 import { useTabsStore } from "../tabs"
+import { historyEntryToRequest } from "../../utils/history-to-request"
 import { identityTuple, pendingRefillFields } from "../../utils/pending-refill"
-import { REDACTION_SENTINEL } from "../../utils/redaction"
-import type { HistoryEntry, KeyValuePair } from "../../types"
+import { REDACTION_SENTINEL, sanitizeHistoryEntry } from "../../utils/redaction"
+import { buildUrlWithParams } from "../../utils/url-params"
+import type { HistoryEntry, KeyValuePair, Tab } from "../../types"
 
 function pair(key: string, value: string): KeyValuePair {
   return { id: "", enabled: true, key, value, description: "" }
@@ -67,8 +69,11 @@ describe("useTabsStore.openHistoryEntry", () => {
     expect(openedTab.method).toBe("POST")
     expect(openedTab.url).toBe("https://api.example.com/users?active=true")
     expect(openedTab.label).toBe("/users?active=true")
-    expect(openedTab.params).toHaveLength(1)
-    expect(openedTab.params[0].key).toBe("page")
+    // Both copies of the query, not whichever one happened to be non-empty.
+    // This fixture's url carries `active` and its stored params carry `page`;
+    // reading only the params dropped `active` from a request that had it, and
+    // the rows are what the send path puts on the wire.
+    expect(openedTab.params.map((item) => item.key)).toEqual(["page", "active"])
     expect(openedTab.headers).toHaveLength(1)
     expect(openedTab.headers[0].key).toBe("X-Test")
     expect(openedTab.body.type).toBe("json")
@@ -548,5 +553,249 @@ describe("§14 the url loses its placeholders on load, the gate does not", () =>
     )
 
     expect(store.activeTab.url).toBe(url)
+  })
+})
+
+/**
+ * A history entry records its query twice — as `requestParams` and inside the
+ * url — and the panel used to read whichever one was non-empty. The two entry
+ * points then answered the same question differently about the same row, which
+ * is the disagreement this slice exists to remove.
+ */
+describe("the query rows a history entry describes come from both copies of it", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+  })
+
+  /**
+   * A second-generation entry: a row opened from history and sent again. Built
+   * by the code that writes history rather than by hand — `buildHistoryEntry`
+   * ends in `sanitizeHistoryEntry`, and the detail these tests turn on is one a
+   * hand-written fixture gets wrong. The url redactor stamps a placeholder on
+   * any sensitive key, the pair redactor leaves an already-empty value alone, so
+   * the same blank parameter comes back as `[redacted]` in the url and as `""`
+   * in the params.
+   */
+  function resent(tab: Tab): HistoryEntry {
+    return sanitizeHistoryEntry(makeHistoryEntry({ url: tab.url, requestParams: tab.params }))
+  }
+
+  function panelGate(tab: Tab) {
+    return pendingRefillFields(tab).map(identityTuple)
+  }
+
+  function rowGate(entry: HistoryEntry) {
+    return pendingRefillFields(historyEntryToRequest(entry)).map(identityTuple)
+  }
+
+  /**
+   * MISSED GATE. The reported defect: a parameter only the url has. Reading the
+   * stored params alone dropped it from the rows, and the rows are what the send
+   * path puts on the wire — so it was not hidden, it was gone — while the very
+   * next step cleared the placeholder out of the url, taking the last sign of it
+   * off the screen.
+   */
+  it("keeps a parameter the url has and the stored params do not", () => {
+    const store = useTabsStore()
+
+    store.openHistoryEntry(
+      makeHistoryEntry({
+        url: `https://api.example.com/users?apikey=${REDACTION_SENTINEL}&page=1`,
+        requestParams: [pair("page", "1")],
+        requestBodyType: "none",
+        requestBodyContent: undefined,
+      }),
+    )
+
+    const opened = store.activeTab
+
+    expect(opened.params.map((item) => item.key)).toEqual(["page", "apikey"])
+    expect(opened.params[1]).toEqual(
+      expect.objectContaining({ key: "apikey", value: "", redacted: true }),
+    )
+    // The rendered url bar is the same list, so the parameter is back on screen
+    // as well as back in the request.
+    expect(buildUrlWithParams(opened.url, opened.params)).toBe(
+      "https://api.example.com/users?page=1&apikey=",
+    )
+    expect(panelGate(opened)).toEqual([["refill", "query", null, "apikey"]])
+  })
+
+  /**
+   * MISSED GATE, the second shape. Here the key is in both copies, so nothing
+   * vanishes — but only the url still says it was blanked, and the panel that
+   * ignored the url reported the request as complete while the row beside it
+   * reported a credential to type back in.
+   */
+  it("marks a blank row a key the url blanked", () => {
+    const store = useTabsStore()
+
+    store.openHistoryEntry(
+      makeHistoryEntry({
+        url: `https://api.example.com/users?apikey=${REDACTION_SENTINEL}`,
+        requestParams: undefined,
+        requestBodyType: "none",
+        requestBodyContent: undefined,
+      }),
+    )
+
+    const entry = resent(store.activeTab)
+    // Self-check on the fixture: the two copies really do disagree, which is
+    // the only reason this test has anything to catch.
+    expect(entry.url).toContain(`apikey=${REDACTION_SENTINEL}`)
+    expect(entry.requestParams).toEqual([expect.objectContaining({ key: "apikey", value: "" })])
+
+    store.openHistoryEntry(entry)
+
+    expect(store.activeTab.params).toEqual([
+      expect.objectContaining({ key: "apikey", value: "", redacted: true }),
+    ])
+    expect(panelGate(store.activeTab)).toEqual([["refill", "query", null, "apikey"]])
+  })
+
+  /**
+   * FALSE GATE. Both copies hold the same key, so merging them naively would
+   * report one blanked parameter as two and make the user acknowledge a field
+   * that does not exist. One key, one row, one entry in the list.
+   */
+  it("does not report a parameter twice for being in both copies", () => {
+    const store = useTabsStore()
+
+    store.openHistoryEntry(
+      makeHistoryEntry({
+        url: `https://api.example.com/users?token=${REDACTION_SENTINEL}&page=1`,
+        requestParams: [pair("token", REDACTION_SENTINEL), pair("page", "1")],
+        requestBodyType: "none",
+        requestBodyContent: undefined,
+      }),
+    )
+
+    const opened = store.activeTab
+
+    expect(opened.params.map((item) => item.key)).toEqual(["token", "page"])
+    expect(panelGate(opened)).toEqual([["refill", "query", null, "token"]])
+  })
+
+  /**
+   * FALSE GATE. The marker travels with the key that was blanked, not with
+   * blankness. A parameter the user deliberately sent empty must not inherit a
+   * gate from an unrelated credential on the same request.
+   */
+  it("does not mark a blank parameter of a key nothing blanked", () => {
+    const store = useTabsStore()
+
+    store.openHistoryEntry(
+      makeHistoryEntry({
+        url: `https://api.example.com/users?apikey=${REDACTION_SENTINEL}&note=`,
+        requestParams: [pair("note", "")],
+        requestBodyType: "none",
+        requestBodyContent: undefined,
+      }),
+    )
+
+    const opened = store.activeTab
+
+    expect(opened.params[0]).toEqual(expect.objectContaining({ key: "note", value: "" }))
+    expect(opened.params[0].redacted).toBeUndefined()
+    expect(panelGate(opened)).toEqual([["refill", "query", null, "apikey"]])
+  })
+
+  /**
+   * FALSE GATE. When the params copy names its own blanked rows, the url must
+   * not have a second say about that key: one `apikey` was sent filled and one
+   * empty, so exactly one value needs typing back in. Letting the url mark by
+   * key on top of that reports two, and the row beside it reports one.
+   */
+  it("does not count a key the stored params already report as blanked", () => {
+    const store = useTabsStore()
+    const entry = sanitizeHistoryEntry(
+      makeHistoryEntry({
+        url: "https://api.example.com/users?apikey=SECRET&apikey=",
+        requestParams: [pair("apikey", "SECRET"), pair("apikey", "")],
+        requestBodyType: "none",
+        requestBodyContent: undefined,
+      }),
+    )
+
+    store.openHistoryEntry(entry)
+
+    expect(panelGate(store.activeTab)).toEqual([["refill", "query", null, "apikey"]])
+    expect(panelGate(store.activeTab)).toEqual(rowGate(entry))
+  })
+
+  it("keeps a disabled row the entry stored", () => {
+    const store = useTabsStore()
+
+    store.openHistoryEntry(
+      makeHistoryEntry({
+        url: "https://api.example.com/users?page=1",
+        requestParams: [pair("page", "1"), { ...pair("debug", "1"), enabled: false }],
+        requestBodyType: "none",
+        requestBodyContent: undefined,
+      }),
+    )
+
+    expect(store.activeTab.params.map((item) => [item.key, item.enabled])).toEqual([
+      ["page", true],
+      ["debug", false],
+    ])
+  })
+
+  /**
+   * The invariant itself, stated directly: the same history row, read through
+   * the panel and read through the history row's own save, names the same
+   * fields. The two lists used to be built from different halves of the entry,
+   * and that is how one of them came to say a request was ready to save while
+   * the other held it back.
+   */
+  describe("both entry points name the same fields for one history row", () => {
+    const cases: Array<[string, HistoryEntry]> = [
+      [
+        "a parameter only the url has",
+        makeHistoryEntry({
+          url: `https://api.example.com/users?apikey=${REDACTION_SENTINEL}&page=1`,
+          requestParams: [pair("page", "1")],
+          requestBodyType: "none",
+          requestBodyContent: undefined,
+        }),
+      ],
+      [
+        "a blank row only the url reports as blanked",
+        sanitizeHistoryEntry(
+          makeHistoryEntry({
+            url: "https://api.example.com/users?apikey=&page=1",
+            requestParams: [pair("apikey", ""), pair("page", "1")],
+            requestBodyType: "none",
+            requestBodyContent: undefined,
+          }),
+        ),
+      ],
+      [
+        "a key both copies report as blanked",
+        makeHistoryEntry({
+          url: `https://api.example.com/users?token=${REDACTION_SENTINEL}`,
+          requestParams: [pair("token", REDACTION_SENTINEL)],
+          requestBodyType: "none",
+          requestBodyContent: undefined,
+        }),
+      ],
+      [
+        "a row with nothing outstanding",
+        makeHistoryEntry({
+          url: "https://api.example.com/users?page=1",
+          requestParams: [pair("page", "1")],
+          requestBodyType: "none",
+          requestBodyContent: undefined,
+        }),
+      ],
+    ]
+
+    it.each(cases)("agrees on %s", (_name, entry) => {
+      const store = useTabsStore()
+
+      store.openHistoryEntry(entry)
+
+      expect(panelGate(store.activeTab)).toEqual(rowGate(entry))
+    })
   })
 })
