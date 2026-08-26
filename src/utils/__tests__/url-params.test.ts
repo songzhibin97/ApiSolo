@@ -319,8 +319,9 @@ describe("§13 a draft never leaks across tabs", () => {
  * only thing left holding the save gate — the placeholder itself is stripped
  * when the tab loads. Rebuilding the rows from the url text used to discard it,
  * so editing the path was enough to let an empty credential be saved with no
- * warning. Rows are lined up by key and occurrence so the marker survives an
- * edit that is not about that value.
+ * warning. Each rebuilt row is now reconciled back to the row it came from —
+ * same value first, then in order — and inherits the marker only if it matched
+ * a marked row and is still blank.
  */
 describe("rebuilding params from the url keeps a still-blank row's marker", () => {
   const redacted = (key: string): KeyValuePair => ({
@@ -450,19 +451,140 @@ describe("rebuilding params from the url keeps a still-blank row's marker", () =
   })
 
   /**
-   * Only rows that are *still blank* count. Defence in depth rather than a
-   * reachable path today: the params table clears the marker when the value
-   * changes and this function never emits a marked row with a value, so a
-   * marked-but-filled row should not exist. The condition is what keeps the
-   * count meaning "outstanding" rather than "was ever blanked" if that ever
-   * stops being true, and this asserts it by handing the pure function the
-   * state directly.
+   * The invariant the whole rule rests on, stated once: a row is never both
+   * marked and non-empty on the way out. `needsRefill` reads the marker *and*
+   * the value, so a marked row holding a value would be inert and misleading —
+   * and every carrying rule so far has had to be checked against this by hand.
+   *
+   * This replaces an earlier test that asserted the opposite answer for a
+   * marked-and-filled *input*. That state is unreachable through the UI, and
+   * the rule it was guarding (a count that excluded filled rows) no longer
+   * exists — so what it pinned was an arbitrary choice about an impossible
+   * input, and it would have had to be rewritten again next time.
    */
-  it("does not count a marked row that already has a value", () => {
-    const synced = syncParamsFromUrl(`${BASE}?apikey=`, [
-      { ...redacted("apikey"), value: "ALREADY" },
-    ])
+  it("never emits a row that is both marked and non-empty", () => {
+    const cases: Array<[string, KeyValuePair[]]> = [
+      [`${BASE}?apikey=REAL`, [redacted("apikey")]],
+      [`${BASE}?apikey=REAL&apikey=`, [redacted("apikey"), redacted("apikey")]],
+      [`${BASE}?apikey=&apikey=REAL`, [redacted("apikey"), redacted("apikey")]],
+      [`${BASE}?apikey=A&apikey=B`, [redacted("apikey"), pair("apikey", "B")]],
+    ]
 
-    expect(synced.params.filter((item) => item.redacted === true)).toHaveLength(0)
+    for (const [url, current] of cases) {
+      const offenders = syncParamsFromUrl(url, current).params.filter(
+        (item) => item.redacted === true && item.value !== "",
+      )
+      expect(`${url}: ${JSON.stringify(offenders)}`).toBe(`${url}: []`)
+    }
+  })
+})
+
+/**
+ * The two directions this rule has to hold shut at once. Every cheaper version
+ * of it closed one and opened the other, so each test below says which side it
+ * guards — a suite that only covers one side lets the next change regress the
+ * other in silence.
+ *
+ *   MISSING GATE — a still-blank credential stops being reported, the save goes
+ *   through, and the request 401s once someone uses it.
+ *   FALSE GATE   — the value that was blanked has been typed back in, but the
+ *   notice and the confirmation will not clear.
+ *
+ * What each of these is worth, measured rather than asserted. Only
+ * "keeps a matched row's identity" has a mutation that nothing else catches.
+ * "a row the user added does not inherit" is the one that is red against the
+ * counting rule this replaced, which is the regression that actually happened.
+ * The remaining four are boundary variations: they are killed only by mutations
+ * that also fell several other tests, so they are kept as documentation of the
+ * shape rather than counted as independent coverage.
+ */
+describe("carrying the marker holds both directions shut", () => {
+  const redacted = (key: string, id = `${key}-r`): KeyValuePair => ({
+    id,
+    enabled: true,
+    key,
+    value: "",
+    description: "",
+    redacted: true,
+  })
+
+  const marks = (params: KeyValuePair[]) =>
+    params.filter((item) => item.redacted === true && item.value === "").length
+
+  it("MISSING GATE: an untouched blank stays marked when a sibling is filled", () => {
+    const after = syncParamsFromUrl(`${BASE}?apikey=SECRET&apikey=`, [
+      redacted("apikey", "first"),
+      redacted("apikey", "second"),
+    ]).params
+
+    expect(marks(after)).toBe(1)
+  })
+
+  /**
+   * The reported case. One blanked parameter, the user adds a second blank row
+   * of the same name, then fills in the one that was actually blanked. Nothing
+   * is outstanding any more, so nothing may be marked — a rule that hands the
+   * marker to "some blank row of this key" moves it to the row the user just
+   * created and blocks a request that is now complete.
+   */
+  it("FALSE GATE: a row the user added does not inherit, so filling the real one clears", () => {
+    const added = syncParamsFromUrl(`${BASE}?apikey=&apikey=`, [redacted("apikey")]).params
+    expect(marks(added)).toBe(1)
+
+    const filled = syncParamsFromUrl(`${BASE}?apikey=SECRET&apikey=`, added).params
+    expect(marks(filled)).toBe(0)
+  })
+
+  it("FALSE GATE: same thing with the added row in front", () => {
+    // The user's new blank row ends up ahead of the one history blanked, so a
+    // position-based rule gets this the wrong way round too.
+    const added = syncParamsFromUrl(`${BASE}?apikey=&apikey=FILLED`, [
+      pair("apikey", "FILLED"),
+    ]).params
+    expect(marks(added)).toBe(0)
+
+    const withReal = syncParamsFromUrl(`${BASE}?apikey=&apikey=FILLED`, [
+      redacted("apikey"),
+      pair("apikey", "FILLED"),
+    ]).params
+    expect(marks(withReal)).toBe(1)
+
+    const filled = syncParamsFromUrl(`${BASE}?apikey=SECRET&apikey=FILLED`, withReal).params
+    expect(marks(filled)).toBe(0)
+  })
+
+  it("FALSE GATE: three of a kind, filling each in turn clears one at a time", () => {
+    let rows = [redacted("apikey", "a"), redacted("apikey", "b"), redacted("apikey", "c")]
+    expect(marks(rows)).toBe(3)
+
+    rows = syncParamsFromUrl(`${BASE}?apikey=1&apikey=&apikey=`, rows).params
+    expect(marks(rows)).toBe(2)
+
+    rows = syncParamsFromUrl(`${BASE}?apikey=1&apikey=2&apikey=`, rows).params
+    expect(marks(rows)).toBe(1)
+
+    rows = syncParamsFromUrl(`${BASE}?apikey=1&apikey=2&apikey=3`, rows).params
+    expect(marks(rows)).toBe(0)
+  })
+
+  it("MISSING GATE: reordering filled and blank rows keeps the count", () => {
+    const start = [redacted("apikey", "blank"), pair("apikey", "FILLED")]
+
+    for (const url of [
+      `${BASE}?apikey=&apikey=FILLED`,
+      `${BASE}?apikey=FILLED&apikey=`,
+      `${BASE}?other=x&apikey=FILLED&apikey=`,
+    ]) {
+      expect(`${url}: ${marks(syncParamsFromUrl(url, start).params)}`).toBe(`${url}: 1`)
+    }
+  })
+
+  it("keeps a matched row's identity so the row is not remounted mid-edit", () => {
+    const after = syncParamsFromUrl(`${BASE}?apikey=&page=1`, [
+      redacted("apikey", "keep-me"),
+      pair("page", "1"),
+    ]).params
+
+    expect(after.find((item) => item.key === "apikey")?.id).toBe("keep-me")
   })
 })

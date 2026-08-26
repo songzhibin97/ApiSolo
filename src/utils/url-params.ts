@@ -17,44 +17,70 @@ export function syncParamsFromUrl(rawUrl: string, currentParams: KeyValuePair[])
   try {
     const parsed = new URL(toParsableUrl(rawUrl))
     /**
-     * How many still-blank redacted rows each key has, carried across the
-     * rebuild and handed to the blank rows of that key in the new url.
+     * Each rebuilt row is reconciled back to the row it came from, and only
+     * then does it inherit anything. The redaction marker is what makes this
+     * matter: it records that history took a value away, so an edit that is not
+     * about that value must not drop it -- changing the path of `?apikey=` used
+     * to be enough to let an empty API key be saved with no warning.
      *
-     * The marker records that history took a value away, so an edit that is not
-     * about that value must not clear it: dropping it on every rebuild meant
-     * changing the path of `?apikey=` let an empty API key be saved with no
-     * warning. Typing a value in does clear it, which is the rule the params
-     * table follows too.
+     * Two failure directions have to be held shut at once, and every cheaper
+     * rule so far has closed one by opening the other:
      *
-     * It is counted per key rather than matched per row on purpose. Anything
-     * that pins the marker to a row's position -- an index, an ordinal among
-     * same-named keys -- is pinning it to something the rebuild itself
-     * reassigns: with two blank `apikey` rows, filling the first and then
-     * pasting the pair back in the other order handed the marker to the row
-     * that no longer needed it and left the blank one unmarked. A count of
-     * what is still outstanding cannot be reordered.
+     *   - Rebuilding rows blindly loses the marker, so a still-blank credential
+     *     stops being reported. That is a gate that should have held and did
+     *     not, and the request 401s in silence once it is used.
+     *   - Handing the marker out by position, or by a count of how many blanks
+     *     a key still has, gives it to whichever blank row happens to be there
+     *     -- including one the user just added. Then filling in the value that
+     *     was actually blanked does not clear the notice, and a correct request
+     *     stays blocked.
+     *
+     * So identity comes first and the marker follows it, rather than the marker
+     * being allocated to a slot. A row keeps its identity if its value is
+     * unchanged, wherever it moved to; the rest pair up in order; anything left
+     * over is a row the user created and inherits nothing.
      */
-    const outstanding = new Map<string, number>()
-    for (const item of currentParams) {
-      if (item.enabled && item.redacted === true && item.value === "") {
-        outstanding.set(item.key, (outstanding.get(item.key) ?? 0) + 1)
+    const entries = [...parsed.searchParams.entries()]
+    const enabled = currentParams.filter((item) => item.enabled)
+    const claimed = new Set<number>()
+
+    function claim(predicate: (item: KeyValuePair) => boolean): KeyValuePair | undefined {
+      const index = enabled.findIndex((item, at) => !claimed.has(at) && predicate(item))
+
+      if (index === -1) {
+        return undefined
       }
+
+      claimed.add(index)
+      return enabled[index]
     }
 
-    const params = [...parsed.searchParams.entries()].map(([key, value]) => {
-      const left = value === "" ? (outstanding.get(key) ?? 0) : 0
+    const matched: Array<KeyValuePair | undefined> = entries.map(() => undefined)
 
-      if (left > 0) {
-        outstanding.set(key, left - 1)
+    // An unchanged value is the strongest evidence that this is the same row,
+    // and it is order-independent -- which is what makes reordering harmless.
+    entries.forEach(([key, value], index) => {
+      if (value !== "") {
+        matched[index] = claim((item) => item.key === key && item.value === value)
       }
+    })
+
+    // Whatever is left pairs up left to right, keeping rows as close to where
+    // they were as an order-preserving match can.
+    entries.forEach(([key], index) => {
+      matched[index] ??= claim((item) => item.key === key)
+    })
+
+    const params = entries.map(([key, value], index) => {
+      const previous = matched[index]
 
       return {
-        id: crypto.randomUUID(),
+        id: previous?.id ?? crypto.randomUUID(),
         enabled: true,
         key,
         value,
-        description: "",
-        ...(left > 0 ? { redacted: true } : {}),
+        description: previous?.description ?? "",
+        ...(value === "" && previous?.redacted === true ? { redacted: true } : {}),
       }
     })
     // Store URL without query string — params are the source of truth

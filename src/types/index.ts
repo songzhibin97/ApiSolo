@@ -4,7 +4,20 @@ export interface KeyValuePair {
   key: string
   value: string
   description: string
-  /** In-memory only: the value was redacted in history and needs re-entering. */
+  /**
+   * In-memory only: the value was redacted in history and needs re-entering.
+   *
+   * Three rules, because this has been got wrong once per rebuild site. Anything
+   * that reconstructs a row must **preserve** it; it may only be **cleared**
+   * when that row's value becomes non-empty; and it is **stripped** before the
+   * row is persisted or written to history. Dropping it where it should be
+   * preserved silently removes a save gate on a blanked credential; keeping it
+   * on a row the user just created blocks a request that is already complete.
+   *
+   * It records where the blank came from, never how far the user has got: the
+   * gate reads this *and* the current value, so a marked row holding a value is
+   * inert. Do not use it as "this row is pending" on its own.
+   */
   redacted?: boolean
 }
 

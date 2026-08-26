@@ -638,6 +638,62 @@ describe("editing an unrelated part of the url keeps the query gate", () => {
   })
 
   /**
+   * FALSE GATE, end to end. The other direction from everything above: here the
+   * user has done the right thing and must not stay blocked.
+   *
+   * One blanked API key, the user adds a second blank row of the same name, then
+   * fills in the one that was actually blanked. Nothing is outstanding, so the
+   * notice must go and the save must unlock. A rule that hands the marker to
+   * whichever blank row is available moves it to the row the user just created
+   * and holds a request that is now complete.
+   */
+  it("clears the gate when the blanked parameter is filled beside a row the user added", async () => {
+    const projects = useProjectsStore()
+    projects.activeProject = "My API"
+    const tabs = useTabsStore()
+    tabs.openHistoryEntry({
+      id: "h-5",
+      method: "GET",
+      url: `https://api.example.com/users?apikey=${REDACTION_SENTINEL}`,
+      status: 200,
+      time: 10,
+      size: 10,
+      timestamp: "2026-03-27T10:00:00Z",
+      contentType: "application/json",
+      requestHeaders: [],
+      requestParams: [],
+      requestBodyType: "none",
+      requestBodyFormData: [],
+    } as HistoryEntry)
+
+    expect(pendingRefillFields(tabs.activeTab)).toHaveLength(1)
+
+    const wrapper = mount(RequestPanel, { global: { plugins: [pinia] } })
+    await nextTick()
+    const urlBar = wrapper.findComponent(UrlBar)
+
+    // The user adds a second, empty apikey of their own.
+    await urlBar.vm.$emit("update:url", "https://api.example.com/users?apikey=&apikey=")
+    await nextTick()
+    // Self-check: still exactly one pending, not two. If the added row inherited
+    // here, the assertion below would pass for the wrong reason.
+    expect(pendingRefillFields(tabs.activeTab)).toHaveLength(1)
+
+    // Now they fill in the one history had blanked.
+    await urlBar.vm.$emit("update:url", "https://api.example.com/users?apikey=SECRET&apikey=")
+    await nextTick()
+
+    expect(pendingRefillFields(tabs.activeTab)).toEqual([])
+    expect(wrapper.find("[data-testid=\"history-redacted-banner\"]").exists()).toBe(false)
+
+    const save = wrapper.findAll("button").find((b) => b.text().includes("request.save"))
+    await save!.trigger("click")
+    expect(
+      (wrapper.find("[data-testid=\"request-save-submit\"]").element as HTMLButtonElement).disabled,
+    ).toBe(false)
+  })
+
+  /**
    * A positive control, not an independently load-bearing assertion, and
    * labelled as one rather than counted twice. `needsRefill` already requires an
    * empty value, so carrying the marker forward too eagerly cannot make this go
