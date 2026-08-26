@@ -1,4 +1,5 @@
 import type { AuthConfig, KeyValuePair, RequestBody } from "../types"
+import { historyQueryRows } from "./history-query"
 import {
   REDACTION_SENTINEL,
   bodyKindFromBodyType,
@@ -154,46 +155,20 @@ function authField(kind: PendingKind, slot: AuthSlot, name: string): PendingFiel
  * placeholder; a row that has been through the replay path holds an empty value
  * and a marker instead, because the placeholder must never be replayable. Both
  * mean "the user has to type this back in".
+ *
+ * Exported because the editor renders the same fact and must not spell it
+ * differently. Asking only whether the marker is set is a different question
+ * with a different answer: the marker outlives the value it was set for, so a
+ * row that has been filled back in still carries it, and a renderer keyed on
+ * the marker alone would keep telling the user to re-enter something they
+ * already typed.
  */
-function needsRefill(item: KeyValuePair): boolean {
+export function needsRefill(item: KeyValuePair): boolean {
   return item.value.trim() === REDACTION_SENTINEL || (item.redacted === true && item.value === "")
 }
 
 function pairFields(items: KeyValuePair[], source: NonAuthSource): PendingField[] {
   return items.filter(needsRefill).map((item) => field("refill", source, item.key))
-}
-
-function urlQueryFields(rawUrl: string): PendingField[] {
-  const hashIndex = rawUrl.indexOf("#")
-  const before = hashIndex === -1 ? rawUrl : rawUrl.slice(0, hashIndex)
-  const queryIndex = before.indexOf("?")
-
-  if (queryIndex === -1) {
-    return []
-  }
-
-  const fields: PendingField[] = []
-
-  for (const part of before.slice(queryIndex + 1).split("&")) {
-    const separator = part.indexOf("=")
-    if (separator === -1) {
-      continue
-    }
-
-    const decode = (value: string) => {
-      try {
-        return decodeURIComponent(value.replace(/\+/g, " "))
-      } catch {
-        return value
-      }
-    }
-
-    if (decode(part.slice(separator + 1)).trim() === REDACTION_SENTINEL) {
-      fields.push(field("refill", "query", decode(part.slice(0, separator))))
-    }
-  }
-
-  return fields
 }
 
 /**
@@ -276,26 +251,27 @@ function fileFields(body: RequestBody): PendingField[] {
 }
 
 /**
- * The query string is reachable from two places at once. Params are a
- * request's source of truth, but a tab opened from history also keeps the query
- * in its url, so a redacted parameter would otherwise be listed twice and
- * inflate the count the dialog reports.
+ * The query string is reachable from two places at once. Params are a request's
+ * source of truth, but a tab opened from history also keeps the query in its
+ * url, so a redacted parameter would otherwise be listed twice and inflate the
+ * count the dialog reports.
  *
- * The overlap is resolved per name, not per row. Collapsing by identity would
- * also swallow a genuine repeat within one source: `?tag=a&tag=b` with both
- * values redacted is two rows the user has to refill, and reporting one is the
- * same class of lie as reporting three.
+ * Reconciling the two copies is `historyQueryRows`' job and only its job. This
+ * used to hold a second rule for the same overlap, phrased over pending
+ * *entries* rather than rows -- suppressing the url's copy of a key only when
+ * the params copy was itself pending -- and the two rules answered differently
+ * for a key the url still spelled `[redacted]` and the params copy held a real
+ * value for: the panel called the request complete, the history row beside it
+ * demanded the credential be typed back in. Reading the reconciled rows here
+ * instead means neither entry point owns a rule the other can drift from.
+ *
+ * What stays local is the per-row question, and it is asked per row rather than
+ * per name: collapsing by name would swallow a genuine repeat within one copy,
+ * and `?tag=a&tag=b` with both values redacted is two rows the user has to
+ * refill. Reporting one is the same class of lie as reporting three.
  */
 function queryFields(source: PendingRefillSource): PendingField[] {
-  const fromParams = pairFields(source.params, "query")
-  // Both sides carry the same kind and source, so the parameter name is the
-  // whole of what tells two query entries apart.
-  const named = new Set(fromParams.map((field) => field.name))
-
-  return [
-    ...fromParams,
-    ...urlQueryFields(source.url).filter((field) => !named.has(field.name)),
-  ]
+  return pairFields(historyQueryRows(source.params, source.url), "query")
 }
 
 export function pendingRefillFields(source: PendingRefillSource): PendingField[] {

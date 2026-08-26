@@ -253,6 +253,44 @@ describe("the query overlap collapses, a same-source repeat does not", () => {
     ).toEqual(["Query · tag", "Query · tag"])
   })
 
+  /**
+   * FALSE GATE. The two copies disagree about one key: the url still spells it
+   * `[redacted]`, the params copy holds the value. Params are what gets sent, so
+   * the value goes out real and there is nothing to type back in — the url is
+   * simply stale. Asking whether the *params entry* is pending rather than
+   * whether the params copy has the key at all was the second rule that made
+   * this entry point demand a credential the panel beside it called done.
+   */
+  it("reports nothing when the params copy holds the value the url still hides", () => {
+    expect(
+      labels(
+        request({
+          url: `https://api.example.com/s?apikey=${REDACTION_SENTINEL}`,
+          params: [pair("apikey", "REAL")],
+        }),
+      ),
+    ).toEqual([])
+  })
+
+  /**
+   * MISSED GATE, and the reason the rule above is "does the params copy have
+   * this key", not "does the params copy have a value for it". The pair redactor
+   * leaves an already-empty value alone while the url redactor stamps any
+   * sensitive key, so a blank row can arrive with only the url saying it was
+   * blanked. Suppressing the url outright for every key the params copy names
+   * would lose exactly that.
+   */
+  it("still reports a blank params row that only the url says was blanked", () => {
+    expect(
+      labels(
+        request({
+          url: `https://api.example.com/s?apikey=${REDACTION_SENTINEL}`,
+          params: [pair("apikey", "")],
+        }),
+      ),
+    ).toEqual(["Query · apikey"])
+  })
+
   // Both sources carry the same repeated name: still two, not four and not one.
   it("keeps the count at the real number when both sources repeat it", () => {
     expect(

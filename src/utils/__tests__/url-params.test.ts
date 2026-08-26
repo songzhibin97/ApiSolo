@@ -353,10 +353,51 @@ describe("rebuilding params from the url keeps a still-blank row's marker", () =
     )
   })
 
-  it("drops the marker once a value is typed in", () => {
+  /**
+   * The rebuilt row is a different row: a blank one cannot be identified, so
+   * the value typed into the url bar arrives as a new handle with nothing on
+   * it. That it comes back unmarked is a property of the rebuild, not a rule
+   * that filling a value clears markers -- there is no such rule any more, and
+   * the two tests below are what stop it being reintroduced here.
+   */
+  it("gives a value typed into the url bar a fresh row with no marker", () => {
     const synced = syncParamsFromUrl(`${BASE}?apikey=REAL`, [redacted("apikey")])
 
     expect(synced.params.find((item) => item.key === "apikey")?.redacted).toBeUndefined()
+  })
+
+  /**
+   * MISSED GATE, the url-bar spelling of it. A credential is typed back into
+   * the params table -- which keeps the marker, because the marker records
+   * where the row came from -- and the url is then edited around it. Losing the
+   * marker on the way through here would leave the row looking like an ordinary
+   * parameter, and emptying it afterwards would go unreported.
+   */
+  it("keeps the marker on a filled row it can identify", () => {
+    const filled = { ...redacted("apikey"), value: "REAL" }
+
+    const synced = syncParamsFromUrl(`${BASE}?apikey=REAL&page=1`, [filled, pair("page", "1")])
+
+    expect(synced.params.find((item) => item.key === "apikey")).toEqual(
+      expect.objectContaining({ value: "REAL", redacted: true }),
+    )
+  })
+
+  /**
+   * MISSED GATE, the whole way round. Blanked by history, typed back in, then
+   * emptied again from the url bar. The row that comes back is a fresh blank
+   * one, so what has to carry the fact across is the key -- and a rule that
+   * only counted a key as blanked while one of its rows was still empty stopped
+   * counting this one at the exact moment it was filled.
+   */
+  it("reports the key again when a filled row is emptied from the url bar", () => {
+    const filled = { ...redacted("apikey"), value: "REAL" }
+
+    const synced = syncParamsFromUrl(`${BASE}?apikey=&page=1`, [filled, pair("page", "1")])
+
+    expect(synced.params.find((item) => item.key === "apikey")).toEqual(
+      expect.objectContaining({ value: "", redacted: true }),
+    )
   })
 
   it("drops the row entirely when the parameter is deleted from the url", () => {
@@ -636,23 +677,29 @@ describe("carrying the marker holds both directions shut", () => {
   })
 
   /**
-   * "Blanked" means a value is *still* outstanding, not that one was blanked at
-   * some point. Without the second half, a key whose blank had already been
-   * filled in would keep stamping markers onto any blank row added later, and
-   * the notice would never stop coming back.
+   * "Blanked" means history blanked this key, not "a row of it is empty right
+   * now". This test used to assert the opposite, on the stated premise that the
+   * emit side never produces a marked row holding a value — that premise is
+   * gone: the params table now keeps the marker through an edit, because
+   * dropping it was how a credential typed in and deleted again went out empty
+   * and unannounced.
    *
-   * The input is reached by handing the pure function the state directly: the
-   * emit side never produces a marked row holding a value, which is what makes
-   * this redundant in practice and worth pinning anyway — it is what fixes the
-   * local meaning of the set, and a reader has no other way to tell whether
-   * "blanked" means "ever" or "still".
+   * So a key whose blank has been filled in is still a key history blanked, and
+   * a blank row of it is still a value that goes out empty. The cost is the one
+   * the rule above already accepts: an `apikey` the user means to send empty
+   * alongside a filled one keeps the notice up, and clearing it takes a tick of
+   * the acknowledgement or deleting the row. That cost stops the moment no
+   * marked row of the key is left, which the FALSE GATE cases above pin.
    */
-  it("treats a key whose blank was already filled as not outstanding", () => {
+  it("still treats a key as blanked once its blank has been filled", () => {
     const after = syncParamsFromUrl(`${BASE}?apikey=&apikey=ALREADY`, [
       { ...redacted("apikey"), value: "ALREADY" },
     ]).params
 
-    expect(marks(after)).toBe(0)
+    expect(after.map((item) => [item.value, item.redacted])).toEqual([
+      ["", true],
+      ["ALREADY", true],
+    ])
   })
 
   /**

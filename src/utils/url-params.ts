@@ -17,9 +17,15 @@ export function syncParamsFromUrl(rawUrl: string, currentParams: KeyValuePair[])
   try {
     const parsed = new URL(toParsableUrl(rawUrl))
     /**
-     * The marker travels per key, not per row: if a key still has a value that
-     * history blanked and nobody has typed back in, every blank row of that key
-     * in the rebuilt list is marked.
+     * The marker travels per key, not per row: if a key is one history blanked,
+     * every blank row of that key in the rebuilt list is marked.
+     *
+     * "A key history blanked" is read off the marker alone, not off the marker
+     * and an empty value together. The marker outlives the value it was set
+     * for, so a credential typed back in still carries it, and a key read as
+     * blanked only while one of its rows is still empty would stop being one the
+     * moment the last blank row was filled -- which is precisely when emptying
+     * it again has to be reported.
      *
      * This is not an approximation of a per-row rule, it is the absence of one,
      * and that is the point. Two rows with the same key and the same value are
@@ -50,7 +56,7 @@ export function syncParamsFromUrl(rawUrl: string, currentParams: KeyValuePair[])
     const blanked = new Set<string>()
 
     for (const item of currentParams) {
-      if (item.enabled && item.redacted === true && item.value === "") {
+      if (item.enabled && item.redacted === true) {
         blanked.add(item.key)
       }
     }
@@ -91,7 +97,14 @@ export function syncParamsFromUrl(rawUrl: string, currentParams: KeyValuePair[])
         key,
         value,
         description: previous?.description ?? "",
-        ...(value === "" && blanked.has(key) ? { redacted: true } : {}),
+        // Two ways a rebuilt row can carry the marker, for the two kinds of row
+        // this rebuild can and cannot identify. A row it identified keeps
+        // whatever it already had: the marker outlives the value, so a
+        // credential typed back in and then deleted again has to report again,
+        // and dropping the marker here would be the only reason it could not.
+        // A blank row cannot be identified at all -- that is the question with
+        // no answer -- so `blanked` speaks for it by key instead.
+        ...(previous?.redacted || (value === "" && blanked.has(key)) ? { redacted: true } : {}),
       }
     })
     // Store URL without query string — params are the source of truth
@@ -105,6 +118,32 @@ export function syncParamsFromUrl(rawUrl: string, currentParams: KeyValuePair[])
       url: rawUrl,
       params: currentParams,
     }
+  }
+}
+
+/**
+ * A url's query read as rows, with no reconciliation against anything: fresh
+ * handles, no markers, disabled rows impossible. It is the one place this app
+ * reads a query string into rows — `syncParamsFromUrl` above and the history
+ * readers all end up here — because a second parser is a second thing to keep
+ * in step with `form_urlencoded`.
+ *
+ * `toParsableUrl` is load-bearing rather than tidy. Bare `new URL` throws on a
+ * relative url and on one that starts with a `{{template}}`, and a throw here
+ * reads as "this url has no query": the parameters are not reported missing,
+ * they are silently not there.
+ */
+export function deriveParamsFromUrl(rawUrl: string): KeyValuePair[] {
+  try {
+    return [...new URL(toParsableUrl(rawUrl)).searchParams.entries()].map(([key, value]) => ({
+      id: crypto.randomUUID(),
+      enabled: true,
+      key,
+      value,
+      description: "",
+    }))
+  } catch {
+    return []
   }
 }
 

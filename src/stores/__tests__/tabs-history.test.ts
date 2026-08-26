@@ -723,6 +723,42 @@ describe("the query rows a history entry describes come from both copies of it",
     expect(panelGate(store.activeTab)).toEqual(rowGate(entry))
   })
 
+  /**
+   * FALSE GATE, and the disagreement itself. The two copies of the query say
+   * different things about one key: the url still holds the placeholder, the
+   * params copy holds the value. Params are what the send path puts on the
+   * wire, so nothing is outstanding — and the panel already read it that way
+   * while the history row beside it listed the key and made the user confirm.
+   *
+   * Written by hand rather than through `sanitizeHistoryEntry`, and that is the
+   * point of stating it: an entry this version writes has both copies redacted
+   * together, so this shape reaches the readers from a `history.jsonl` an older
+   * version wrote — the same reason the `?? ""` fallbacks in `openHistoryEntry`
+   * exist. It is also the shape the two rules were found to differ on, and two
+   * rules for one fact are a defect whether or not today's writer can produce
+   * the input that shows it.
+   */
+  it("reports nothing for a key the url still hides and the params copy holds", () => {
+    const store = useTabsStore()
+    const entry = makeHistoryEntry({
+      url: `https://api.example.com/users?apikey=${REDACTION_SENTINEL}&page=1`,
+      requestParams: [pair("apikey", "REAL"), pair("page", "1")],
+      requestBodyType: "none",
+      requestBodyContent: undefined,
+    })
+
+    store.openHistoryEntry(entry)
+
+    // The value survives into the tab, so it is not that both sides agree by
+    // losing it.
+    expect(store.activeTab.params.find((item) => item.key === "apikey")).toEqual(
+      expect.objectContaining({ value: "REAL" }),
+    )
+    expect(store.activeTab.params.find((item) => item.key === "apikey")?.redacted).toBeUndefined()
+    expect(rowGate(entry)).toEqual([])
+    expect(panelGate(store.activeTab)).toEqual(rowGate(entry))
+  })
+
   it("keeps a disabled row the entry stored", () => {
     const store = useTabsStore()
 
@@ -784,6 +820,18 @@ describe("the query rows a history entry describes come from both copies of it",
         makeHistoryEntry({
           url: "https://api.example.com/users?page=1",
           requestParams: [pair("page", "1")],
+          requestBodyType: "none",
+          requestBodyContent: undefined,
+        }),
+      ],
+      // The overlap the two rules answered differently: a placeholder in one
+      // copy, the value in the other. Both must call it done, because done is
+      // what goes on the wire.
+      [
+        "a key the url still hides and the params copy holds",
+        makeHistoryEntry({
+          url: `https://api.example.com/users?apikey=${REDACTION_SENTINEL}&page=1`,
+          requestParams: [pair("apikey", "REAL"), pair("page", "1")],
           requestBodyType: "none",
           requestBodyContent: undefined,
         }),

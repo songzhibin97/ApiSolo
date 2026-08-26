@@ -721,4 +721,71 @@ describe("editing an unrelated part of the url keeps the query gate", () => {
 
     expect(pendingRefillFields(tabs.activeTab)).toEqual([])
   })
+
+  /**
+   * The same round trip through the params table instead of the url bar, which
+   * is the path the user takes when the notice tells them which row to fill.
+   * Typing used to clear the row's marker outright, so deleting what was typed
+   * left an ordinary-looking blank parameter: notice down, save unlocked, and
+   * the request written with an empty api key that 401s the next time anyone
+   * sends it.
+   *
+   * Driven through the editor's own `input` events rather than an emit, because
+   * both halves of the defect were in the editor: the write path that dropped
+   * the marker, and the value box that decided what to flag by reading the
+   * marker on its own.
+   */
+  it("holds the gate again when a typed-in query value is deleted", async () => {
+    const projects = useProjectsStore()
+    projects.activeProject = "My API"
+    const saveRequest = vi.spyOn(projects, "saveRequest").mockResolvedValue(undefined)
+    const tabs = openedWithRedactedQuery()
+    const wrapper = mount(RequestPanel, { global: { plugins: [pinia] } })
+    await nextTick()
+
+    const valueBox = () => {
+      const editor = wrapper.findAllComponents(KeyValueEditor)[0]
+      // Self-check the pick: params and headers are the same component and
+      // differ only by template order.
+      expect((editor.props("modelValue") as KeyValuePair[]).map((row) => row.key)).toContain(
+        "apikey",
+      )
+      const row = (editor.props("modelValue") as KeyValuePair[]).findIndex(
+        (item) => item.key === "apikey",
+      )
+      return editor
+        .findAll("input[type=\"text\"]")
+        .filter((input) => (input.element as HTMLInputElement).placeholder !== "keyValue.key")
+        .filter(
+          (input) =>
+            (input.element as HTMLInputElement).placeholder !== "keyValue.description",
+        )[row]
+    }
+
+    // FALSE GATE first: typing the credential back in releases everything.
+    await valueBox().setValue("REAL")
+    await nextTick()
+
+    expect(pendingRefillFields(tabs.activeTab)).toEqual([])
+    expect(wrapper.find("[data-testid=\"history-redacted-banner\"]").exists()).toBe(false)
+
+    // MISSED GATE: deleting it again puts the request back where it started.
+    await valueBox().setValue("")
+    await nextTick()
+
+    expect(tabs.activeTab.params.find((item) => item.key === "apikey")).toEqual(
+      expect.objectContaining({ value: "", redacted: true }),
+    )
+    expect(pendingRefillFields(tabs.activeTab).map(identityTuple)).toEqual([
+      ["refill", "query", null, "apikey"],
+    ])
+    expect(wrapper.find("[data-testid=\"history-redacted-banner\"]").exists()).toBe(true)
+
+    const save = wrapper.findAll("button").find((b) => b.text().includes("request.save"))
+    await save!.trigger("click")
+    expect(
+      (wrapper.find("[data-testid=\"request-save-submit\"]").element as HTMLButtonElement).disabled,
+    ).toBe(true)
+    expect(saveRequest).not.toHaveBeenCalled()
+  })
 })

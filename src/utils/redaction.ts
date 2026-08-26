@@ -807,22 +807,25 @@ export function isUnverifiableBody(kind: BodyKind, content: string): boolean {
 }
 
 /**
- * The marker is cleared only when the value becomes non-empty. Toggling
- * `enabled`, editing the key or the description must keep it — otherwise the row
- * goes back to looking normal while still holding no value — and so must an edit
- * that leaves the value empty, for exactly the same reason: an empty credential
- * is still empty after someone has clicked into its box.
+ * No edit clears the marker. `redacted` says "history blanked this row", which
+ * is a fact about where the row came from and stays true however the value is
+ * edited; whether the row still needs typing back in is the *conjunction*
+ * `redacted && value === ""`, and every reader asks it that way. Filling the
+ * value in therefore answers "no" on its own, with nothing to clear, and
+ * deleting what was typed answers "yes" again.
  *
- * What this does not recover: typing into a marked row and then deleting what
- * was typed. The marker was legitimately cleared on the first keystroke and
- * nothing brings it back, so that row ends up blank and ungated. Restoring it
- * needs a per-row record of "this was blanked" that outlives the value itself,
- * which is more state than this function is given.
+ * This is the single record of what was blanked that outlives the value, so
+ * throwing it away on the first keystroke is what made a typed-then-deleted
+ * credential go quiet: the notice came down, the save unlocked, and the request
+ * was written with an empty api key that 401s the next time anyone uses it.
+ * An earlier note here declared that case out of reach for want of exactly this
+ * record. The record was never missing — it was being discarded two lines below
+ * the sentence that said it did not exist.
+ *
+ * Keeping it means a marker can outlive its usefulness (a row whose key the
+ * user retyped into something else stays marked). That direction costs a
+ * confirmation; the other direction costs a credential.
  */
 export function applyPairEdit<T extends KeyValuePair>(rows: T[], id: string, patch: Partial<T>): T[] {
-  const becomesNonEmpty = patch.value !== undefined && patch.value !== ""
-
-  return rows.map((row) =>
-    row.id === id ? { ...row, ...patch, ...(becomesNonEmpty ? { redacted: false } : {}) } : row,
-  )
+  return rows.map((row) => (row.id === id ? { ...row, ...patch } : row))
 }

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import sharedKeys from "../__fixtures__/sensitive-keys.json"
+import { needsRefill } from "../pending-refill"
 import {
   REDACTION_SENTINEL,
   applyPairEdit,
@@ -46,20 +47,43 @@ describe("§3 redacted marker lifecycle", () => {
     ["enabled", { enabled: false } as Partial<KeyValuePair>],
     ["key", { key: "Cookie2" } as Partial<KeyValuePair>],
     ["description", { description: "note" } as Partial<KeyValuePair>],
+    // Touching the box is not filling it in. A rule keyed on "was the value
+    // part of this edit" rather than on what the row now holds lets a click-in,
+    // click-out — or a paste of nothing — drop the gate on a row that still
+    // holds no credential.
+    ["the value to empty", { value: "" } as Partial<KeyValuePair>],
+    // And filling it in does not clear it either: the marker records that
+    // history blanked this row, which stays true no matter what is typed over
+    // it. What stops the row being reported is the value, asked for separately.
+    ["the value to a real one", { value: "sid=1" } as Partial<KeyValuePair>],
   ])("keeps the marker when %s changes", (_field, patch) => {
     expect(applyPairEdit(marked, "Cookie-1", patch)[0].redacted).toBe(true)
   })
 
-  it("clears the marker when value changes", () => {
-    expect(applyPairEdit(marked, "Cookie-1", { value: "sid=1" })[0].redacted).toBe(false)
+  /**
+   * The pair the marker exists for, walked in order. Clearing it on the first
+   * keystroke made the second step unrecoverable: the row went back to blank
+   * with nothing left saying it had ever held a credential, so the notice came
+   * down, the save unlocked and the request was written with an empty api key.
+   *
+   * `needsRefill` is the question every reader actually asks, so it is what is
+   * asserted here — the marker on its own answers neither step.
+   */
+  it("stops reporting a filled row and reports it again once it is emptied", () => {
+    const filled = applyPairEdit(marked, "Cookie-1", { value: "sid=1" })
+    expect(needsRefill(filled[0])).toBe(false)
+
+    const emptiedAgain = applyPairEdit(filled, "Cookie-1", { value: "" })
+    expect(needsRefill(emptiedAgain[0])).toBe(true)
   })
 
-  // Touching the box is not filling it in. A rule keyed on "was the value part
-  // of this edit" rather than on what the value became lets a click-in,
-  // click-out — or a paste of nothing — drop the gate on a row that still holds
-  // no credential.
-  it("keeps the marker when the value is edited to empty", () => {
-    expect(applyPairEdit(marked, "Cookie-1", { value: "" })[0].redacted).toBe(true)
+  // The other direction, so that "never clear it" cannot be satisfied by
+  // marking everything: a row history never blanked is never reported, however
+  // it is edited.
+  it("never reports a row that carries no marker", () => {
+    const plain = [pair("page", "1")]
+
+    expect(needsRefill(applyPairEdit(plain, "page-1", { value: "" })[0])).toBe(false)
   })
 })
 
