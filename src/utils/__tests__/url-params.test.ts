@@ -362,11 +362,50 @@ describe("rebuilding params from the url keeps a still-blank row's marker", () =
   })
 
   /**
-   * Repeats are matched by position, not by name. `?tag=a&tag=` with only the
-   * second one blanked must not hand its marker to the first, and matching on
-   * name alone would do exactly that.
+   * The case that broke the previous, position-based version of this. Two
+   * same-named parameters, one already filled in, then the pair pasted back in
+   * the other order: a rule that pinned the marker to an ordinal handed it to
+   * the row that no longer needed it and left the blank one unmarked, so the
+   * gate disappeared on a still-empty API key.
    */
-  it("lines up repeats by occurrence rather than by name", () => {
+  it("keeps the blank row marked when same-named parameters are reordered", () => {
+    const current = [pair("apikey", "FILLED"), redacted("apikey")]
+
+    const synced = syncParamsFromUrl(`${BASE}?apikey=&apikey=FILLED`, current)
+
+    expect(synced.params.map((item) => [item.value, item.redacted])).toEqual([
+      ["", true],
+      ["FILLED", undefined],
+    ])
+  })
+
+  it("hands out no more markers than there are outstanding blanks", () => {
+    // One row was blanked; three blank rows in the url must not become three
+    // pending fields the user never had.
+    const synced = syncParamsFromUrl(`${BASE}?tag=&tag=&tag=`, [
+      redacted("tag"),
+      pair("tag", "b"),
+      pair("tag", "c"),
+    ])
+
+    expect(synced.params.filter((item) => item.redacted === true)).toHaveLength(1)
+  })
+
+  it("carries both markers when both rows are still blank, in either order", () => {
+    const current = [redacted("apikey"), redacted("apikey")]
+
+    for (const url of [`${BASE}?apikey=&apikey=`, `${BASE}?apikey=&other=x&apikey=`]) {
+      const synced = syncParamsFromUrl(url, current)
+      expect(synced.params.filter((item) => item.redacted === true)).toHaveLength(2)
+    }
+  })
+
+  /**
+   * Repeats are told apart by how many are still outstanding, not by name
+   * alone: `?tag=kept&tag=` with only the second one blanked must end up with
+   * exactly one marked row, and it must be the blank one.
+   */
+  it("marks the blank repeat and not the filled one", () => {
     const synced = syncParamsFromUrl(`${BASE}?tag=kept&tag=`, [
       pair("tag", "kept"),
       redacted("tag"),
@@ -385,19 +424,45 @@ describe("rebuilding params from the url keeps a still-blank row's marker", () =
     expect(synced.params[0].redacted).toBeUndefined()
   })
 
-  it("ignores disabled rows when lining up occurrences", () => {
-    // A disabled row is not in the url at all, so counting it would offset
-    // every match after it.
-    //
-    // The two rows must differ in the marker for this to prove anything: with
-    // both of them marked, counting the disabled one still lands on a marked
-    // row and the assertion holds either way. That version of this fixture
-    // existed first and let the mutation through.
-    const synced = syncParamsFromUrl(`${BASE}?apikey=`, [
-      { ...pair("apikey", ""), enabled: false },
-      redacted("apikey"),
+  /**
+   * A disabled row is not in the url at all, so it is not outstanding and must
+   * not add to the count.
+   *
+   * The marked row has to be the *disabled* one for this to prove anything. An
+   * earlier version of this fixture put the marker on the enabled row, and
+   * counting the disabled one made no difference to the total -- so the
+   * assertion held whether or not the filter was there. That is worth spelling
+   * out because the same fixture has now been a no-op twice, once against a
+   * position-based rule and once against this counting one: a fixture only
+   * tests a condition if the two branches of that condition disagree on it.
+   */
+  it("does not count a disabled row as outstanding", () => {
+    const synced = syncParamsFromUrl(`${BASE}?apikey=&apikey=`, [
+      { ...redacted("apikey"), enabled: false },
+      pair("apikey", ""),
     ])
 
-    expect(synced.params[0]).toEqual(expect.objectContaining({ value: "", redacted: true }))
+    // Scoped to the rebuilt rows. The disabled row is carried through verbatim,
+    // marker and all -- that is existing behaviour and not what this checks.
+    expect(
+      synced.params.filter((item) => item.enabled && item.redacted === true),
+    ).toHaveLength(0)
+  })
+
+  /**
+   * Only rows that are *still blank* count. Defence in depth rather than a
+   * reachable path today: the params table clears the marker when the value
+   * changes and this function never emits a marked row with a value, so a
+   * marked-but-filled row should not exist. The condition is what keeps the
+   * count meaning "outstanding" rather than "was ever blanked" if that ever
+   * stops being true, and this asserts it by handing the pure function the
+   * state directly.
+   */
+  it("does not count a marked row that already has a value", () => {
+    const synced = syncParamsFromUrl(`${BASE}?apikey=`, [
+      { ...redacted("apikey"), value: "ALREADY" },
+    ])
+
+    expect(synced.params.filter((item) => item.redacted === true)).toHaveLength(0)
   })
 })

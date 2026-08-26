@@ -586,6 +586,58 @@ describe("editing an unrelated part of the url keeps the query gate", () => {
   })
 
   /**
+   * The reorder case, end to end. Two blanked API keys, one typed back in, then
+   * the pair pasted back the other way round. Nothing about the second one was
+   * touched, so it has to stay pending and the save has to stay held.
+   */
+  it("keeps the still-blank one pending when same-named parameters are reordered", async () => {
+    const projects = useProjectsStore()
+    projects.activeProject = "My API"
+    const tabs = useTabsStore()
+    tabs.openHistoryEntry({
+      id: "h-4",
+      method: "GET",
+      url: `https://api.example.com/users?apikey=${REDACTION_SENTINEL}&apikey=${REDACTION_SENTINEL}`,
+      status: 200,
+      time: 10,
+      size: 10,
+      timestamp: "2026-03-27T10:00:00Z",
+      contentType: "application/json",
+      requestHeaders: [],
+      requestParams: [],
+      requestBodyType: "none",
+      requestBodyFormData: [],
+    } as HistoryEntry)
+
+    // Self-check: both rows must start out pending, otherwise the reorder below
+    // has nothing to lose and this test proves nothing.
+    expect(pendingRefillFields(tabs.activeTab)).toHaveLength(2)
+
+    const wrapper = mount(RequestPanel, { global: { plugins: [pinia] } })
+    await nextTick()
+
+    const urlBar = wrapper.findComponent(UrlBar)
+    await urlBar.vm.$emit("update:url", "https://api.example.com/users?apikey=FILLED&apikey=")
+    await nextTick()
+    expect(pendingRefillFields(tabs.activeTab)).toHaveLength(1)
+
+    // The reorder. Only the order changed; no value did.
+    await urlBar.vm.$emit("update:url", "https://api.example.com/users?apikey=&apikey=FILLED")
+    await nextTick()
+
+    expect(pendingRefillFields(tabs.activeTab).map(identityTuple)).toEqual([
+      ["refill", "query", null, "apikey"],
+    ])
+    expect(wrapper.find("[data-testid=\"history-redacted-banner\"]").exists()).toBe(true)
+
+    const save = wrapper.findAll("button").find((b) => b.text().includes("request.save"))
+    await save!.trigger("click")
+    expect(
+      (wrapper.find("[data-testid=\"request-save-submit\"]").element as HTMLButtonElement).disabled,
+    ).toBe(true)
+  })
+
+  /**
    * A positive control, not an independently load-bearing assertion, and
    * labelled as one rather than counted twice. `needsRefill` already requires an
    * empty value, so carrying the marker forward too eagerly cannot make this go

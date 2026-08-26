@@ -17,25 +17,36 @@ export function syncParamsFromUrl(rawUrl: string, currentParams: KeyValuePair[])
   try {
     const parsed = new URL(toParsableUrl(rawUrl))
     /**
-     * Rebuilt rows are lined up against the existing ones by key and by which
-     * occurrence of that key they are, so that a row can carry forward what it
-     * was holding. Only the redaction marker is carried, and only while the
-     * value is still blank.
+     * How many still-blank redacted rows each key has, carried across the
+     * rebuild and handed to the blank rows of that key in the new url.
      *
-     * Without this, editing any part of the url dropped the marker, and with it
-     * the save gate on a credential history had blanked: changing the path of
-     * `?apikey=` was enough to let an empty API key be saved unannounced. The
-     * marker records that history took the value away — not that the url has
-     * not been touched since — so an edit elsewhere must not clear it. Typing a
-     * value in does clear it, which is the same rule the params table follows.
+     * The marker records that history took a value away, so an edit that is not
+     * about that value must not clear it: dropping it on every rebuild meant
+     * changing the path of `?apikey=` let an empty API key be saved with no
+     * warning. Typing a value in does clear it, which is the rule the params
+     * table follows too.
+     *
+     * It is counted per key rather than matched per row on purpose. Anything
+     * that pins the marker to a row's position -- an index, an ordinal among
+     * same-named keys -- is pinning it to something the rebuild itself
+     * reassigns: with two blank `apikey` rows, filling the first and then
+     * pasting the pair back in the other order handed the marker to the row
+     * that no longer needed it and left the blank one unmarked. A count of
+     * what is still outstanding cannot be reordered.
      */
-    const enabled = currentParams.filter((item) => item.enabled)
-    const seen = new Map<string, number>()
+    const outstanding = new Map<string, number>()
+    for (const item of currentParams) {
+      if (item.enabled && item.redacted === true && item.value === "") {
+        outstanding.set(item.key, (outstanding.get(item.key) ?? 0) + 1)
+      }
+    }
 
     const params = [...parsed.searchParams.entries()].map(([key, value]) => {
-      const occurrence = seen.get(key) ?? 0
-      seen.set(key, occurrence + 1)
-      const previous = enabled.filter((item) => item.key === key)[occurrence]
+      const left = value === "" ? (outstanding.get(key) ?? 0) : 0
+
+      if (left > 0) {
+        outstanding.set(key, left - 1)
+      }
 
       return {
         id: crypto.randomUUID(),
@@ -43,7 +54,7 @@ export function syncParamsFromUrl(rawUrl: string, currentParams: KeyValuePair[])
         key,
         value,
         description: "",
-        ...(value === "" && previous?.redacted === true ? { redacted: true } : {}),
+        ...(left > 0 ? { redacted: true } : {}),
       }
     })
     // Store URL without query string — params are the source of truth
