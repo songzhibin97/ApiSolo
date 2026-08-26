@@ -380,16 +380,27 @@ describe("rebuilding params from the url keeps a still-blank row's marker", () =
     ])
   })
 
-  it("hands out no more markers than there are outstanding blanks", () => {
-    // One row was blanked; three blank rows in the url must not become three
-    // pending fields the user never had.
+  /**
+   * Every blank row of a blanked key is marked, not a capped number of them.
+   * An earlier version of this test asserted a cap of one, which was the
+   * signature of trying to say *which* blank row was the blanked one — the
+   * question that has no answer in a url. Three empty `tag` values go out as
+   * three empty values whichever row each came from.
+   */
+  it("marks every blank row of a key that was blanked", () => {
     const synced = syncParamsFromUrl(`${BASE}?tag=&tag=&tag=`, [
       redacted("tag"),
       pair("tag", "b"),
       pair("tag", "c"),
     ])
 
-    expect(synced.params.filter((item) => item.redacted === true)).toHaveLength(1)
+    expect(synced.params.filter((item) => item.redacted === true)).toHaveLength(3)
+  })
+
+  it("marks no blank row of a key that was never blanked", () => {
+    const synced = syncParamsFromUrl(`${BASE}?tag=&tag=`, [pair("tag", "b"), pair("tag", "c")])
+
+    expect(synced.params.filter((item) => item.redacted === true)).toHaveLength(0)
   })
 
   it("carries both markers when both rows are still blank, in either order", () => {
@@ -485,18 +496,15 @@ describe("rebuilding params from the url keeps a still-blank row's marker", () =
  * guards — a suite that only covers one side lets the next change regress the
  * other in silence.
  *
- *   MISSING GATE — a still-blank credential stops being reported, the save goes
+ *   MISSING GATE — a blank sensitive value stops being reported, the save goes
  *   through, and the request 401s once someone uses it.
- *   FALSE GATE   — the value that was blanked has been typed back in, but the
- *   notice and the confirmation will not clear.
+ *   FALSE GATE   — nothing of that key is blank any more, but the notice and
+ *   the confirmation will not clear.
  *
- * What each of these is worth, measured rather than asserted. Only
- * "keeps a matched row's identity" has a mutation that nothing else catches.
- * "a row the user added does not inherit" is the one that is red against the
- * counting rule this replaced, which is the regression that actually happened.
- * The remaining four are boundary variations: they are killed only by mutations
- * that also fell several other tests, so they are kept as documentation of the
- * shape rather than counted as independent coverage.
+ * Note what the release condition became: the key has no blank rows left, not
+ * "the particular row that was blanked got filled in". The second phrasing is
+ * what three earlier rules tried to implement, and it is unanswerable — a url
+ * holds no fact distinguishing two same-named blank parameters.
  */
 describe("carrying the marker holds both directions shut", () => {
   const redacted = (key: string, id = `${key}-r`): KeyValuePair => ({
@@ -511,7 +519,7 @@ describe("carrying the marker holds both directions shut", () => {
   const marks = (params: KeyValuePair[]) =>
     params.filter((item) => item.redacted === true && item.value === "").length
 
-  it("MISSING GATE: an untouched blank stays marked when a sibling is filled", () => {
+  it("MISSING GATE: a blank stays marked when a sibling of the same key is filled", () => {
     const after = syncParamsFromUrl(`${BASE}?apikey=SECRET&apikey=`, [
       redacted("apikey", "first"),
       redacted("apikey", "second"),
@@ -521,70 +529,146 @@ describe("carrying the marker holds both directions shut", () => {
   })
 
   /**
-   * The reported case. One blanked parameter, the user adds a second blank row
-   * of the same name, then fills in the one that was actually blanked. Nothing
-   * is outstanding any more, so nothing may be marked — a rule that hands the
-   * marker to "some blank row of this key" moves it to the row the user just
-   * created and blocks a request that is now complete.
+   * The chain the review walked, with the values recomputed for this rule
+   * rather than copied. `[blank/marked, X, blank/unmarked]` pasted back in any
+   * order: two blanks of a blanked key, so two marks, in every arrangement.
+   * Under the rules that tried to identify rows, some arrangements produced one
+   * mark on the wrong row — which was wrong in both directions at once.
    */
-  it("FALSE GATE: a row the user added does not inherit, so filling the real one clears", () => {
-    const added = syncParamsFromUrl(`${BASE}?apikey=&apikey=`, [redacted("apikey")]).params
-    expect(marks(added)).toBe(1)
-
-    const filled = syncParamsFromUrl(`${BASE}?apikey=SECRET&apikey=`, added).params
-    expect(marks(filled)).toBe(0)
-  })
-
-  it("FALSE GATE: same thing with the added row in front", () => {
-    // The user's new blank row ends up ahead of the one history blanked, so a
-    // position-based rule gets this the wrong way round too.
-    const added = syncParamsFromUrl(`${BASE}?apikey=&apikey=FILLED`, [
-      pair("apikey", "FILLED"),
-    ]).params
-    expect(marks(added)).toBe(0)
-
-    const withReal = syncParamsFromUrl(`${BASE}?apikey=&apikey=FILLED`, [
-      redacted("apikey"),
-      pair("apikey", "FILLED"),
-    ]).params
-    expect(marks(withReal)).toBe(1)
-
-    const filled = syncParamsFromUrl(`${BASE}?apikey=SECRET&apikey=FILLED`, withReal).params
-    expect(marks(filled)).toBe(0)
-  })
-
-  it("FALSE GATE: three of a kind, filling each in turn clears one at a time", () => {
-    let rows = [redacted("apikey", "a"), redacted("apikey", "b"), redacted("apikey", "c")]
-    expect(marks(rows)).toBe(3)
-
-    rows = syncParamsFromUrl(`${BASE}?apikey=1&apikey=&apikey=`, rows).params
-    expect(marks(rows)).toBe(2)
-
-    rows = syncParamsFromUrl(`${BASE}?apikey=1&apikey=2&apikey=`, rows).params
-    expect(marks(rows)).toBe(1)
-
-    rows = syncParamsFromUrl(`${BASE}?apikey=1&apikey=2&apikey=3`, rows).params
-    expect(marks(rows)).toBe(0)
-  })
-
-  it("MISSING GATE: reordering filled and blank rows keeps the count", () => {
-    const start = [redacted("apikey", "blank"), pair("apikey", "FILLED")]
+  it("MISSING GATE: any rearrangement of the same rows gives the same answer", () => {
+    const start = [redacted("apikey", "a"), pair("apikey", "X"), pair("apikey", "")]
 
     for (const url of [
-      `${BASE}?apikey=&apikey=FILLED`,
-      `${BASE}?apikey=FILLED&apikey=`,
-      `${BASE}?other=x&apikey=FILLED&apikey=`,
+      `${BASE}?apikey=&apikey=X&apikey=`,
+      `${BASE}?apikey=X&apikey=&apikey=`,
+      `${BASE}?apikey=&apikey=&apikey=X`,
     ]) {
-      expect(`${url}: ${marks(syncParamsFromUrl(url, start).params)}`).toBe(`${url}: 1`)
+      expect(`${url}: ${marks(syncParamsFromUrl(url, start).params)}`).toBe(`${url}: 2`)
     }
   })
 
-  it("keeps a matched row's identity so the row is not remounted mid-edit", () => {
-    const after = syncParamsFromUrl(`${BASE}?apikey=&page=1`, [
-      redacted("apikey", "keep-me"),
+  it("MISSING GATE: inserting a blank row in front does not lose the gate", () => {
+    const after = syncParamsFromUrl(`${BASE}?apikey=&apikey=FILLED`, [
+      redacted("apikey", "blank"),
+      pair("apikey", "FILLED"),
+    ]).params
+
+    expect(marks(after)).toBe(1)
+  })
+
+  it("MISSING GATE: deleting the marked blank but keeping a plain blank still gates", () => {
+    // Which of the two blanks was removed is exactly the unanswerable question.
+    // It does not need answering: an empty apikey remains either way.
+    const after = syncParamsFromUrl(`${BASE}?apikey=`, [
+      redacted("apikey", "was-blanked"),
+      pair("apikey", ""),
+    ]).params
+
+    expect(marks(after)).toBe(1)
+  })
+
+  /**
+   * The accepted cost of this rule, written down as a test so it is a decision
+   * rather than a surprise. The user adds a second blank `apikey` of their own
+   * and fills in one of the two: an empty `apikey` is still going to be sent,
+   * so the notice stays and the save needs the acknowledgement ticked.
+   *
+   * Reported as a false gate against the previous rule and it was one there,
+   * because that rule claimed to know which row was which. This rule makes no
+   * such claim, so the remaining blank is reported accurately. Filling both, or
+   * deleting the spare, clears it — that is the release path.
+   */
+  it("FALSE GATE: a remaining blank keeps gating, and filling it clears", () => {
+    const added = syncParamsFromUrl(`${BASE}?apikey=&apikey=`, [redacted("apikey")]).params
+    expect(marks(added)).toBe(2)
+
+    const half = syncParamsFromUrl(`${BASE}?apikey=SECRET&apikey=`, added).params
+    expect(marks(half)).toBe(1)
+
+    const whole = syncParamsFromUrl(`${BASE}?apikey=SECRET&apikey=OTHER`, half).params
+    expect(marks(whole)).toBe(0)
+  })
+
+  it("FALSE GATE: deleting the spare blank row clears it too", () => {
+    const added = syncParamsFromUrl(`${BASE}?apikey=&apikey=`, [redacted("apikey")]).params
+
+    const trimmed = syncParamsFromUrl(`${BASE}?apikey=SECRET`, added).params
+
+    expect(marks(trimmed)).toBe(0)
+  })
+
+  it("FALSE GATE: filling every blank of the key clears it in one step", () => {
+    const rows = [redacted("apikey", "a"), redacted("apikey", "b")]
+
+    const filled = syncParamsFromUrl(`${BASE}?apikey=1&apikey=2`, rows).params
+
+    expect(marks(filled)).toBe(0)
+  })
+
+  it("FALSE GATE: deleting the parameter altogether clears it", () => {
+    const after = syncParamsFromUrl(`${BASE}?page=1`, [
+      redacted("apikey"),
       pair("page", "1"),
     ]).params
 
-    expect(after.find((item) => item.key === "apikey")?.id).toBe("keep-me")
+    expect(marks(after)).toBe(0)
+  })
+
+  it("FALSE GATE: a re-added parameter is the user's own row, not a blanked one", () => {
+    const gone = syncParamsFromUrl(`${BASE}?page=1`, [redacted("apikey"), pair("page", "1")]).params
+
+    const back = syncParamsFromUrl(`${BASE}?page=1&apikey=`, gone).params
+
+    expect(marks(back)).toBe(0)
+  })
+
+  /**
+   * "Blanked" means a value is *still* outstanding, not that one was blanked at
+   * some point. Without the second half, a key whose blank had already been
+   * filled in would keep stamping markers onto any blank row added later, and
+   * the notice would never stop coming back.
+   *
+   * The input is reached by handing the pure function the state directly: the
+   * emit side never produces a marked row holding a value, which is what makes
+   * this redundant in practice and worth pinning anyway — it is what fixes the
+   * local meaning of the set, and a reader has no other way to tell whether
+   * "blanked" means "ever" or "still".
+   */
+  it("treats a key whose blank was already filled as not outstanding", () => {
+    const after = syncParamsFromUrl(`${BASE}?apikey=&apikey=ALREADY`, [
+      { ...redacted("apikey"), value: "ALREADY" },
+    ]).params
+
+    expect(marks(after)).toBe(0)
+  })
+
+  /**
+   * Identity is reused only where it is unambiguous — same key, same non-empty
+   * value. Blank rows are deliberately left unmatched, since telling two of
+   * them apart is the question this rule stops asking; they get a fresh handle,
+   * which is what they had before any of this.
+   */
+  it("gives a blank row a fresh handle rather than another row's", () => {
+    // Reusing a blank row's identity hands its description to a row that may
+    // mean something else, and lets the list reuse the wrong DOM row.
+    const after = syncParamsFromUrl(`${BASE}?apikey=&apikey=`, [
+      { ...redacted("apikey", "was-blanked"), description: "the one from history" },
+      { ...pair("apikey", ""), id: "mine", description: "mine" },
+    ]).params
+
+    expect(after.map((item) => item.description)).toEqual(["", ""])
+    expect(after.map((item) => item.id)).not.toContain("was-blanked")
+    expect(after.map((item) => item.id)).not.toContain("mine")
+  })
+
+  it("keeps the identity of a row whose value did not change", () => {
+    const after = syncParamsFromUrl(`${BASE}?apikey=&page=1`, [
+      redacted("apikey", "blank-row"),
+      { ...pair("page", "1"), id: "keep-me", description: "which page" },
+    ]).params
+
+    expect(after.find((item) => item.key === "page")).toEqual(
+      expect.objectContaining({ id: "keep-me", description: "which page" }),
+    )
   })
 })

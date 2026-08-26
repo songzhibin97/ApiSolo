@@ -7,16 +7,28 @@ export interface KeyValuePair {
   /**
    * In-memory only: the value was redacted in history and needs re-entering.
    *
-   * Three rules, because this has been got wrong once per rebuild site. Anything
-   * that reconstructs a row must **preserve** it; it may only be **cleared**
-   * when that row's value becomes non-empty; and it is **stripped** before the
-   * row is persisted or written to history. Dropping it where it should be
-   * preserved silently removes a save gate on a blanked credential; keeping it
-   * on a row the user just created blocks a request that is already complete.
-   *
-   * It records where the blank came from, never how far the user has got: the
+   * It records where a blank came from, never how far the user has got. The
    * gate reads this *and* the current value, so a marked row holding a value is
-   * inert. Do not use it as "this row is pending" on its own.
+   * inert — do not treat this on its own as "the row is pending".
+   *
+   * Two rules for anything that touches it while a request is being edited.
+   * Both have been got wrong at least once:
+   *
+   *   - It is **stripped** before a row is persisted or written to history. It
+   *     is session state, not data.
+   *   - A rebuild must not lose it, and must not invent it. Losing it silently
+   *     removes the save gate on a blanked credential; inventing it blocks a
+   *     request that is already complete. Where rows can be told apart, carry
+   *     it per row and clear it when that row's value becomes non-empty. Where
+   *     they cannot -- the query string, whose two identical blank `apikey`
+   *     parameters hold no fact saying which is which -- carry it per key
+   *     instead: see `syncParamsFromUrl`. Do not invent a tie-break; three
+   *     attempts to do that each failed in one direction or the other.
+   *
+   * Scope note: this is about the marker's life inside *editable request state*.
+   * It is deliberately not a claim about every site that rebuilds a
+   * `KeyValuePair[]` — that set grows with the code, and the gate does not
+   * depend on all of it.
    */
   redacted?: boolean
 }

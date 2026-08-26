@@ -638,16 +638,15 @@ describe("editing an unrelated part of the url keeps the query gate", () => {
   })
 
   /**
-   * FALSE GATE, end to end. The other direction from everything above: here the
-   * user has done the right thing and must not stay blocked.
+   * FALSE GATE, end to end. The other direction from everything above: once no
+   * `apikey` is blank any more, the notice must go and the save must unlock.
    *
-   * One blanked API key, the user adds a second blank row of the same name, then
-   * fills in the one that was actually blanked. Nothing is outstanding, so the
-   * notice must go and the save must unlock. A rule that hands the marker to
-   * whichever blank row is available moves it to the row the user just created
-   * and holds a request that is now complete.
+   * The release condition is "the key has no blank rows left", not "the
+   * particular row history blanked got filled in". The second phrasing needs to
+   * know which of two identical blank parameters is which, and a url does not
+   * say — so this walks the whole way to no blanks rather than stopping at one.
    */
-  it("clears the gate when the blanked parameter is filled beside a row the user added", async () => {
+  it("clears the gate once no parameter of that key is blank", async () => {
     const projects = useProjectsStore()
     projects.activeProject = "My API"
     const tabs = useTabsStore()
@@ -672,15 +671,23 @@ describe("editing an unrelated part of the url keeps the query gate", () => {
     await nextTick()
     const urlBar = wrapper.findComponent(UrlBar)
 
-    // The user adds a second, empty apikey of their own.
+    // The user adds a second, empty apikey of their own. Both are blank and the
+    // key was blanked, so both are reported — the accepted cost of not
+    // pretending to know which row is which.
     await urlBar.vm.$emit("update:url", "https://api.example.com/users?apikey=&apikey=")
     await nextTick()
-    // Self-check: still exactly one pending, not two. If the added row inherited
-    // here, the assertion below would pass for the wrong reason.
-    expect(pendingRefillFields(tabs.activeTab)).toHaveLength(1)
+    expect(pendingRefillFields(tabs.activeTab)).toHaveLength(2)
 
-    // Now they fill in the one history had blanked.
+    // Filling one still leaves an empty apikey, which is reported accurately.
     await urlBar.vm.$emit("update:url", "https://api.example.com/users?apikey=SECRET&apikey=")
+    await nextTick()
+    // Self-check on the step that matters: if the gate had already cleared here,
+    // the final assertion would pass without the release path being exercised.
+    expect(pendingRefillFields(tabs.activeTab)).toHaveLength(1)
+    expect(wrapper.find("[data-testid=\"history-redacted-banner\"]").exists()).toBe(true)
+
+    // Nothing of that key is blank now, so the gate lifts.
+    await urlBar.vm.$emit("update:url", "https://api.example.com/users?apikey=SECRET&apikey=TWO")
     await nextTick()
 
     expect(pendingRefillFields(tabs.activeTab)).toEqual([])

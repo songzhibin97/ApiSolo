@@ -17,35 +17,62 @@ export function syncParamsFromUrl(rawUrl: string, currentParams: KeyValuePair[])
   try {
     const parsed = new URL(toParsableUrl(rawUrl))
     /**
-     * Each rebuilt row is reconciled back to the row it came from, and only
-     * then does it inherit anything. The redaction marker is what makes this
-     * matter: it records that history took a value away, so an edit that is not
-     * about that value must not drop it -- changing the path of `?apikey=` used
-     * to be enough to let an empty API key be saved with no warning.
+     * The marker travels per key, not per row: if a key still has a value that
+     * history blanked and nobody has typed back in, every blank row of that key
+     * in the rebuilt list is marked.
      *
-     * Two failure directions have to be held shut at once, and every cheaper
-     * rule so far has closed one by opening the other:
+     * This is not an approximation of a per-row rule, it is the absence of one,
+     * and that is the point. Two rows with the same key and the same value are
+     * indistinguishable -- there is no fact in a url that says which blank
+     * `apikey` is "the" blanked one. Every rule that tried to answer that
+     * question failed in one of two directions, and fixing one direction opened
+     * the other:
      *
-     *   - Rebuilding rows blindly loses the marker, so a still-blank credential
-     *     stops being reported. That is a gate that should have held and did
-     *     not, and the request 401s in silence once it is used.
-     *   - Handing the marker out by position, or by a count of how many blanks
-     *     a key still has, gives it to whichever blank row happens to be there
-     *     -- including one the user just added. Then filling in the value that
-     *     was actually blanked does not clear the notice, and a correct request
-     *     stays blocked.
+     *   - Rebuild the rows blindly and the marker is lost, so a still-blank
+     *     credential stops being reported: the save goes through and the
+     *     request 401s in silence once someone uses it.
+     *   - Hand the marker to a row chosen by position, by ordinal among
+     *     same-named keys, or by order-preserving match, and it can land on a
+     *     row the user just added. Then filling in the value that really was
+     *     blanked leaves the notice up on a request that is already complete.
      *
-     * So identity comes first and the marker follows it, rather than the marker
-     * being allocated to a slot. A row keeps its identity if its value is
-     * unchanged, wherever it moved to; the rest pair up in order; anything left
-     * over is a row the user created and inherits nothing.
+     * Asking "is any `apikey` still empty" has an answer; asking "which one"
+     * does not. And the first question is the one that matters to the person
+     * reading the notice: an empty `apikey` goes out empty whichever row it
+     * came from.
+     *
+     * The cost, stated rather than hidden: deliberately sending one sensitive
+     * parameter empty alongside a filled one keeps the notice up, and the user
+     * has to tick the acknowledgement to save. That is the direction to err in,
+     * and it is a confirmation rather than a refusal.
      */
     const entries = [...parsed.searchParams.entries()]
+    const blanked = new Set<string>()
+
+    for (const item of currentParams) {
+      if (item.enabled && item.redacted === true && item.value === "") {
+        blanked.add(item.key)
+      }
+    }
+
+    /**
+     * Identity is only reused where it is unambiguous: a row whose key and
+     * non-empty value both still appear is the same row wherever it moved to.
+     * Blank rows are deliberately not matched -- that is the question with no
+     * answer -- so they get a fresh handle, which is what they got before any
+     * of this.
+     */
     const enabled = currentParams.filter((item) => item.enabled)
     const claimed = new Set<number>()
 
-    function claim(predicate: (item: KeyValuePair) => boolean): KeyValuePair | undefined {
-      const index = enabled.findIndex((item, at) => !claimed.has(at) && predicate(item))
+    function claimSameValue(key: string, value: string): KeyValuePair | undefined {
+      if (value === "") {
+        return undefined
+      }
+
+      const index = enabled.findIndex(
+        (item, at) => !claimed.has(at) && item.key === key && item.value === value,
+      )
 
       if (index === -1) {
         return undefined
@@ -55,24 +82,8 @@ export function syncParamsFromUrl(rawUrl: string, currentParams: KeyValuePair[])
       return enabled[index]
     }
 
-    const matched: Array<KeyValuePair | undefined> = entries.map(() => undefined)
-
-    // An unchanged value is the strongest evidence that this is the same row,
-    // and it is order-independent -- which is what makes reordering harmless.
-    entries.forEach(([key, value], index) => {
-      if (value !== "") {
-        matched[index] = claim((item) => item.key === key && item.value === value)
-      }
-    })
-
-    // Whatever is left pairs up left to right, keeping rows as close to where
-    // they were as an order-preserving match can.
-    entries.forEach(([key], index) => {
-      matched[index] ??= claim((item) => item.key === key)
-    })
-
-    const params = entries.map(([key, value], index) => {
-      const previous = matched[index]
+    const params = entries.map(([key, value]) => {
+      const previous = claimSameValue(key, value)
 
       return {
         id: previous?.id ?? crypto.randomUUID(),
@@ -80,7 +91,7 @@ export function syncParamsFromUrl(rawUrl: string, currentParams: KeyValuePair[])
         key,
         value,
         description: previous?.description ?? "",
-        ...(value === "" && previous?.redacted === true ? { redacted: true } : {}),
+        ...(value === "" && blanked.has(key) ? { redacted: true } : {}),
       }
     })
     // Store URL without query string — params are the source of truth
