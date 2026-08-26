@@ -701,12 +701,22 @@ describe("the query rows a history entry describes come from both copies of it",
   })
 
   /**
-   * FALSE GATE. When the params copy names its own blanked rows, the url must
-   * not have a second say about that key: one `apikey` was sent filled and one
-   * empty, so exactly one value needs typing back in. Letting the url mark by
-   * key on top of that reports two, and the row beside it reports one.
+   * MISSED GATE. One key, one row sent filled and one sent empty. The two copies
+   * describe it differently on purpose -- the params copy stamps the value it
+   * found and leaves the empty row alone, the url stamps the whole key -- and
+   * reading the url's answer *minus* the keys the params copy reports as blanked
+   * dropped it for exactly this shape: the blank row came back unmarked, filling
+   * the marked one emptied the list, the notice came down, the save unlocked and
+   * `apikey=""` went into the collection to 401 in silence later.
+   *
+   * Which of the two blanks in the replayed tab is "the" credential is not a
+   * question the entry can answer -- an `apikey=` blanked by an earlier
+   * generation and never typed back in reaches this reader in the same shape as
+   * one the user meant to send empty -- so both are reported, on the standing
+   * ruling that over-reporting costs a confirmation and under-reporting costs a
+   * credential.
    */
-  it("does not count a key the stored params already report as blanked", () => {
+  it("marks every blank row of a key one copy reports as blanked", () => {
     const store = useTabsStore()
     const entry = sanitizeHistoryEntry(
       makeHistoryEntry({
@@ -717,10 +727,114 @@ describe("the query rows a history entry describes come from both copies of it",
       }),
     )
 
+    // Self-check on the fixture: this is the disagreement, not a hand-written
+    // approximation of it.
+    expect(entry.requestParams).toEqual([
+      expect.objectContaining({ key: "apikey", value: REDACTION_SENTINEL }),
+      expect.objectContaining({ key: "apikey", value: "" }),
+    ])
+    expect(entry.url).toBe(
+      `https://api.example.com/users?apikey=${REDACTION_SENTINEL}&apikey=${REDACTION_SENTINEL}`,
+    )
+
     store.openHistoryEntry(entry)
 
-    expect(panelGate(store.activeTab)).toEqual([["refill", "query", null, "apikey"]])
+    expect(store.activeTab.params).toEqual([
+      expect.objectContaining({ key: "apikey", value: "", redacted: true }),
+      expect.objectContaining({ key: "apikey", value: "", redacted: true }),
+    ])
+    expect(panelGate(store.activeTab)).toEqual([
+      ["refill", "query", null, "apikey"],
+      ["refill", "query", null, "apikey"],
+    ])
     expect(panelGate(store.activeTab)).toEqual(rowGate(entry))
+  })
+
+  // The same shape with the rows the other way round. Which row holds the
+  // placeholder is not a fact the rule may turn on, and a rule that read the
+  // first row of the key would pass the test above and fail this one.
+  it("marks every blank row when the blank one was sent first", () => {
+    const store = useTabsStore()
+    const entry = sanitizeHistoryEntry(
+      makeHistoryEntry({
+        url: "https://api.example.com/users?apikey=&apikey=SECRET",
+        requestParams: [pair("apikey", ""), pair("apikey", "SECRET")],
+        requestBodyType: "none",
+        requestBodyContent: undefined,
+      }),
+    )
+
+    store.openHistoryEntry(entry)
+
+    expect(panelGate(store.activeTab)).toEqual([
+      ["refill", "query", null, "apikey"],
+      ["refill", "query", null, "apikey"],
+    ])
+    expect(panelGate(store.activeTab)).toEqual(rowGate(entry))
+  })
+
+  /**
+   * The same pair with the url carrying no query at all, which is what a tab
+   * whose URL bar was touched last records: `syncParamsFromUrl` moves the query
+   * into the params and stores the bare url, so the params copy is the only one
+   * that can say anything about the key. Reading the blanked fact off the url
+   * alone answers "nothing was blanked" for an entry in this shape, whatever its
+   * params hold.
+   */
+  it("marks every blank row of a blanked key when the url kept no query", () => {
+    const store = useTabsStore()
+    const entry = sanitizeHistoryEntry(
+      makeHistoryEntry({
+        url: "https://api.example.com/users",
+        requestParams: [pair("apikey", "SECRET"), pair("apikey", "")],
+        requestBodyType: "none",
+        requestBodyContent: undefined,
+      }),
+    )
+
+    expect(entry.url).toBe("https://api.example.com/users")
+
+    store.openHistoryEntry(entry)
+
+    expect(store.activeTab.params).toEqual([
+      expect.objectContaining({ key: "apikey", value: "", redacted: true }),
+      expect.objectContaining({ key: "apikey", value: "", redacted: true }),
+    ])
+    expect(panelGate(store.activeTab)).toEqual([
+      ["refill", "query", null, "apikey"],
+      ["refill", "query", null, "apikey"],
+    ])
+    expect(panelGate(store.activeTab)).toEqual(rowGate(entry))
+  })
+
+  /**
+   * Both directions of that row, in the order the user meets them. Typing the
+   * credential into one blank used to clear the notice outright; it now leaves
+   * the other blank listed, and only filling that one too empties the list.
+   * Without the second half this test would pass on a gate that never lifts.
+   */
+  it("holds the gate until every blank row of the key is filled", () => {
+    const store = useTabsStore()
+
+    store.openHistoryEntry(
+      sanitizeHistoryEntry(
+        makeHistoryEntry({
+          url: "https://api.example.com/users?apikey=SECRET&apikey=",
+          requestParams: [pair("apikey", "SECRET"), pair("apikey", "")],
+          requestBodyType: "none",
+          requestBodyContent: undefined,
+        }),
+      ),
+    )
+
+    const opened = store.activeTab
+    opened.params[0].value = "SECRET"
+
+    expect(panelGate(opened)).toEqual([["refill", "query", null, "apikey"]])
+
+    opened.params[1].value = "OTHER"
+
+    expect(panelGate(opened)).toEqual([])
   })
 
   /**
@@ -823,6 +937,22 @@ describe("the query rows a history entry describes come from both copies of it",
           requestBodyType: "none",
           requestBodyContent: undefined,
         }),
+      ],
+      // One key, one blank row and one the params copy names as blanked. The
+      // two entry points agreed on the wrong number here before -- both said
+      // one where there are two blanks to fill -- so agreement alone is not what
+      // this case is for; it is here because the number they agree on has to
+      // stay the same one when either side is edited.
+      [
+        "a key with a blanked row and a blank row",
+        sanitizeHistoryEntry(
+          makeHistoryEntry({
+            url: "https://api.example.com/users?apikey=SECRET&apikey=",
+            requestParams: [pair("apikey", "SECRET"), pair("apikey", "")],
+            requestBodyType: "none",
+            requestBodyContent: undefined,
+          }),
+        ),
       ],
       // The overlap the two rules answered differently: a placeholder in one
       // copy, the value in the other. Both must call it done, because done is

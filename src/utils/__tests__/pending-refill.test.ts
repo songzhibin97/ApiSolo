@@ -291,6 +291,107 @@ describe("the query overlap collapses, a same-source repeat does not", () => {
     ).toEqual(["Query · apikey"])
   })
 
+  /**
+   * MISSED GATE, and the shape the per-key rule claimed to cover and did not:
+   * one key, one row holding the placeholder and one row blank. `apikey=SECRET`
+   * beside `apikey=` comes back exactly like this, because the pair redactor
+   * stamps the value it finds and leaves the empty one alone. The url's per-key
+   * answer used to be dropped for any key the params copy reported as blanked,
+   * so the blank row went unmarked, and typing the credential into the other row
+   * emptied the list while `apikey=""` was still on its way to the collection.
+   *
+   * Both orders, because "which row is the placeholder" is not a fact the rule
+   * may depend on -- a rule that reads the first row would pass one of these.
+   */
+  it("reports both rows when one holds the placeholder and the other is blank", () => {
+    expect(
+      labels(
+        request({
+          url: `https://api.example.com/s?apikey=${REDACTION_SENTINEL}&apikey=${REDACTION_SENTINEL}`,
+          params: [pair("apikey", REDACTION_SENTINEL), pair("apikey", "", { id: "apikey-2" })],
+        }),
+      ),
+    ).toEqual(["Query · apikey", "Query · apikey"])
+  })
+
+  it("reports both rows when the blank one comes first", () => {
+    expect(
+      labels(
+        request({
+          url: `https://api.example.com/s?apikey=${REDACTION_SENTINEL}&apikey=${REDACTION_SENTINEL}`,
+          params: [pair("apikey", ""), pair("apikey", REDACTION_SENTINEL, { id: "apikey-2" })],
+        }),
+      ),
+    ).toEqual(["Query · apikey", "Query · apikey"])
+  })
+
+  // The same pair on an entry whose url kept no query -- what a tab records
+  // when its URL bar was touched last, since `syncParamsFromUrl` stores the bare
+  // url and moves the query into the params. Nothing but the params copy can
+  // report the key as blanked here.
+  it("reports both rows of a blanked key when the url kept no query", () => {
+    expect(
+      labels(
+        request({
+          url: "https://api.example.com/s",
+          params: [pair("apikey", REDACTION_SENTINEL), pair("apikey", "", { id: "apikey-2" })],
+        }),
+      ),
+    ).toEqual(["Query · apikey", "Query · apikey"])
+  })
+
+  /**
+   * FALSE GATE, the other direction of the same shape. The key is still one the
+   * entry blanked, so the set it belongs to does not change -- what changes is
+   * that no row of it is empty any more, and a rule that reported by key alone
+   * would keep demanding a credential the user has already typed back in.
+   */
+  it("reports nothing once every row of the blanked key holds a value", () => {
+    expect(
+      labels(
+        request({
+          url: `https://api.example.com/s?apikey=${REDACTION_SENTINEL}&apikey=${REDACTION_SENTINEL}`,
+          params: [pair("apikey", "REAL"), pair("apikey", "OTHER", { id: "apikey-2" })],
+        }),
+      ),
+    ).toEqual([])
+  })
+
+  /**
+   * MISSED GATE, the replayed spelling of the same fact. After `openHistoryEntry`
+   * neither copy holds a placeholder any more -- the rows carry the marker and
+   * the url has been cleared -- so the marker is the only thing left saying the
+   * key was blanked. A blank row added beside a marked one from the table
+   * editor, which does not go through `syncParamsFromUrl`, is reachable only
+   * through it.
+   */
+  it("marks a blank row beside a marked one once the placeholders are gone", () => {
+    expect(
+      labels(
+        request({
+          url: "https://api.example.com/s",
+          params: [pair("apikey", "", { redacted: true }), pair("apikey", "", { id: "apikey-2" })],
+        }),
+      ),
+    ).toEqual(["Query · apikey", "Query · apikey"])
+  })
+
+  // FALSE GATE, the same pair once both rows hold a value. The marker outlives
+  // the value it was set for, so the key stays blanked and nothing is pending.
+  it("reports nothing for a marked row and its neighbour once both are filled", () => {
+    expect(
+      labels(
+        request({
+          url: "https://api.example.com/s",
+          params: [
+            pair("apikey", "TYPED-BACK", { redacted: true }),
+            pair("apikey", "OTHER", { id: "apikey-2" }),
+          ],
+        }),
+      ),
+    ).toEqual([])
+  })
+
   // Both sources carry the same repeated name: still two, not four and not one.
   it("keeps the count at the real number when both sources repeat it", () => {
     expect(
