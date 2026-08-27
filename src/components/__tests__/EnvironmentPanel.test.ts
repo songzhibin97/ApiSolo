@@ -18,12 +18,16 @@ const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }))
 
 vi.mock("../../utils/invoke", () => ({ invoke: invokeMock }))
 
+import { createI18n } from "vue-i18n"
+import { Lock, LockOpen } from "lucide-vue-next"
+
 import EnvironmentPanel from "../sidebar/EnvironmentPanel.vue"
 import ConfirmDialog from "../ui/ConfirmDialog.vue"
 import InlineError from "../ui/InlineError.vue"
 import { useEnvironmentsStore } from "../../stores/environments"
 import { useProjectsStore } from "../../stores/projects"
-import type { SecretKeyCollision } from "../../types"
+import zhCN from "../../i18n/zh-CN"
+import type { EnvVariable, SecretKeyCollision } from "../../types"
 
 let pinia: ReturnType<typeof createPinia>
 
@@ -111,7 +115,7 @@ function mountPanel() {
   return mount(EnvironmentPanel, {
     global: {
       plugins: [pinia],
-      stubs: { Eye: true, EyeOff: true, Lock: true, Plus: true, Trash2: true },
+      stubs: { Eye: true, EyeOff: true, Lock: true, LockOpen: true, Plus: true, Trash2: true },
     },
   })
 }
@@ -132,8 +136,38 @@ beforeEach(() => {
   pinia = createPinia()
   setActivePinia(pinia)
   t.mockClear()
+  // Back to the key-echo default: one test below (D13 §14, per A50) swaps in
+  // the real zh-CN catalog, and mockClear alone does not undo an implementation.
+  t.mockImplementation((key: string, _params?: Record<string, unknown>) => key)
   invokeMock.mockReset()
 })
+
+/**
+ * A panel with an active project, a draft environment and the given variable
+ * rows — entirely in memory. createEnvironment marks the name as a draft, so
+ * the activeEnv watcher skips load_environment and nothing here touches the
+ * (mocked) backend beyond the list read; setVariables is store-local state.
+ */
+async function mountWithVariables(vars: EnvVariable[]) {
+  stubBackend()
+  const projects = useProjectsStore()
+  projects.activeProject = "demo"
+  const wrapper = mountPanel()
+  await settle()
+
+  const environmentsStore = useEnvironmentsStore()
+  environmentsStore.createEnvironment("draft-env")
+  await settle()
+  environmentsStore.setVariables(vars)
+  await settle()
+
+  return { wrapper, environmentsStore }
+}
+
+const TWO_VARS: EnvVariable[] = [
+  { key: "base", value: "https://api.example.com", secret: false },
+  { key: "token", value: "s3cr3t", secret: true },
+]
 
 // PROCESS.md P12: prove the harness can say both words before trusting its
 // silence. Phase 1 is a correct assertion that must pass; phase 2 is the same
@@ -341,6 +375,151 @@ describe("D08 §8 no records, no collision nodes", () => {
     expect(
       t.mock.calls.every(([key]) => !String(key).startsWith("environment.collision")),
     ).toBe(true)
+  })
+})
+
+describe("D13 §1 §2 every row carries its two buttons and the header its eye", () => {
+  it("renders one secret toggle and one delete button per row, trailing empty row included", async () => {
+    const { wrapper } = await mountWithVariables(TWO_VARS)
+
+    const rows = wrapper.findAll('[data-testid="variable-row"]')
+    // Two variables plus the always-appended empty row.
+    expect(rows).toHaveLength(3)
+    for (const row of rows) {
+      expect(row.findAll('[data-testid="secret-toggle"]')).toHaveLength(1)
+      expect(row.findAll('[data-testid="delete-row"]')).toHaveLength(1)
+    }
+  })
+
+  it("renders exactly one eye button, in the header", async () => {
+    const { wrapper } = await mountWithVariables(TWO_VARS)
+
+    expect(wrapper.findAll('[data-testid="toggle-secret-visibility"]')).toHaveLength(1)
+    expect(
+      wrapper
+        .find('[data-testid="variable-table-header"]')
+        .find('[data-testid="toggle-secret-visibility"]')
+        .exists(),
+    ).toBe(true)
+  })
+})
+
+describe("D13 §13 the header shows a section label, not the four column labels", () => {
+  it("labels the section and renders no column-label spans", async () => {
+    const { wrapper } = await mountWithVariables(TWO_VARS)
+
+    // The section label's wiring (category ④: an injected t call)…
+    expect(t).toHaveBeenCalledWith("environment.variables")
+    // …and the four old labels' shape gone: they were <span> children of the
+    // header; the new header holds one label div and the eye button only.
+    const header = wrapper.find('[data-testid="variable-table-header"]')
+    expect(header.findAll("span")).toHaveLength(0)
+    // keyValue.del was only ever the fourth column label; the delete button
+    // uses keyValue.deleteRow, a different key.
+    expect(t).not.toHaveBeenCalledWith("keyValue.del")
+  })
+})
+
+describe("D13 §10 §11 §12 the controls say who they are", () => {
+  it("the secret toggle's title and aria-label follow its state", async () => {
+    const { wrapper } = await mountWithVariables(TWO_VARS)
+
+    const toggles = wrapper.findAll('[data-testid="secret-toggle"]')
+    // Row 0 is not secret, row 1 is (TWO_VARS order).
+    expect(toggles[0].attributes("title")).toBe("environment.visible")
+    expect(toggles[0].attributes("aria-label")).toBe("environment.visible")
+    expect(toggles[1].attributes("title")).toBe("environment.secret")
+    expect(toggles[1].attributes("aria-label")).toBe("environment.secret")
+  })
+
+  it("the toggle's icon changes shape with the state, not only its colour", async () => {
+    const { wrapper } = await mountWithVariables(TWO_VARS)
+
+    // Three rows: one secret (locked shape), two not (open shape) — the
+    // trailing empty row is never secret.
+    expect(wrapper.findAllComponents(Lock)).toHaveLength(1)
+    expect(wrapper.findAllComponents(LockOpen)).toHaveLength(2)
+  })
+
+  it("the delete button keeps its wording on both properties", async () => {
+    const { wrapper } = await mountWithVariables(TWO_VARS)
+
+    const del = wrapper.find('[data-testid="delete-row"]')
+    expect(del.attributes("title")).toBe("keyValue.deleteRow")
+    expect(del.attributes("aria-label")).toBe("keyValue.deleteRow")
+  })
+
+  it("the eye's aria-label flips between show and hide", async () => {
+    const { wrapper } = await mountWithVariables(TWO_VARS)
+
+    const eye = wrapper.find('[data-testid="toggle-secret-visibility"]')
+    expect(eye.attributes("aria-label")).toBe("environment.showSecretValues")
+    await eye.trigger("click")
+    expect(eye.attributes("aria-label")).toBe("environment.hideSecretValues")
+  })
+})
+
+describe("D13 §9 the two inputs carry accessible names", () => {
+  it("names the key and value inputs with the existing wordings", async () => {
+    const { wrapper } = await mountWithVariables(TWO_VARS)
+
+    expect(wrapper.find('[data-testid="variable-key"]').attributes("aria-label")).toBe(
+      "keyValue.key",
+    )
+    expect(wrapper.find('[data-testid="variable-value"]').attributes("aria-label")).toBe(
+      "keyValue.value",
+    )
+  })
+})
+
+describe("D13 §15 the relaid-out buttons still commit the same edits", () => {
+  it("clicking the secret toggle flips only that row's secret flag", async () => {
+    const { wrapper, environmentsStore } = await mountWithVariables(TWO_VARS)
+
+    const spy = vi.spyOn(environmentsStore, "setVariables")
+    // The secret row, so the flip goes true → false: a mutation that hardcodes
+    // `secret: true` gives the same answer as a flip on a false row.
+    await wrapper.findAll('[data-testid="secret-toggle"]')[1].trigger("click")
+
+    expect(spy).toHaveBeenCalledWith([
+      { key: "base", value: "https://api.example.com", secret: false },
+      { key: "token", value: "s3cr3t", secret: false },
+    ])
+  })
+
+  it("clicking delete removes exactly that row from the committed set", async () => {
+    const { wrapper, environmentsStore } = await mountWithVariables(TWO_VARS)
+
+    const spy = vi.spyOn(environmentsStore, "setVariables")
+    await wrapper.findAll('[data-testid="delete-row"]')[0].trigger("click")
+
+    expect(spy).toHaveBeenCalledWith([{ key: "token", value: "s3cr3t", secret: true }])
+  })
+})
+
+describe("D13 §14 the ack button's wording still comes from its own key", () => {
+  it("renders the collisionAck catalog entry on the button itself", async () => {
+    // Real zh-CN catalog (A50): the confirm dialog binds the same key while
+    // mounted, so a t-call assertion alone cannot see a rewired button label.
+    // Asserting the button's rendered text against the catalog entry can —
+    // the wording itself stays owned by the locale matrix.
+    const realI18n = createI18n({
+      legacy: false,
+      locale: "zh-CN",
+      fallbackLocale: false as const,
+      messages: { "zh-CN": zhCN },
+    })
+    t.mockImplementation((key: string, params?: Record<string, unknown>) =>
+      realI18n.global.t(key, params ?? {}),
+    )
+
+    stubBackend({ collisions: [collisionRecord()] })
+    const wrapper = mountPanel()
+    await settle()
+
+    expect(wrapper.find('[data-testid="collision-ack"]').text()).toBe(
+      zhCN.environment.collisionAck,
+    )
   })
 })
 

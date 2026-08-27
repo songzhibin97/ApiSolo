@@ -286,6 +286,7 @@ export default {
     noEnvironments: "No environment yet",
     noEnvironmentsDescription: "Create an environment to manage base URLs, tokens, and reusable variables.",
     newEnvironment: "New Environment",
+    variables: "Variables",
     secret: "secret",
     visible: "visible",
     hideSecretValues: "Hide secret values",
