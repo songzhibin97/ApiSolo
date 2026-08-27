@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue"
 import { storeToRefs } from "pinia"
-import { Eye, EyeOff, Lock, Plus, Trash2 } from "lucide-vue-next"
+import { Eye, EyeOff, Lock, LockOpen, Plus, Trash2 } from "lucide-vue-next"
 import { useI18n } from "vue-i18n"
 
 import ConfirmDialog from "../ui/ConfirmDialog.vue"
@@ -234,26 +234,39 @@ async function confirmDeleteEnvironment() {
         >
           {{ t("environment.nameNormalizedHint") }}
         </p>
-        <form v-if="showCreateEnvironment" class="mt-2 flex gap-2" @submit.prevent="createEnvironment">
+        <!--
+          Stacked on purpose: with the input and both buttons on one line, the
+          two incompressible buttons squeezed the input down to its 26px
+          padding-and-border floor — zero content width in the English locale
+          at the default sidebar ratio. The input gets its own line; the
+          buttons sit right-aligned on a second one.
+        -->
+        <form
+          v-if="showCreateEnvironment"
+          class="mt-2 flex flex-col gap-2"
+          @submit.prevent="createEnvironment"
+        >
           <input
             v-model="newEnvironmentName"
-            class="h-9 min-w-0 flex-1 rounded border border-[var(--border)] bg-[var(--bg-primary)] px-3 text-sm text-[var(--text-primary)] outline-none transition placeholder:text-[var(--text-secondary)] focus:border-[color-mix(in_srgb,var(--accent)_70%,white)]"
+            class="h-9 w-full min-w-0 rounded border border-[var(--border)] bg-[var(--bg-primary)] px-3 text-sm text-[var(--text-primary)] outline-none transition placeholder:text-[var(--text-secondary)] focus:border-[color-mix(in_srgb,var(--accent)_70%,white)]"
             type="text"
             :placeholder="t('environment.environmentName')"
           />
-          <button
-            class="inline-flex h-9 items-center justify-center rounded bg-[var(--accent)] px-3 text-sm font-semibold text-white transition hover:brightness-110"
-            type="submit"
-          >
-            {{ t("common.create") }}
-          </button>
-          <button
-            class="inline-flex h-9 items-center justify-center rounded border border-[var(--border)] px-3 text-sm text-[var(--text-primary)] transition hover:border-[color-mix(in_srgb,var(--accent)_60%,white)]"
-            type="button"
-            @click="cancelCreateEnvironment"
-          >
-            {{ t("common.cancel") }}
-          </button>
+          <div data-testid="create-environment-actions" class="flex justify-end gap-2">
+            <button
+              class="inline-flex h-9 items-center justify-center rounded bg-[var(--accent)] px-3 text-sm font-semibold text-white transition hover:brightness-110"
+              type="submit"
+            >
+              {{ t("common.create") }}
+            </button>
+            <button
+              class="inline-flex h-9 items-center justify-center rounded border border-[var(--border)] px-3 text-sm text-[var(--text-primary)] transition hover:border-[color-mix(in_srgb,var(--accent)_60%,white)]"
+              type="button"
+              @click="cancelCreateEnvironment"
+            >
+              {{ t("common.cancel") }}
+            </button>
+          </div>
         </form>
       </template>
 
@@ -291,11 +304,18 @@ async function confirmDeleteEnvironment() {
             {{ t("environment.collisionShared") }}
           </div>
           <ul class="mt-1 space-y-0.5">
+            <!--
+              break-all: this markup belongs to the collision-notice slice
+              (D08); D13 only fixes its layout. A name with no break point
+              (no hyphen, no space) used to overflow ~179px into a region
+              that cannot scroll — and this line is the only thing that says
+              which two environments shared the slot.
+            -->
             <li
               v-for="environmentRef in record.environments"
               :key="`${environmentRef.project}/${environmentRef.environment}`"
               data-testid="collision-environment"
-              class="font-mono text-sm text-[var(--text-primary)]"
+              class="break-all font-mono text-sm text-[var(--text-primary)]"
             >
               {{ environmentRef.project }} / {{ environmentRef.environment }}
             </li>
@@ -303,9 +323,15 @@ async function confirmDeleteEnvironment() {
           <div class="mt-1 text-sm text-[var(--text-secondary)]">
             {{ t("environment.collisionDetectedAt", { at: formatDetectedAt(record.detectedAt) }) }}
           </div>
+          <!--
+            min-h-8, not h-8: this markup belongs to the collision-notice
+            slice (D08); D13 only fixes its layout. The English wording wraps
+            to two lines in a narrow sidebar, and a fixed height painted the
+            second line outside the button box.
+          -->
           <button
             data-testid="collision-ack"
-            class="mt-2 inline-flex h-8 items-center rounded border border-[var(--border)] px-3 text-sm text-[var(--text-primary)] transition hover:border-[color-mix(in_srgb,var(--accent)_60%,white)]"
+            class="mt-2 inline-flex min-h-8 items-center rounded border border-[var(--border)] px-3 text-sm text-[var(--text-primary)] transition hover:border-[color-mix(in_srgb,var(--accent)_60%,white)]"
             type="button"
             @click="requestAcknowledgeCollision(record)"
           >
@@ -325,15 +351,26 @@ async function confirmDeleteEnvironment() {
     </div>
 
     <template v-else-if="activeEnv">
-      <div class="flex items-center justify-between border-b border-[var(--border)] px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--text-secondary)]">
-        <div class="grid flex-1 grid-cols-[minmax(120px,1fr)_minmax(160px,1.2fr)_44px_44px] gap-2">
-          <span>{{ t("keyValue.key") }}</span>
-          <span>{{ t("keyValue.value") }}</span>
-          <span class="text-center">{{ t("environment.secret") }}</span>
-          <span class="text-right">{{ t("keyValue.del") }}</span>
-        </div>
+      <!--
+        One section label instead of the old four column labels (key / value /
+        secret / del): the rows below are two lines each, so column labels have
+        no columns to line up with, and the old fixed-minimum header track was
+        432px — twice the default sidebar pane. The labels' information lives
+        on the controls themselves (title / aria-label).
+      -->
+      <div
+        data-testid="variable-table-header"
+        class="flex items-center justify-between border-b border-[var(--border)] px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--text-secondary)]"
+      >
+        <div class="min-w-0 flex-1 truncate">{{ t("environment.variables") }}</div>
+        <!--
+          shrink-0 keeps this button binary — fully visible or clipped. Without
+          it a tight header squeezes the 32px box down to the 15px icon first,
+          leaving a "half a button" state nobody can judge.
+        -->
         <button
-          class="ml-2 inline-flex h-8 w-8 items-center justify-center rounded text-[var(--text-secondary)] transition hover:bg-[color-mix(in_srgb,var(--accent)_16%,transparent)] hover:text-[var(--text-primary)]"
+          data-testid="toggle-secret-visibility"
+          class="ml-2 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded text-[var(--text-secondary)] transition hover:bg-[color-mix(in_srgb,var(--accent)_16%,transparent)] hover:text-[var(--text-primary)]"
           type="button"
           :aria-label="showSecrets ? t('environment.hideSecretValues') : t('environment.showSecretValues')"
           @click="showSecrets = !showSecrets"
@@ -344,35 +381,56 @@ async function confirmDeleteEnvironment() {
       </div>
 
       <div class="flex-1 overflow-auto px-4 py-2">
+        <!--
+          Two lines per variable: key + the two icon buttons on the first, the
+          value spanning the second. The old single-line track demanded 392px
+          minimum while the default sidebar pane is ~214px, which pushed both
+          buttons out of view. The 36px button tracks carry no slack on
+          purpose — that width is measured against the buttons' own w-9 boxes,
+          not guessed; widening the buttons without widening the tracks makes
+          them overdraw their neighbours.
+        -->
         <div
           v-for="row in rows"
           :key="row.id"
-          class="grid grid-cols-[minmax(120px,1fr)_minmax(160px,1.2fr)_44px_44px] items-center gap-2 border-b border-[color-mix(in_srgb,var(--border)_80%,transparent)] py-2"
+          data-testid="variable-row"
+          class="grid grid-cols-[minmax(0,1fr)_36px_36px] items-center gap-x-2 gap-y-1 border-b border-[color-mix(in_srgb,var(--border)_80%,transparent)] py-2"
         >
-          <input
-            class="h-9 w-full rounded border border-[var(--border)] bg-[var(--bg-primary)] px-3 font-mono text-sm text-[var(--text-primary)] outline-none transition placeholder:text-[color-mix(in_srgb,var(--text-secondary)_75%,transparent)] focus:border-[color-mix(in_srgb,var(--accent)_70%,white)]"
-            type="text"
-            :placeholder="t('keyValue.key')"
-            :value="row.key"
-            @input="updateRow(row.id, { key: ($event.target as HTMLInputElement).value })"
-          />
-          <input
-            class="h-9 w-full rounded border border-[var(--border)] bg-[var(--bg-primary)] px-3 font-mono text-sm text-[var(--text-primary)] outline-none transition placeholder:text-[color-mix(in_srgb,var(--text-secondary)_75%,transparent)] focus:border-[color-mix(in_srgb,var(--accent)_70%,white)]"
-            :type="row.secret && !showSecrets ? 'password' : 'text'"
-            :placeholder="row.secret && !showSecrets ? '****' : t('keyValue.value')"
-            :value="row.value"
-            @input="updateRow(row.id, { value: ($event.target as HTMLInputElement).value })"
-          />
+          <!--
+            A deliberate wrapper, not a leftover: a px-3 input's border-box
+            floor is 26px (24px padding + 2px border), so min-width alone
+            cannot take it below that — once the 0-minimum track gets narrower
+            the input would keep painting 26px and land on the secret toggle
+            (measured 18px of overlap at a 120px pane). This cell clips the
+            overhang so the input shows less instead. Measured as sufficient
+            against the one natural alternative (flex shrink), which pushes
+            the buttons out instead; other alternatives were not exhausted.
+          -->
+          <div data-testid="variable-key-cell" class="min-w-0 overflow-hidden">
+            <input
+              data-testid="variable-key"
+              class="h-9 w-full min-w-0 rounded border border-[var(--border)] bg-[var(--bg-primary)] px-3 font-mono text-sm text-[var(--text-primary)] outline-none transition placeholder:text-[color-mix(in_srgb,var(--text-secondary)_75%,transparent)] focus:border-[color-mix(in_srgb,var(--accent)_70%,white)]"
+              type="text"
+              :placeholder="t('keyValue.key')"
+              :aria-label="t('keyValue.key')"
+              :value="row.key"
+              @input="updateRow(row.id, { key: ($event.target as HTMLInputElement).value })"
+            />
+          </div>
           <button
+            data-testid="secret-toggle"
             class="flex h-9 w-9 items-center justify-center rounded text-[var(--text-secondary)] transition hover:bg-[color-mix(in_srgb,var(--accent)_16%,transparent)] hover:text-[var(--text-primary)]"
             type="button"
             :class="row.secret ? 'text-amber-300' : ''"
+            :title="row.secret ? t('environment.secret') : t('environment.visible')"
             :aria-label="row.secret ? t('environment.secret') : t('environment.visible')"
             @click="updateRow(row.id, { secret: !row.secret })"
           >
-            <Lock :size="15" />
+            <Lock v-if="row.secret" :size="15" />
+            <LockOpen v-else :size="15" />
           </button>
           <button
+            data-testid="delete-row"
             class="flex h-9 w-9 items-center justify-center rounded text-[var(--text-secondary)] transition hover:bg-[color-mix(in_srgb,var(--accent)_16%,transparent)] hover:text-[var(--text-primary)]"
             type="button"
             :aria-label="t('keyValue.deleteRow')"
@@ -381,6 +439,15 @@ async function confirmDeleteEnvironment() {
           >
             <Trash2 :size="15" />
           </button>
+          <input
+            data-testid="variable-value"
+            class="col-span-3 col-start-1 h-9 w-full min-w-0 rounded border border-[var(--border)] bg-[var(--bg-primary)] px-3 font-mono text-sm text-[var(--text-primary)] outline-none transition placeholder:text-[color-mix(in_srgb,var(--text-secondary)_75%,transparent)] focus:border-[color-mix(in_srgb,var(--accent)_70%,white)]"
+            :type="row.secret && !showSecrets ? 'password' : 'text'"
+            :placeholder="row.secret && !showSecrets ? '****' : t('keyValue.value')"
+            :aria-label="t('keyValue.value')"
+            :value="row.value"
+            @input="updateRow(row.id, { value: ($event.target as HTMLInputElement).value })"
+          />
         </div>
       </div>
 

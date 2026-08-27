@@ -113,6 +113,10 @@ const MATRIX: Record<string, { "zh-CN": string; en: string }> = {
     "zh-CN": "这会删除 {variable} 的这条碰撞记录，无法撤销。ApiSolo 此后不会再提到这次碰撞。",
     en: "This deletes the collision record for {variable} and cannot be undone. ApiSolo will not mention this collision again.",
   },
+  "environment.variables": {
+    "zh-CN": "变量",
+    en: "Variables",
+  },
   "environment.nameNormalizedHint": {
     "zh-CN": "环境名会按大小写、空格与标点归一化成一个文件名，两种写法可能落到同一个环境上。",
     en: "Environment names are normalised — case, spaces and punctuation — into a single file name, so two spellings can land on the same environment.",

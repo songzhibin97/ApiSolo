@@ -279,6 +279,7 @@ export default {
     noEnvironments: "暂无环境",
     noEnvironmentsDescription: "创建一个环境来管理基础 URL、令牌和可复用变量。",
     newEnvironment: "新建环境",
+    variables: "变量",
     secret: "密钥",
     visible: "可见",
     hideSecretValues: "隐藏密钥值",

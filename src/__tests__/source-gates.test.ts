@@ -394,6 +394,177 @@ describe("D12 §1 the history row's lines clip their own overflow", () => {
   })
 })
 
+/**
+ * D13 §7: the structural premises of "the variable table converges instead of
+ * overflowing" — a zero-minimum text track, fixed 36px button tracks, a
+ * self-clipping key cell, a value input on its own spanned line, and an eye
+ * button that refuses to shrink. Same shape as the D12 gate above: it proves
+ * the classes are bound in the template, not that the layout converges — the
+ * size-facing half is carried by the manual acceptance items.
+ */
+describe("D13 §7 the variable table's tracks and cells are the ones that converge", () => {
+  const panel = readFileSync("src/components/sidebar/EnvironmentPanel.vue", "utf8")
+
+  function classOf(testid: string): string {
+    const anchor = `data-testid="${testid}"`
+    const at = panel.indexOf(anchor)
+    expect(at, `${anchor} is missing from EnvironmentPanel.vue`).toBeGreaterThan(-1)
+    const tag = panel.slice(panel.lastIndexOf("<", at), panel.indexOf(">", at))
+    const match = tag.match(/ class="([^"]*)"/)
+    expect(match, `${testid} carries no static class attribute`).not.toBeNull()
+    return match![1]
+  }
+
+  function classTokensOf(testid: string): string[] {
+    return classOf(testid).split(/\s+/)
+  }
+
+  it("the scan finds an anchor that predates this slice", () => {
+    // Fail-closed: a scan that finds nothing would otherwise read as "nothing
+    // is missing". environment-save predates D13; its class is known non-empty.
+    expect(classOf("environment-save")).toContain("flex")
+  })
+
+  it("the variable row uses the zero-minimum two-button track", () => {
+    expect(classOf("variable-row")).toContain("grid-cols-[minmax(0,1fr)_36px_36px]")
+  })
+
+  it("no fixed-minimum text track is left anywhere in the panel", () => {
+    // 120px + 160px minimums are the root cause: 392px of track in a 214px
+    // pane. Scanned file-wide so the old track cannot survive in the header.
+    expect(panel).not.toContain("minmax(120px")
+    expect(panel).not.toContain("minmax(160px")
+  })
+
+  it("the key cell clips its own overflow and may shrink below its content", () => {
+    expect(classOf("variable-key-cell")).toContain("overflow-hidden")
+    expect(classOf("variable-key-cell")).toContain("min-w-0")
+  })
+
+  it("the value input spans the full second line", () => {
+    expect(classOf("variable-value")).toContain("col-span-3")
+    expect(classOf("variable-value")).toContain("col-start-1")
+  })
+
+  it("the header labels its section and drops the del column label", () => {
+    expect(panel).toContain('t("environment.variables")')
+    // Exact call, closing quote included: keyValue.deleteRow (the delete
+    // button's own wording, which stays) shares the prefix.
+    expect(panel).not.toContain('t("keyValue.del")')
+  })
+
+  it("the eye button refuses to shrink", () => {
+    expect(classTokensOf("toggle-secret-visibility")).toContain("shrink-0")
+  })
+
+  /**
+   * D13 §19 §20: the collision area's two layout constraints (this slice fixes
+   * only the layout of that D08 markup — wording and behaviour are pinned by
+   * the component tests).
+   */
+  it("§19 the ack button grows with a wrapped label instead of fixing its height", () => {
+    const tokens = classTokensOf("collision-ack")
+    expect(tokens).toContain("min-h-8")
+    // Token comparison, not substring: "min-h-8" contains "h-8".
+    expect(tokens).not.toContain("h-8")
+  })
+
+  it("§20 the environment list lines may break inside an unbroken name", () => {
+    expect(classTokensOf("collision-environment")).toContain("break-all")
+  })
+
+  /**
+   * D13 §18: the create-environment form stacks the name input above its two
+   * buttons, so the two incompressible buttons can no longer squeeze the input
+   * to its 26px padding floor.
+   */
+  it("§18 the create-environment form stacks vertically", () => {
+    const form = panel.slice(panel.indexOf("<form"), panel.indexOf("</form>"))
+    const match = form.match(/ class="([^"]*)"/)
+    expect(match, "the form carries no static class attribute").not.toBeNull()
+    expect(match![1]).toContain("flex-col")
+  })
+
+  it("§18 both buttons live in their own right-aligned actions row", () => {
+    expect(classTokensOf("create-environment-actions")).toContain("justify-end")
+    // Both buttons sit after the actions wrapper opens — moving either back
+    // beside the input puts it before this anchor and fails the slice check.
+    const actions = panel.slice(
+      panel.indexOf('data-testid="create-environment-actions"'),
+      panel.indexOf("</form>"),
+    )
+    expect(actions).toContain('t("common.create")')
+    expect(actions).toContain('t("common.cancel")')
+  })
+})
+
+/**
+ * D13 §17: the environment-panel layout decisions, written down in both
+ * READMEs — and the old "reveal button unreachable" known issue gone from
+ * both, in the same PR as the fix that removes the defect it described. The
+ * sentences carry no width thresholds on purpose (A52: the README states only
+ * what is unconditionally true; the one threshold the old text named was
+ * measurably wrong).
+ *
+ * Element 17.6 (sidebar width is not remembered) is deliberately absent here:
+ * both READMEs state it once, in the sentence the D12 gate above already pins
+ * for both languages — a second assertion on the same sentence would not be
+ * independently load-bearing.
+ */
+describe("D13 §17 the environment-panel layout decisions are written down in both READMEs", () => {
+  it("the scan reads the READMEs it thinks it does", () => {
+    // Fail-closed anchors that predate this slice.
+    expect(readmeEn).toContain("# ApiSolo")
+    expect(readmeZh).toContain("# ApiSolo")
+  })
+
+  const ELEMENTS: Array<{ id: string; zh: string; en: string }> = [
+    {
+      id: "17.1 two lines per variable",
+      zh: "每个变量占两行",
+      en: "each variable takes two lines",
+    },
+    {
+      id: "17.2 both row buttons stay visible",
+      zh: "这两个按钮都完整显示",
+      en: "both buttons are fully visible",
+    },
+    {
+      id: "17.3 still reachable once the list scrolls",
+      zh: "按钮仍然能滚到",
+      en: "still reachable by scrolling",
+    },
+    {
+      id: "17.4 the traded-away row count",
+      zh: "一屏能看到的变量数大约少一半",
+      en: "about half as many variables fit on screen",
+    },
+    {
+      id: "17.5 narrow sidebar never overlaps controls",
+      zh: "不会让两个控件叠在一起",
+      en: "never lets two controls sit on top of each other",
+    },
+  ]
+
+  it.each(ELEMENTS)("$id is stated in the English README", ({ en }) => {
+    expect(readmeEn).toContain(en)
+  })
+
+  it.each(ELEMENTS)("$id is stated in the Chinese README", ({ zh }) => {
+    expect(readmeZh).toContain(zh)
+  })
+
+  it("the English README no longer lists the unreachable reveal button as a known issue", () => {
+    expect(readmeEn).not.toContain("no amount of dragging reveals it")
+    expect(readmeEn).not.toContain("Known issues")
+  })
+
+  it("the Chinese README no longer lists the unreachable reveal button as a known issue", () => {
+    expect(readmeZh).not.toContain("无论怎么拖都看不到它")
+    expect(readmeZh).not.toContain("已知问题")
+  })
+})
+
 describe("§51 the annotation command cannot be handed a whole history row", () => {
   function annotationSignature(): string {
     const source = readFileSync("src-tauri/src/lib.rs", "utf8")
