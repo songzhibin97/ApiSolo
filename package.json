@@ -1,7 +1,7 @@
 {
   "name": "apisolo",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "PATH=\"$(dirname \"$(rustup which rustc)\"):$PATH\" tauri dev --features devtools,dev-bridge",
