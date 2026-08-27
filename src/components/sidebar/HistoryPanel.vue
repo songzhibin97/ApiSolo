@@ -402,97 +402,121 @@ async function clearHistory() {
               v-for="entry in group.entries"
               :key="entry.id"
               data-testid="history-row"
-              class="flex w-full items-center gap-1 rounded px-1 transition hover:bg-[color-mix(in_srgb,var(--bg-surface)_35%,transparent)]"
+              class="flex w-full flex-col gap-0.5 rounded px-1 py-1 transition hover:bg-[color-mix(in_srgb,var(--bg-surface)_35%,transparent)]"
             >
               <button
-                class="flex min-w-0 flex-1 items-center gap-2 rounded px-1 py-2 text-left"
+                class="flex w-full min-w-0 items-center gap-2 overflow-hidden rounded text-left"
                 data-testid="history-open"
                 type="button"
                 :title="`${entry.method} ${entry.url} • ${formatTimestamp(entry.timestamp)}`"
                 @click="openEntry(entry)"
               >
+                <!-- w-12 (48px) is 6px narrower than OPTIONS needs (54px), the
+                     longest method this app can write. The overflowing glyphs land
+                     inside the 8px gap-2 that follows, a measured 2px short of the
+                     URL. That margin is calculated and deliberately accepted
+                     (owner ruling, D12): clipping here would cut characters out of
+                     OPTIONS, and widening the box would spend row width this
+                     layout cannot spare. -->
                 <span class="w-12 shrink-0 text-[11px] font-semibold tracking-wide" :class="methodClass(entry.method)">
                   {{ entry.method }}
                 </span>
-                <span class="min-w-0 flex-1">
-                  <span class="block truncate text-sm text-[var(--text-primary)]">
-                    {{ formatEntryUrl(entry.url) }}
-                  </span>
-                  <span
-                    v-if="entry.responseBody"
-                    class="block truncate text-xs text-[var(--text-secondary)]"
-                  >
-                    {{ summarizeResponseBody(entry.responseBody) }}
-                  </span>
+                <span class="min-w-0 flex-1 truncate text-sm text-[var(--text-primary)]">
+                  {{ formatEntryUrl(entry.url) }}
                 </span>
-                <!-- Network truncation: this row's stored body is the prefix of
-                     a body that was never fully received. Same key as the
-                     response panel's badge — they state the same fact. -->
-                <span
-                  v-if="entry.responseBodyTruncated"
-                  data-testid="history-truncated-badge"
-                  class="shrink-0 rounded border border-amber-500/40 px-1 text-[10px] leading-4 text-amber-500"
-                >
-                  {{ t("response.networkTruncatedBadge") }}
-                </span>
-                <StickyNote
-                  v-if="entry.note"
-                  data-testid="history-note-badge"
-                  :size="12"
-                  class="shrink-0 text-[var(--accent)]"
-                />
                 <span class="shrink-0 text-xs font-semibold" :class="statusClass(entry.status)">
                   {{ entry.status }}
                 </span>
-                <span class="shrink-0 text-xs text-[var(--text-secondary)]">
-                  {{ formatTime(entry.time) }}
-                </span>
               </button>
 
-              <button
-                class="shrink-0 rounded p-1 text-[var(--text-secondary)] transition hover:text-[var(--text-primary)]"
-                data-testid="history-star"
-                type="button"
-                :title="entry.starred ? t('history.unstar') : t('history.star')"
-                :aria-label="entry.starred ? t('history.unstar') : t('history.star')"
-                @click.stop="toggleStar(entry)"
+              <div
+                data-testid="history-line2"
+                class="flex w-full min-w-0 items-center gap-1 overflow-hidden"
               >
-                <Star :size="14" :class="entry.starred ? 'text-amber-300' : ''" />
-              </button>
+                <div
+                  data-testid="history-facts"
+                  class="flex min-w-0 flex-1 items-center gap-1 overflow-hidden"
+                >
+                  <span class="min-w-0 truncate text-xs text-[var(--text-secondary)]">
+                    {{ formatTime(entry.time) }}
+                  </span>
+                  <!-- Network truncation: this row's stored body is the prefix of
+                       a body that was never fully received. Same key as the
+                       response panel's badge — they state the same fact. The icon
+                       sits in a span with role="img" because aria-label on a
+                       generic span is naming-prohibited: the attribute would be
+                       present and the accessible name absent. -->
+                  <span
+                    v-if="entry.responseBodyTruncated"
+                    data-testid="history-truncated-badge"
+                    role="img"
+                    :title="t('response.networkTruncatedBadge')"
+                    :aria-label="t('response.networkTruncatedBadge')"
+                    class="shrink-0 text-amber-500"
+                  >
+                    <AlertTriangle :size="12" aria-hidden="true" />
+                  </span>
+                  <StickyNote
+                    v-if="entry.note"
+                    data-testid="history-note-badge"
+                    :size="12"
+                    class="shrink-0 text-[var(--accent)]"
+                  />
+                  <span
+                    v-if="entry.responseBody"
+                    class="min-w-0 flex-1 truncate text-xs text-[var(--text-secondary)]"
+                  >
+                    {{ summarizeResponseBody(entry.responseBody) }}
+                  </span>
+                </div>
 
-              <button
-                class="shrink-0 rounded p-1 text-[var(--text-secondary)] transition hover:text-[var(--text-primary)]"
-                data-testid="history-note"
-                type="button"
-                :title="t('history.note')"
-                :aria-label="t('history.note')"
-                @click.stop="openNoteDialog(entry)"
-              >
-                <StickyNote :size="14" />
-              </button>
+                <div class="flex shrink-0 items-center gap-0">
+                  <button
+                    class="shrink-0 rounded p-0.5 text-[var(--text-secondary)] transition hover:text-[var(--text-primary)]"
+                    data-testid="history-star"
+                    type="button"
+                    :title="entry.starred ? t('history.unstar') : t('history.star')"
+                    :aria-label="entry.starred ? t('history.unstar') : t('history.star')"
+                    @click.stop="toggleStar(entry)"
+                  >
+                    <Star :size="14" :class="entry.starred ? 'text-amber-300' : ''" />
+                  </button>
 
-              <button
-                class="shrink-0 rounded p-1 text-[var(--text-secondary)] transition hover:text-[var(--text-primary)] disabled:cursor-not-allowed disabled:opacity-40"
-                data-testid="history-save"
-                type="button"
-                :title="t('history.saveToCollection')"
-                :aria-label="t('history.saveToCollection')"
-                :disabled="!activeProject"
-                @click.stop="openSaveDialog(entry)"
-              >
-                <FolderPlus :size="14" />
-              </button>
+                  <button
+                    class="shrink-0 rounded p-0.5 text-[var(--text-secondary)] transition hover:text-[var(--text-primary)]"
+                    data-testid="history-note"
+                    type="button"
+                    :title="t('history.note')"
+                    :aria-label="t('history.note')"
+                    @click.stop="openNoteDialog(entry)"
+                  >
+                    <StickyNote :size="14" />
+                  </button>
 
-              <button
-                class="shrink-0 rounded p-1 text-[var(--text-secondary)] transition hover:text-rose-300"
-                data-testid="history-delete"
-                type="button"
-                :title="t('history.deleteEntry')"
-                :aria-label="t('history.deleteEntry')"
-                @click.stop="openDeleteDialog(entry)"
-              >
-                <Trash2 :size="14" />
-              </button>
+                  <button
+                    class="shrink-0 rounded p-0.5 text-[var(--text-secondary)] transition hover:text-[var(--text-primary)] disabled:cursor-not-allowed disabled:opacity-40"
+                    data-testid="history-save"
+                    type="button"
+                    :title="t('history.saveToCollection')"
+                    :aria-label="t('history.saveToCollection')"
+                    :disabled="!activeProject"
+                    @click.stop="openSaveDialog(entry)"
+                  >
+                    <FolderPlus :size="14" />
+                  </button>
+
+                  <button
+                    class="shrink-0 rounded p-0.5 text-[var(--text-secondary)] transition hover:text-rose-300"
+                    data-testid="history-delete"
+                    type="button"
+                    :title="t('history.deleteEntry')"
+                    :aria-label="t('history.deleteEntry')"
+                    @click.stop="openDeleteDialog(entry)"
+                  >
+                    <Trash2 :size="14" />
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
         </div>

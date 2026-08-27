@@ -315,6 +315,85 @@ describe("D09 §26 the size-cap decisions are written down in both READMEs", () 
   })
 })
 
+/**
+ * D12 §13: two layout decisions that are invisible from the interface at the
+ * moment they matter — where the truncation badge's full wording went, and
+ * what a narrow sidebar is allowed to take away (with the one deliberate
+ * method-name exception that keeps the no-overlap promise honest). Both
+ * READMEs are asserted separately, as this file always does.
+ */
+describe("D12 §13 the history-row layout decisions are written down in both READMEs", () => {
+  it("the English README says where the badge's wording lives", () => {
+    expect(readmeEn).toContain(
+      "hover it for the full wording, which is also what a screen reader announces",
+    )
+  })
+
+  it("the Chinese README says where the badge's wording lives", () => {
+    expect(readmeZh).toContain(
+      "把鼠标停在它上面会显示完整说明，读屏器读到它时念的也是同一句",
+    )
+  })
+
+  it("the English README bounds the no-overlap promise and disclaims persistence", () => {
+    expect(readmeEn).toContain(
+      "it never lets two pieces of text sit on top of each other — with one exception",
+    )
+    expect(readmeEn).toContain(
+      "The sidebar width is not remembered; every launch starts at the default width",
+    )
+  })
+
+  it("the Chinese README bounds the no-overlap promise and disclaims persistence", () => {
+    expect(readmeZh).toContain("也不会让两段文字叠在一起——只有方法名例外")
+    expect(readmeZh).toContain("侧栏宽度不会被记住，每次启动都回到默认宽度")
+  })
+})
+
+/**
+ * D12 §1: the structural premise of "nothing overdraws its siblings" is that
+ * every container whose content can outgrow it clips itself. This gate pins
+ * that premise to the class strings on disk (the repository's existing
+ * scan-gate shape, judged as in A21: it proves the classes are bound in the
+ * template, not that the layout converges — the size-facing half of §1 has no
+ * automated gate and is carried by the manual acceptance items).
+ */
+describe("D12 §1 the history row's lines clip their own overflow", () => {
+  const panel = readFileSync("src/components/sidebar/HistoryPanel.vue", "utf8")
+
+  function classOf(testid: string): string {
+    const anchor = `data-testid="${testid}"`
+    const at = panel.indexOf(anchor)
+    expect(at, `${anchor} is missing from HistoryPanel.vue`).toBeGreaterThan(-1)
+    const tag = panel.slice(panel.lastIndexOf("<", at), panel.indexOf(">", at))
+    const match = tag.match(/ class="([^"]*)"/)
+    expect(match, `${testid} carries no static class attribute`).not.toBeNull()
+    return match![1]
+  }
+
+  it("the scan finds an anchor that predates this slice", () => {
+    // Fail-closed: a scan that finds nothing would otherwise read as "nothing
+    // is missing". history-row predates D12; its class is known to be non-empty.
+    expect(classOf("history-row")).toContain("flex")
+  })
+
+  it("line 1 clips its own overflow", () => {
+    expect(classOf("history-open")).toContain("overflow-hidden")
+  })
+
+  it("line 2 clips its own overflow", () => {
+    expect(classOf("history-line2")).toContain("overflow-hidden")
+  })
+
+  it("the response facts group clips its own overflow", () => {
+    expect(classOf("history-facts")).toContain("overflow-hidden")
+  })
+
+  it("the response facts group may shrink below its content", () => {
+    expect(classOf("history-facts")).toContain("min-w-0")
+  })
+})
+
 describe("§51 the annotation command cannot be handed a whole history row", () => {
   function annotationSignature(): string {
     const source = readFileSync("src-tauri/src/lib.rs", "utf8")
