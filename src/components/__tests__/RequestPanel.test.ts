@@ -827,6 +827,22 @@ describe("the params table shows an amber box for every query entry the list rep
       .map((input) => (input.element as HTMLInputElement).value)
   }
 
+  /**
+   * The value box of the row whose key box holds `key`. Key boxes and value
+   * boxes come in row order, so the index carries across; asserting the row
+   * exists here keeps a missing row from reading as "no amber box to check".
+   */
+  function valueBoxByKey(editor: VueWrapper<InstanceType<typeof KeyValueEditor>>, key: string) {
+    const row = editor
+      .findAll("input[type=\"text\"]")
+      .filter((input) => (input.element as HTMLInputElement).placeholder === "keyValue.key")
+      .findIndex((input) => (input.element as HTMLInputElement).value === key)
+
+    expect(row, `no row for ${key}`).toBeGreaterThanOrEqual(0)
+
+    return valueBoxes(editor)[row]
+  }
+
   it("marks the blank row the user adds beside a marked one of the same key", async () => {
     const tabs = useTabsStore()
     tabs.openHistoryEntry({
@@ -897,11 +913,95 @@ describe("the params table shows an amber box for every query entry the list rep
       ["refill", "query", null, "ghost"],
     ])
 
-    // The subject: the row exists in the table and its value box is the amber
-    // one — an amber box holding the placeholder can only come from the
-    // url-contributed row being rendered.
-    expect(amberValues(wrapper.findAllComponents(KeyValueEditor)[0])).toEqual([
-      REDACTION_SENTINEL,
+    // The subject: the url-contributed row is rendered, and rendered
+    // *normalized* — an empty, marked row, never the literal placeholder text
+    // sitting in an editable box. The literal was this test's expectation
+    // once, and it was the unsafe shape (R10): a row carrying its origin in
+    // its value and nothing in its marker loses it the moment the value is
+    // edited. The row-existence check lives in `valueBoxByKey`.
+    const ghostBox = valueBoxByKey(wrapper.findAllComponents(KeyValueEditor)[0], "ghost")
+    expect(ghostBox.classes()).toContain("border-amber-500")
+    expect(ghostBox.attributes("placeholder")).toBe("keyValue.redactedPlaceholder")
+    expect((ghostBox.element as HTMLInputElement).value).toBe("")
+  })
+
+  /**
+   * R10 CRITICAL, end to end. The url-contributed row used to carry its origin
+   * in its *value* — the literal placeholder — and nothing in its marker, so
+   * typing over it and deleting again left a row no reader could tell from one
+   * the user meant to send empty: `pendingRefillFields` returned `[]`, the
+   * notice came down, the save unlocked, and an empty sensitive parameter was
+   * written with zero confirmations. Normalizing the row moves the fact into
+   * the marker, which `applyPairEdit` deliberately never clears.
+   */
+  it("holds the gate again when a filled-in url-only parameter is deleted", async () => {
+    const projects = useProjectsStore()
+    projects.activeProject = "My API"
+    const saveRequest = vi.spyOn(projects, "saveRequest").mockResolvedValue(undefined)
+    const tabs = useTabsStore()
+    tabs.updateTab(tabs.activeTab.id, {
+      url: `https://api.test/items?ghost=${REDACTION_SENTINEL}`,
+      params: [pair("page", "1")],
+    })
+    const wrapper = mount(RequestPanel, { global: { plugins: [pinia] } })
+    await nextTick()
+
+    const editor = () => wrapper.findAllComponents(KeyValueEditor)[0]
+
+    // FALSE GATE first: typing the credential in releases everything.
+    await valueBoxByKey(editor(), "ghost").setValue("REAL")
+    await nextTick()
+    expect(pendingRefillFields(tabs.activeTab)).toEqual([])
+    expect(wrapper.find("[data-testid=\"history-redacted-banner\"]").exists()).toBe(false)
+
+    // MISSED GATE, the R10 reproduction: deleting it again must put the
+    // request back behind the gate, not hand out an ordinary blank row.
+    await valueBoxByKey(editor(), "ghost").setValue("")
+    await nextTick()
+
+    expect(pendingRefillFields(tabs.activeTab).map(identityTuple)).toEqual([
+      ["refill", "query", null, "ghost"],
+    ])
+    expect(wrapper.find("[data-testid=\"history-redacted-banner\"]").exists()).toBe(true)
+
+    const save = wrapper.findAll("button").find((b) => b.text().includes("request.save"))
+    await save!.trigger("click")
+    expect(
+      (wrapper.find("[data-testid=\"request-save-submit\"]").element as HTMLButtonElement).disabled,
+    ).toBe(true)
+    expect(saveRequest).not.toHaveBeenCalled()
+  })
+
+  /**
+   * The other spelling of the same class (P16): a *stored* params row that
+   * still holds the literal placeholder — the shape a hand-edited or legacy
+   * saved request opens into through `openRequest`, which clears nothing. The
+   * normalization has to cover both copies, not just the url-contributed rows
+   * the review named; a fix applied to `fromUrl` alone would leave this row
+   * walking the identical fill-then-empty bypass.
+   */
+  it("holds the gate again when a filled-in stored placeholder row is deleted", async () => {
+    const tabs = useTabsStore()
+    tabs.updateTab(tabs.activeTab.id, {
+      url: "https://api.test/items",
+      params: [pair("apikey", REDACTION_SENTINEL), pair("page", "1")],
+    })
+    const wrapper = mount(RequestPanel, { global: { plugins: [pinia] } })
+    await nextTick()
+
+    const editor = () => wrapper.findAllComponents(KeyValueEditor)[0]
+
+    await valueBoxByKey(editor(), "apikey").setValue("REAL")
+    await nextTick()
+    // Self-check, not the subject: filling in releases the gate either way.
+    expect(pendingRefillFields(tabs.activeTab)).toEqual([])
+
+    await valueBoxByKey(editor(), "apikey").setValue("")
+    await nextTick()
+
+    // The subject: the row's origin survived the round trip in its marker.
+    expect(pendingRefillFields(tabs.activeTab).map(identityTuple)).toEqual([
+      ["refill", "query", null, "apikey"],
     ])
   })
 })

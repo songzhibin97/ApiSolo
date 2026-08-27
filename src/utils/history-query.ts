@@ -92,7 +92,21 @@ export function historyQueryRows(stored: KeyValuePair[], rawUrl: string): KeyVal
   // copies together — the union, not one of them minus the other.
   const blankedKeys = new Set([...stored, ...fromUrl].filter(isBlanked).map((item) => item.key))
 
-  return [...stored, ...fromUrl.filter((item) => !storedKeys.has(item.key))].map((item) =>
+  return [...stored, ...fromUrl.filter((item) => !storedKeys.has(item.key))].map((item) => {
+    // A row still holding the literal placeholder leaves here as an empty,
+    // marked row — the same shape `clearSentinelPairs` gives a stored row — so
+    // the placeholder text never reaches anything editable. Handing it out
+    // as-is is what let a url-contributed row lose its origin: the row carried
+    // the fact in its *value* and nothing in its marker, so typing over the
+    // placeholder and deleting again left an ordinary-looking blank row that
+    // no reader could tell from one the user meant to send empty — gate gone,
+    // empty credential saved without a word. It also kept the placeholder one
+    // keystroke away from the wire, and the placeholder must never be
+    // replayable.
+    if (item.value.trim() === REDACTION_SENTINEL) {
+      return { ...item, value: "", redacted: true }
+    }
+
     // `value === ""` is what keeps the two entry points agreeing on a key whose
     // copies disagree: the url still holding a placeholder for a key the params
     // copy holds a real value for says only that the url is stale, and marking
@@ -100,6 +114,6 @@ export function historyQueryRows(stored: KeyValuePair[], rawUrl: string): KeyVal
     // also why nothing is marked over a row that holds a value — the marker
     // means "this blank came from history", and putting it on a non-blank row
     // would be inventing it.
-    item.value === "" && blankedKeys.has(item.key) ? { ...item, redacted: true } : item,
-  )
+    return item.value === "" && blankedKeys.has(item.key) ? { ...item, redacted: true } : item
+  })
 }

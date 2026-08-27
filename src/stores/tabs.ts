@@ -460,6 +460,10 @@ export const useTabsStore = defineStore("tabs", () => {
 
     // History stores sensitive values as the sentinel. Restore them as empty,
     // marked rows so replaying can never put the placeholder back on the wire.
+    // The params line is a no-op today — `historyQueryRows` normalizes
+    // placeholder rows itself before they reach anything — and is kept as the
+    // same second line of defense the other two lists get: a regression there
+    // must not be what puts a replayable placeholder into a tab.
     tab.params = clearSentinelPairs(tab.params)
     tab.headers = clearSentinelPairs(tab.headers)
     tab.body.formData = clearSentinelPairs(tab.body.formData)
