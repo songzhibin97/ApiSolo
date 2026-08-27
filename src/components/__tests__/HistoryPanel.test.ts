@@ -558,6 +558,63 @@ describe("§31/§36/§38 notes are offered on every row and shown when present",
   })
 })
 
+describe("D12 §10 every row still carries all four action entries", () => {
+  const three = [
+    entry({ id: "a", url: "https://api.example.com/a" }),
+    entry({ id: "b", url: "https://api.example.com/b" }),
+    entry({ id: "c", url: "https://api.example.com/c" }),
+  ]
+
+  it("renders one star button per entry", async () => {
+    const wrapper = await mountPanel(three)
+
+    expect(rows(wrapper, "history-star")).toHaveLength(3)
+  })
+
+  it("renders one note button per entry", async () => {
+    const wrapper = await mountPanel(three)
+
+    expect(rows(wrapper, "history-note")).toHaveLength(3)
+  })
+
+  it("renders one save button per entry", async () => {
+    const wrapper = await mountPanel(three)
+
+    expect(rows(wrapper, "history-save")).toHaveLength(3)
+  })
+
+  it("renders one delete button per entry", async () => {
+    const wrapper = await mountPanel(three)
+
+    expect(rows(wrapper, "history-delete")).toHaveLength(3)
+  })
+})
+
+describe("D12 §8 the truncated badge hands its wording to the tooltip and the screen reader", () => {
+  // `t` is mocked to echo its key, so these assert "this key is bound to this
+  // attribute" (A44/A49), not the Chinese or English wording — the wording
+  // stays pinned by the locale matrix test on the same key.
+  async function badge() {
+    const wrapper = await mountPanel([entry({ responseBodyTruncated: true })])
+    const found = rows(wrapper, "history-truncated-badge")[0]
+    expect(found, "the truncated badge is not in the template").toBeDefined()
+    return found
+  }
+
+  it("T4a — the hover tip carries the badge key", async () => {
+    expect((await badge()).attributes("title")).toBe("response.networkTruncatedBadge")
+  })
+
+  it("T4b — the accessible name has a host role and carries the badge key", async () => {
+    // Both halves live in one `it` on purpose: an aria-label on a generic
+    // span is naming-prohibited, so either half alone cannot detect "the
+    // attribute is present and the accessible name absent".
+    const el = await badge()
+    expect(el.attributes("role")).toBe("img")
+    expect(el.attributes("aria-label")).toBe("response.networkTruncatedBadge")
+  })
+})
+
 describe("§39/§42 stars can be toggled from the row and filtered on", () => {
   it("writes the star through the store when the row's star is clicked", async () => {
     const wrapper = await mountPanel([entry({ id: "a" })])
