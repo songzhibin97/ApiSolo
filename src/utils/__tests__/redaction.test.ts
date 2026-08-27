@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import sharedKeys from "../__fixtures__/sensitive-keys.json"
+import { needsRefill } from "../pending-refill"
 import {
   REDACTION_SENTINEL,
   applyPairEdit,
@@ -8,16 +9,19 @@ import {
   bodyKindFromContentType,
   clearSentinelBody,
   clearSentinelPairs,
-  hasPendingRedactedFields,
+  emptyBodyFields,
   isSensitiveKey,
+  isUnverifiableBody,
   lenientDecodeKey,
   redactBodyText,
   redactKeyValuePairs,
   redactUrlQuery,
   redactValue,
+  remainingRedactedBodyFields,
   sentinelBodyFields,
+  tryScanJsonSpans,
 } from "../redaction"
-import type { KeyValuePair, Tab } from "../../types"
+import type { KeyValuePair } from "../../types"
 
 // `~` stands for a single backslash everywhere in this file. Escapes written as
 // literals have been silently eaten by the writing chain before (repo rule P6),
@@ -36,27 +40,6 @@ function pair(key: string, value: string, overrides: Partial<KeyValuePair> = {})
   return { id: `${key}-1`, enabled: true, key, value, description: "", ...overrides }
 }
 
-function makeTab(overrides: Partial<Tab> = {}): Tab {
-  return {
-    id: "tab-1",
-    label: "tab",
-    method: "POST",
-    url: "https://api.example.com/users",
-    protocol: "http",
-    isDirty: false,
-    params: [],
-    headers: [],
-    body: { type: "none", content: "", formData: [], binaryPath: "", binaryContent: "" },
-    auth: { type: "none" },
-    preRequestScript: "",
-    testScript: "",
-    projectName: null,
-    savedRequestPath: null,
-    urlRevision: 0,
-    ...overrides,
-  }
-}
-
 describe("§3 redacted marker lifecycle", () => {
   const marked = [pair("Cookie", "", { redacted: true })]
 
@@ -64,36 +47,189 @@ describe("§3 redacted marker lifecycle", () => {
     ["enabled", { enabled: false } as Partial<KeyValuePair>],
     ["key", { key: "Cookie2" } as Partial<KeyValuePair>],
     ["description", { description: "note" } as Partial<KeyValuePair>],
+    // Touching the box is not filling it in. A rule keyed on "was the value
+    // part of this edit" rather than on what the row now holds lets a click-in,
+    // click-out — or a paste of nothing — drop the gate on a row that still
+    // holds no credential.
+    ["the value to empty", { value: "" } as Partial<KeyValuePair>],
+    // And filling it in does not clear it either: the marker records that
+    // history blanked this row, which stays true no matter what is typed over
+    // it. What stops the row being reported is the value, asked for separately.
+    ["the value to a real one", { value: "sid=1" } as Partial<KeyValuePair>],
   ])("keeps the marker when %s changes", (_field, patch) => {
     expect(applyPairEdit(marked, "Cookie-1", patch)[0].redacted).toBe(true)
   })
 
-  it("clears the marker when value changes", () => {
-    expect(applyPairEdit(marked, "Cookie-1", { value: "sid=1" })[0].redacted).toBe(false)
+  /**
+   * The pair the marker exists for, walked in order. Clearing it on the first
+   * keystroke made the second step unrecoverable: the row went back to blank
+   * with nothing left saying it had ever held a credential, so the notice came
+   * down, the save unlocked and the request was written with an empty api key.
+   *
+   * `needsRefill` is the question every reader actually asks, so it is what is
+   * asserted here — the marker on its own answers neither step.
+   */
+  it("stops reporting a filled row and reports it again once it is emptied", () => {
+    const filled = applyPairEdit(marked, "Cookie-1", { value: "sid=1" })
+    expect(needsRefill(filled[0])).toBe(false)
+
+    const emptiedAgain = applyPairEdit(filled, "Cookie-1", { value: "" })
+    expect(needsRefill(emptiedAgain[0])).toBe(true)
+  })
+
+  // The other direction, so that "never clear it" cannot be satisfied by
+  // marking everything: a row history never blanked is never reported, however
+  // it is edited.
+  it("never reports a row that carries no marker", () => {
+    const plain = [pair("page", "1")]
+
+    expect(needsRefill(applyPairEdit(plain, "page-1", { value: "" })[0])).toBe(false)
   })
 })
 
-describe("§4 pending redacted fields", () => {
-  it("reports pending redacted fields until every marker is cleared", () => {
-    const headerOnly = makeTab({ headers: [pair("Cookie", "", { redacted: true })] })
-    expect(hasPendingRedactedFields(headerOnly)).toBe(true)
+describe("§4 clearing a body says which keys it emptied", () => {
+  it("names the keys it emptied in a JSON body", () => {
+    const cleared = clearSentinelBody("json", `{"token":"${REDACTION_SENTINEL}","keep":"v"}`)
 
-    const paramOnly = makeTab({ params: [pair("access_token", "", { redacted: true })] })
-    expect(hasPendingRedactedFields(paramOnly)).toBe(true)
+    expect(cleared.fields).toEqual(["token"])
+    expect(cleared.content).toBe(`{"token":"","keep":"v"}`)
+  })
 
-    const formDataOnly = makeTab({
-      body: { type: "form-data", content: "", formData: [pair("password", "", { redacted: true })], binaryPath: "", binaryContent: "" },
-    })
-    expect(hasPendingRedactedFields(formDataOnly)).toBe(true)
+  it("names the keys it emptied in a urlencoded body", () => {
+    const cleared = clearSentinelBody("urlencoded", `token=${REDACTION_SENTINEL}&page=2`)
 
-    const bodyOnly = makeTab({ bodyRedacted: true })
-    expect(hasPendingRedactedFields(bodyOnly)).toBe(true)
+    expect(cleared.fields).toEqual(["token"])
+    expect(cleared.content).toBe("token=&page=2")
+  })
 
-    const cleared = makeTab({
-      headers: [pair("Cookie", "sid=1", { redacted: false })],
-      bodyRedacted: false,
-    })
-    expect(hasPendingRedactedFields(cleared)).toBe(false)
+  it("names the keys it emptied in a plain-text body", () => {
+    const cleared = clearSentinelBody("text", `token: ${REDACTION_SENTINEL}`)
+
+    expect(cleared.fields).toEqual(["token"])
+    expect(cleared.content).toBe("token: ")
+  })
+
+  // Two values under the same name are two values to type back in. Collapsing
+  // them would understate the list at both save entry points.
+  it("keeps a repeated key once per occurrence", () => {
+    const cleared = clearSentinelBody(
+      "json",
+      `{"a":{"token":"${REDACTION_SENTINEL}"},"b":{"token":"${REDACTION_SENTINEL}"}}`,
+    )
+
+    expect(cleared.fields).toEqual(["token", "token"])
+  })
+
+  it("reports no names when there was nothing to clear", () => {
+    expect(clearSentinelBody("json", `{"keep":"v"}`).fields).toEqual([])
+    expect(clearSentinelBody("json", "").fields).toEqual([])
+  })
+})
+
+describe("§5-§8 which recorded keys are still empty", () => {
+  it("finds the sensitive keys currently holding nothing", () => {
+    expect(emptyBodyFields("json", `{"token":"","keep":"v"}`)).toEqual(["token"])
+    expect(emptyBodyFields("urlencoded", "token=&page=2")).toEqual(["token"])
+    expect(emptyBodyFields("text", "token:")).toEqual(["token"])
+  })
+
+  it("finds nothing once the value is back", () => {
+    expect(emptyBodyFields("json", `{"token":"REAL"}`)).toEqual([])
+  })
+
+  /**
+   * The asymmetry that makes the gate fail closed. `sentinelBodyFields` falls
+   * back to the text scanner here and is right to -- finding a placeholder in
+   * unparseable text is still finding one. This must not, because the text
+   * scanner would answer "already filled in" for `  "token": "",` and the gate
+   * would vanish at the worst possible moment.
+   */
+  it("refuses to answer for a JSON body that will not parse", () => {
+    expect(emptyBodyFields("json", `{"token": "",`)).toBeNull()
+    expect(isUnverifiableBody("json", `{"token": "",`)).toBe(true)
+  })
+
+  it("always answers for the two kinds that cannot fail to scan", () => {
+    expect(emptyBodyFields("urlencoded", "%%%not=valid")).not.toBeNull()
+    expect(emptyBodyFields("text", "}{")).not.toBeNull()
+    expect(isUnverifiableBody("text", `{"token": "",`)).toBe(false)
+    expect(isUnverifiableBody("urlencoded", `{"token": "",`)).toBe(false)
+  })
+
+  it("keeps a recorded key while it is still empty", () => {
+    expect(remainingRedactedBodyFields("json", `{"token":"","keep":"CHANGED"}`, ["token"])).toEqual([
+      "token",
+    ])
+  })
+
+  it("drops a recorded key once it is filled in, and once it is deleted", () => {
+    expect(remainingRedactedBodyFields("json", `{"token":"REAL"}`, ["token"])).toEqual([])
+    expect(remainingRedactedBodyFields("json", `{"keep":"v"}`, ["token"])).toEqual([])
+  })
+
+  it("holds every recorded key while the body will not parse", () => {
+    expect(remainingRedactedBodyFields("json", `{"token": "",`, ["token", "secret"])).toEqual([
+      "token",
+      "secret",
+    ])
+  })
+
+  it("matches repeats one for one rather than by presence", () => {
+    expect(
+      remainingRedactedBodyFields("json", `{"a":{"token":""},"b":{"token":"REAL"}}`, [
+        "token",
+        "token",
+      ]),
+    ).toEqual(["token"])
+  })
+
+  it("has nothing to say when replay recorded nothing", () => {
+    expect(remainingRedactedBodyFields("json", `{"token":""}`, [])).toEqual([])
+  })
+})
+
+/**
+ * Both save entry points have to agree on whether the body can be read, and
+ * they see it at different moments -- the history row before the placeholders
+ * are cleared, the tab after. Clearing must therefore not change whether the
+ * body parses. The reasoning for why it holds (a replacement swaps one string
+ * token for another, and a text cut always lands after `key:`, which is never
+ * a complete JSON value on its own) is written down, but the reasoning is not
+ * what carries this: the equality below is.
+ */
+describe("clearing a body does not change whether it parses", () => {
+  const parseable = (content: string) => tryScanJsonSpans(content) !== null
+
+  const effective: Array<[string, string]> = [
+    ["escape adjacent to the placeholder", `{"a":"b\\\\","token":"${REDACTION_SENTINEL}"}`],
+    ["compact JSON", `{"token":"${REDACTION_SENTINEL}","keep":"v"}`],
+    ["already formatted JSON", `{\n  "token": "${REDACTION_SENTINEL}",\n  "keep": "v"\n}`],
+    ["a bare value the text path degrades to", `{token: ${REDACTION_SENTINEL}`],
+  ]
+
+  it.each(effective)("holds for %s", (_label, before) => {
+    const after = clearSentinelBody("json", before).content
+
+    // Step one: prove the fixture is not a no-op. An unchanged body satisfies
+    // the equality for free and would occupy the slot without covering it.
+    expect(after).not.toBe(before)
+    // Step two: assert the two sides agree, not that each equals a value
+    // written down here -- otherwise a day when both go wrong together is a day
+    // when two expectations get updated and the equality stops carrying weight.
+    expect(parseable(before)).toBe(parseable(after))
+  })
+
+  // Recorded rather than counted as coverage: the production code only replaces
+  // a span whose whole value token is the placeholder, so in these shapes
+  // nothing is cleared at all and the equality holds vacuously.
+  const noOp: Array<[string, string]> = [
+    ["the placeholder sitting in a key position", `{"${REDACTION_SENTINEL}":"v"}`],
+    ["the placeholder inside a doubly-encoded string", `{"a":"{\\"token\\":\\"${REDACTION_SENTINEL}\\"}"}`],
+    ["a quoted placeholder in an unparseable body", `{"token": "${REDACTION_SENTINEL}",`],
+  ]
+
+  it.each(noOp)("does not fire for %s, so the equality is vacuous there", (_label, before) => {
+    expect(clearSentinelBody("json", before).content).toBe(before)
   })
 })
 
@@ -210,7 +346,7 @@ describe("§13 escaped json keys", () => {
     // clearing — key bytes survive there too
     expect(clearSentinelBody("json", esc(`{"~u0070assword":"${REDACTION_SENTINEL}"}`))).toEqual({
       content: esc('{"~u0070assword":""}'),
-      cleared: true,
+      fields: ["password"],
     })
 
     // the gate names the decoded key
@@ -461,19 +597,19 @@ describe("clearing the sentinel out of a body", () => {
   it("clears a sensitive field and leaves prose alone", () => {
     expect(clearSentinelBody("urlencoded", `user=bob&password=${REDACTION_SENTINEL}`)).toEqual({
       content: "user=bob&password=",
-      cleared: true,
+      fields: ["password"],
     })
     expect(clearSentinelBody("text", `Cookie: ${REDACTION_SENTINEL}`)).toEqual({
       content: "Cookie: ",
-      cleared: true,
+      fields: ["Cookie"],
     })
     expect(clearSentinelBody("text", `note: the string ${REDACTION_SENTINEL} appears here`)).toEqual({
       content: `note: the string ${REDACTION_SENTINEL} appears here`,
-      cleared: false,
+      fields: [],
     })
     expect(clearSentinelBody("json", `{"note":"${REDACTION_SENTINEL}"}`)).toEqual({
       content: `{"note":"${REDACTION_SENTINEL}"}`,
-      cleared: false,
+      fields: [],
     })
   })
 

@@ -4,11 +4,14 @@ import { defineStore } from "pinia";
 import i18n from "../i18n";
 import { recordConsoleEntry } from "./console"
 import { useWebSocketStore } from "./websocket"
+import { historyQueryRows } from "../utils/history-query"
+import { clearUrlSentinels } from "../utils/history-to-request"
 import {
   bodyKindFromBodyType,
   clearSentinelBody,
   clearSentinelPairs,
 } from "../utils/redaction"
+import { deriveParamsFromUrl } from "../utils/url-params"
 import type {
   AuthType,
   BodyType,
@@ -172,18 +175,10 @@ function sanitizeHistoryFormData(items: Tab["body"]["formData"]) {
   )
 }
 
-function deriveParamsFromUrl(url: string) {
-  try {
-    return [...new URL(url).searchParams.entries()].map(([key, value]) => ({
-      id: crypto.randomUUID(),
-      enabled: true,
-      key,
-      value,
-      description: "",
-    }))
-  } catch {
-    return []
-  }
+function historyQueryRowsFor(entry: HistoryEntry): KeyValuePair[] {
+  // The url is read before `clearUrlSentinels` runs on it: afterwards the
+  // placeholders are gone and there is nothing left to recognise them by.
+  return historyQueryRows(createEditablePairs(entry.requestParams ?? []), entry.url)
 }
 
 export const useTabsStore = defineStore("tabs", () => {
@@ -400,11 +395,12 @@ export const useTabsStore = defineStore("tabs", () => {
     const tab = createEmptyTab(tabs.value.length + 1)
     tab.method = normalizedMethod
     tab.url = entry.url
-    tab.label = deriveHistoryLabel(entry.url)
+    // Cleared here too, not just on `tab.url`: the label is the save dialog's
+    // default name, so a placeholder left in it lands in the collection file as
+    // the request's name and leaves with any export.
+    tab.label = deriveHistoryLabel(clearUrlSentinels(entry.url))
 
-    tab.params = entry.requestParams?.length
-      ? createEditablePairs(entry.requestParams)
-      : deriveParamsFromUrl(entry.url)
+    tab.params = historyQueryRowsFor(entry)
 
     if (entry.requestHeaders?.length) {
       tab.headers = createEditablePairs(entry.requestHeaders)
@@ -464,12 +460,21 @@ export const useTabsStore = defineStore("tabs", () => {
 
     // History stores sensitive values as the sentinel. Restore them as empty,
     // marked rows so replaying can never put the placeholder back on the wire.
+    // The params line is a no-op today — `historyQueryRows` normalizes
+    // placeholder rows itself before they reach anything — and is kept as the
+    // same second line of defense the other two lists get: a regression there
+    // must not be what puts a replayable placeholder into a tab.
     tab.params = clearSentinelPairs(tab.params)
     tab.headers = clearSentinelPairs(tab.headers)
     tab.body.formData = clearSentinelPairs(tab.body.formData)
     const cleared = clearSentinelBody(bodyKindFromBodyType(tab.body.type), tab.body.content)
     tab.body.content = cleared.content
-    tab.bodyRedacted = cleared.cleared
+    tab.bodyRedactedFields = cleared.fields
+    // Has to stay below `historyQueryRowsFor` above: that is where the url's copy
+    // of the query is read, both for rows the params copy does not have and for
+    // which keys were blanked. Reading an already-cleared url hands it empty
+    // values with nothing left to recognise as a placeholder.
+    tab.url = clearUrlSentinels(tab.url)
 
     const matchingEmptyTab = tabs.value.find(
       (candidate) =>

@@ -11,8 +11,15 @@ import { isUntitledTabLabel, useTabsStore } from "../../stores/tabs";
 import { flattenCollectionFolders } from "../../utils/collection-options";
 import { exportCurl } from "../../utils/curl-export";
 import { parseCurl } from "../../utils/curl-parser";
-import { pendingRefillFields } from "../../utils/pending-refill";
-import { hasPendingRedactedFields, pendingRedactedFieldNames } from "../../utils/redaction";
+import { historyQueryRows } from "../../utils/history-query";
+import {
+  bannerFields,
+  formatPendingField,
+  pendingRefillFields,
+  refillFields,
+  unverifiableFields,
+  type PendingField,
+} from "../../utils/pending-refill";
 import { buildSavedRequest } from "../../utils/saved-request";
 import { buildUrlWithParams, syncParamsFromUrl } from "../../utils/url-params";
 import AuthEditor from "../request/AuthEditor.vue";
@@ -65,13 +72,6 @@ const sections = computed(() => {
   ];
 });
 
-const redactedFieldLabels = computed(() =>
-  [
-    ...pendingRedactedFieldNames(activeTab.value),
-    ...(activeTab.value.bodyRedacted ? [t("request.historyRedactedBody")] : []),
-  ].join(", "),
-);
-
 const collectionOptions = computed(() => [
   { label: t("common.rootCollection"), value: "" },
   ...flattenCollectionFolders(collectionTree.value),
@@ -85,6 +85,56 @@ const collectionOptions = computed(() => [
  */
 const pendingFields = computed(() => pendingRefillFields(activeTab.value));
 const saveBlocked = computed(() => saveGate.blocksSave(pendingFields.value));
+
+/**
+ * What the params table shows: the reconciled rows the list and the gate are
+ * computed from, not the raw `tab.params`. `historyQueryRows` is the one rule
+ * for which query rows this request has and which of them history blanked; the
+ * list is `needsRefill` over its output and the table's amber mark is
+ * `needsRefill` over the rows the table is given — so handing the table the
+ * raw rows let the two part ways. A blank row added by hand beside a marked
+ * one of the same key carries no marker of its own; the reconciliation marks
+ * it at read time, so the notice named it and the gate held the save, while no
+ * box on screen turned amber to say where. Same rule, same inputs
+ * (`tab.params`, `tab.url`) as the gate above: every query entry the list
+ * names is a row this table shows.
+ *
+ * An edit in the table emits these reconciled rows back through
+ * `updateParams`, so a mark the reconciliation computed becomes part of
+ * `tab.params`. Deliberate: `openHistoryEntry` and `syncParamsFromUrl` already
+ * write exactly these rows, the write is idempotent under the reconciliation,
+ * and stripping the marks back out on emit would take a second rule for
+ * telling computed marks from stored ones — the kind of second rule this
+ * derivation exists to remove.
+ */
+const paramRows = computed(() => historyQueryRows(activeTab.value.params, activeTab.value.url));
+
+/**
+ * The always-on notice reads the save gate's own list. It used to derive the
+ * same fact separately, and the two had drifted: the gate would hold a save for
+ * a blanked Bearer token while the notice said nothing at all, and the user's
+ * next move is Send, not Save. One derivation means they cannot disagree —
+ * whether the notice appears and what it says now change together.
+ */
+const noticeFields = computed(() => bannerFields(pendingFields.value));
+
+/**
+ * Split by class, using the save dialog's own filters. The two classes are not
+ * the same statement and must not be run together into one: "these need
+ * re-entering" is a claim we can only make about fields we can see are still
+ * blank. When the body will not parse we cannot see that, so saying it there
+ * would send the user to fill a field back in and leave the notice standing
+ * afterwards, with nothing on screen explaining why or how to clear it.
+ */
+const refillNotice = computed(() => refillFields(noticeFields.value));
+const unverifiableNotice = computed(() => unverifiableFields(noticeFields.value));
+
+function labelsOf(fields: PendingField[]) {
+  return fields.map((field) => formatPendingField(field, t)).join(", ");
+}
+
+const refillFieldLabels = computed(() => labelsOf(refillNotice.value));
+const unverifiableFieldLabels = computed(() => labelsOf(unverifiableNotice.value));
 
 function countEnabled(items: KeyValuePair[]) {
   return items.filter((item) => item.enabled && (item.key || item.value)).length;
@@ -160,9 +210,14 @@ function updateHeaders(headers: KeyValuePair[]) {
   updateActiveTab({ headers });
 }
 
+// No bookkeeping here on purpose. This used to clear the redaction marker
+// whenever the body text changed, which meant the body editor reformatting a
+// compact JSON payload for display wiped the gate — the values were untouched,
+// but the record of what had been blanked was gone. Nothing outside
+// `openHistoryEntry` writes that record any more; what still needs re-entering
+// is recomputed from the body each time it is asked.
 function updateBody(body: RequestBody) {
-  const contentChanged = body.content !== activeTab.value.body.content;
-  updateActiveTab({ body, ...(contentChanged ? { bodyRedacted: false } : {}) });
+  updateActiveTab({ body });
 }
 
 function updateAuth(auth: AuthConfig) {
@@ -362,11 +417,28 @@ onUnmounted(() => {
       @paste-curl="applyPastedCurl"
     />
 
+    <!--
+      Two sentences, each rendered only when its own class is present, and both
+      when both are. The list of names alone cannot tell the two apart: the same
+      "Body · token" row means "type this back in" in one state and "we cannot
+      tell whether you already did" in the other.
+    -->
     <div
-      v-if="hasPendingRedactedFields(activeTab)"
-      class="border-b border-amber-500/40 bg-amber-500/10 px-4 py-2 text-sm text-amber-300"
+      v-if="noticeFields.length > 0"
+      data-testid="history-redacted-banner"
+      class="space-y-1 border-b border-amber-500/40 bg-amber-500/10 px-4 py-2 text-sm text-amber-300"
     >
-      {{ t("request.historyRedactedBanner", { fields: redactedFieldLabels }) }}
+      <p v-if="refillNotice.length > 0" data-testid="history-redacted-banner-refill">
+        {{ t("request.historyRedactedBanner", { fields: refillFieldLabels }) }}
+      </p>
+      <div v-if="unverifiableNotice.length > 0" data-testid="history-redacted-banner-unverifiable">
+        <p>{{ t("history.refillUnparseableBody", { count: unverifiableNotice.length }) }}</p>
+        <!--
+          The names still get listed. The user needs to know which fields the
+          message is about, and the sentence above only carries how many.
+        -->
+        <p class="font-mono">{{ unverifiableFieldLabels }}</p>
+      </div>
     </div>
 
     <div
@@ -457,7 +529,7 @@ onUnmounted(() => {
 
     <div class="flex-1 min-h-0 overflow-auto p-4">
       <div v-show="activeSection === 'params'" class="h-full">
-        <KeyValueEditor :model-value="activeTab.params" @update:model-value="updateParams" />
+        <KeyValueEditor :model-value="paramRows" @update:model-value="updateParams" />
       </div>
 
       <div v-show="activeSection === 'headers'" class="h-full">

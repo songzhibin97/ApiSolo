@@ -12,8 +12,14 @@ function makeTab(overrides: Partial<Tab> = {}): Tab {
     url: "https://api.example.com/token",
     protocol: "http",
     isDirty: false,
+    // A marked row that holds a value: the marker records that history blanked
+    // this row and is not cleared when the value is typed back in, so this is
+    // the shape a tab is in between the refill and the save. It is also the one
+    // that matters most here -- the marker means "was blanked", and a marker on
+    // a row holding a credential is a claim about that credential following the
+    // file wherever it is copied or exported to.
     params: [
-      { id: "p-1", enabled: true, key: "page", value: "1", description: "", redacted: false },
+      { id: "p-1", enabled: true, key: "apikey", value: "REAL", description: "", redacted: true },
     ],
     headers: [
       { id: "h-1", enabled: true, key: "Cookie", value: "", description: "", redacted: true },
@@ -48,7 +54,7 @@ describe("§40 the redacted marker never reaches a saved request", () => {
       { id: "", enabled: true, key: "Cookie", value: "", description: "" },
     ])
     expect(saved.params).toEqual([
-      { id: "", enabled: true, key: "page", value: "1", description: "" },
+      { id: "", enabled: true, key: "apikey", value: "REAL", description: "" },
     ])
     expect(saved.body.formData).toEqual([
       { id: "", enabled: true, key: "password", value: "", description: "" },

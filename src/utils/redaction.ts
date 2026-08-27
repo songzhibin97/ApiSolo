@@ -336,7 +336,12 @@ function replaceSpans(text: string, spans: JsonSpan[], replacement: string): str
   return out
 }
 
-function tryScanJsonSpans(text: string): JsonSpan[] | null {
+/**
+ * Exported for tests only: it is the repository's own idea of what parses, and
+ * a test that reached for `JSON.parse` instead would be checking a different
+ * grammar than the one that ships.
+ */
+export function tryScanJsonSpans(text: string): JsonSpan[] | null {
   try {
     return scanJsonSpans(text)
   } catch {
@@ -508,7 +513,20 @@ export function clearSentinelPairs<T extends KeyValuePair>(items: T[]): T[] {
   ) as T[]
 }
 
-function clearSentinelJson(content: string): { content: string; cleared: boolean } | null {
+/**
+ * What replay took out of a body, by name. The names are the whole point: once
+ * the placeholder is gone the key it sat under is indistinguishable from a key
+ * the user meant to leave blank, and the save dialog has to be able to say
+ * which ones need typing back in. They are kept in order and with repeats --
+ * the same key redacted twice is two values to re-enter, and reporting one is
+ * the same class of lie as reporting three.
+ */
+export interface ClearedBody {
+  content: string
+  fields: string[]
+}
+
+function clearSentinelJson(content: string): ClearedBody | null {
   const spans = tryScanJsonSpans(content)
 
   if (spans === null) {
@@ -518,14 +536,17 @@ function clearSentinelJson(content: string): { content: string; cleared: boolean
   const hits = spans.filter((span) => content.slice(span.start, span.end) === SENTINEL_JSON)
 
   if (hits.length === 0) {
-    return { content, cleared: false }
+    return { content, fields: [] }
   }
 
-  return { content: replaceSpans(content, hits, EMPTY_JSON_STRING), cleared: true }
+  return {
+    content: replaceSpans(content, hits, EMPTY_JSON_STRING),
+    fields: hits.map((hit) => hit.name),
+  }
 }
 
-function clearSentinelUrlencoded(content: string): { content: string; cleared: boolean } {
-  let cleared = false
+function clearSentinelUrlencoded(content: string): ClearedBody {
+  const fields: string[] = []
 
   const next = content
     .split("&")
@@ -537,38 +558,39 @@ function clearSentinelUrlencoded(content: string): { content: string; cleared: b
       }
 
       const rawKey = part.slice(0, separator)
+      const key = lenientDecodeKey(rawKey)
 
-      if (!isSensitiveKey(lenientDecodeKey(rawKey))) {
+      if (!isSensitiveKey(key)) {
         return part
       }
 
-      cleared = true
+      fields.push(key)
       return `${rawKey}=`
     })
     .join("&")
 
-  return { content: next, cleared }
+  return { content: next, fields }
 }
 
-function clearSentinelText(content: string): { content: string; cleared: boolean } {
+function clearSentinelText(content: string): ClearedBody {
   const parts = content.split(/(\r\n|\n|\r)/)
-  let cleared = false
+  const fields: string[] = []
 
   for (let k = 0; k < parts.length; k += 2) {
     const hit = firstSensitiveCut(parts[k])
 
     if (hit && parts[k].slice(hit.cut) === REDACTION_SENTINEL) {
       parts[k] = parts[k].slice(0, hit.cut)
-      cleared = true
+      fields.push(hit.key)
     }
   }
 
-  return { content: parts.join(""), cleared }
+  return { content: parts.join(""), fields }
 }
 
-export function clearSentinelBody(kind: BodyKind, content: string): { content: string; cleared: boolean } {
+export function clearSentinelBody(kind: BodyKind, content: string): ClearedBody {
   if (!content) {
-    return { content, cleared: false }
+    return { content, fields: [] }
   }
 
   if (kind === "urlencoded") {
@@ -664,33 +686,146 @@ export function findSentinelFields(tab: Tab): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// "needs re-entering" markers
+// "needs re-entering" — decided by what the body holds now, not by what happened
 // ---------------------------------------------------------------------------
 
-export function pendingRedactedFieldNames(tab: Tab): string[] {
-  return [...tab.headers, ...tab.params, ...tab.body.formData]
-    .filter((item) => item.redacted)
-    .map((item) => item.key)
-}
+/**
+ * Which sensitive keys currently hold an empty value. Same scanners as
+ * `sentinelBodyFields`, comparing against empty instead of the placeholder.
+ *
+ * One asymmetry is deliberate: when the body is meant to be JSON and will not
+ * parse, this returns `null` rather than falling back to the text scanner the
+ * way `sentinelBodyFields` does. Hunting for a placeholder in unparseable text
+ * is worth doing -- finding one is finding one. Concluding that a value has
+ * been typed back in is not: "cannot tell" is not evidence of "already done",
+ * and the text scanner would supply a confident wrong answer. On
+ * `  "token": "",` the cut lands before `"",` rather than before an empty
+ * string, so the field would read as refilled and the gate would disappear at
+ * exactly the moment the body is least trustworthy.
+ */
+export function emptyBodyFields(kind: BodyKind, content: string): string[] | null {
+  if (kind === "json") {
+    const spans = tryScanJsonSpans(content)
 
-export function hasPendingRedactedFields(tab: Tab): boolean {
-  return (
-    tab.headers.some((item) => item.redacted) ||
-    tab.params.some((item) => item.redacted) ||
-    tab.body.formData.some((item) => item.redacted) ||
-    Boolean(tab.bodyRedacted)
-  )
+    if (spans === null) {
+      return null
+    }
+
+    return spans
+      .filter((span) => content.slice(span.start, span.end) === EMPTY_JSON_STRING)
+      .map((span) => span.name)
+  }
+
+  if (kind === "urlencoded") {
+    const keys: string[] = []
+
+    for (const part of content.split("&")) {
+      const separator = part.indexOf("=")
+
+      if (separator === -1 || part.slice(separator + 1) !== "") {
+        continue
+      }
+
+      const key = lenientDecodeKey(part.slice(0, separator))
+
+      if (isSensitiveKey(key)) {
+        keys.push(key)
+      }
+    }
+
+    return keys
+  }
+
+  const keys: string[] = []
+
+  for (const line of content.split(/\r\n|\n|\r/)) {
+    const hit = firstSensitiveCut(line)
+
+    if (hit && line.slice(hit.cut) === "") {
+      keys.push(hit.key)
+    }
+  }
+
+  return keys
 }
 
 /**
- * Clearing the marker is tied to the value alone. Toggling `enabled`, editing
- * the key or the description must keep it — otherwise the row goes back to
- * looking normal while still holding no value.
+ * Of the keys replay emptied, which still need typing back in. The answer is
+ * recomputed from the body every time rather than tracked as the user edits:
+ * a state nobody maintains has no write path left to forget. Reformatting the
+ * body changes no value and so changes no answer; editing a different key
+ * leaves this one empty and still listed; deleting the key outright drops it,
+ * because there is nothing left to fill.
+ *
+ * The overlap is a multiset, not a set. The same key emptied twice is two
+ * values the user has to supply, and it is also what keeps the two save entry
+ * points reporting the same list -- the history side produces one entry per
+ * span and does not collapse repeats either.
+ */
+export function remainingRedactedBodyFields(
+  kind: BodyKind,
+  content: string,
+  recorded: string[],
+): string[] {
+  if (recorded.length === 0) {
+    return []
+  }
+
+  const empty = emptyBodyFields(kind, content)
+
+  if (empty === null) {
+    return [...recorded]
+  }
+
+  const budget = new Map<string, number>()
+
+  for (const name of empty) {
+    budget.set(name, (budget.get(name) ?? 0) + 1)
+  }
+
+  return recorded.filter((name) => {
+    const left = budget.get(name) ?? 0
+
+    if (left === 0) {
+      return false
+    }
+
+    budget.set(name, left - 1)
+    return true
+  })
+}
+
+/**
+ * Whether the body is in a state where the question above cannot be answered.
+ * Read from the body text alone, so both save entry points get the same answer
+ * regardless of which branch produced the field names -- if this depended on
+ * the caller, the same request would carry two different signatures and the
+ * user would be asked to confirm twice.
+ */
+export function isUnverifiableBody(kind: BodyKind, content: string): boolean {
+  return kind === "json" && tryScanJsonSpans(content) === null
+}
+
+/**
+ * No edit clears the marker. `redacted` says "history blanked this row", which
+ * is a fact about where the row came from and stays true however the value is
+ * edited; whether the row still needs typing back in is the *conjunction*
+ * `redacted && value === ""`, and every reader asks it that way. Filling the
+ * value in therefore answers "no" on its own, with nothing to clear, and
+ * deleting what was typed answers "yes" again.
+ *
+ * This is the single record of what was blanked that outlives the value, so
+ * throwing it away on the first keystroke is what made a typed-then-deleted
+ * credential go quiet: the notice came down, the save unlocked, and the request
+ * was written with an empty api key that 401s the next time anyone uses it.
+ * An earlier note here declared that case out of reach for want of exactly this
+ * record. The record was never missing — it was being discarded two lines below
+ * the sentence that said it did not exist.
+ *
+ * Keeping it means a marker can outlive its usefulness (a row whose key the
+ * user retyped into something else stays marked). That direction costs a
+ * confirmation; the other direction costs a credential.
  */
 export function applyPairEdit<T extends KeyValuePair>(rows: T[], id: string, patch: Partial<T>): T[] {
-  return rows.map((row) =>
-    row.id === id
-      ? { ...row, ...patch, ...("value" in patch ? { redacted: false } : {}) }
-      : row,
-  )
+  return rows.map((row) => (row.id === id ? { ...row, ...patch } : row))
 }

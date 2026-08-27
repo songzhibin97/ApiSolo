@@ -4,7 +4,38 @@ export interface KeyValuePair {
   key: string
   value: string
   description: string
-  /** In-memory only: the value was redacted in history and needs re-entering. */
+  /**
+   * In-memory only: history blanked this row.
+   *
+   * It records where a blank came from, never how far the user has got. The
+   * gate reads this *and* the current value, so a marked row holding a value is
+   * inert — do not treat this on its own as "the row is pending".
+   *
+   * Two rules for anything that touches it while a request is being edited.
+   * Both have been got wrong at least once:
+   *
+   *   - It is **stripped** before a row is persisted or written to history. It
+   *     is session state, not data.
+   *   - A rebuild must not lose it, and must not invent it. Losing it silently
+   *     removes the save gate on a blanked credential; inventing it blocks a
+   *     request that is already complete. Where rows can be told apart, carry
+   *     it per row — including onto a row that now holds a value, because
+   *     deleting that value again has to be reported and this is the only
+   *     record that can say so. Where they cannot -- the query string, whose
+   *     two identical blank `apikey` parameters hold no fact saying which is
+   *     which -- carry it per key instead: see `syncParamsFromUrl`. Do not
+   *     invent a tie-break; three attempts to do that each failed in one
+   *     direction or the other.
+   *
+   *     Nothing clears it. Editing a value answers "is this row pending" on its
+   *     own, so there is nothing left for a clear to do, and a clear is how the
+   *     typed-in-then-deleted credential used to go out empty and unannounced.
+   *
+   * Scope note: this is about the marker's life inside *editable request state*.
+   * It is deliberately not a claim about every site that rebuilds a
+   * `KeyValuePair[]` — that set grows with the code, and the gate does not
+   * depend on all of it.
+   */
   redacted?: boolean
 }
 
@@ -116,8 +147,13 @@ export interface Tab {
   responseError?: string | null
   scriptResult?: ScriptResult | null
   isLoading?: boolean
-  /** In-memory only: the body was redacted in history and needs re-entering. */
-  bodyRedacted?: boolean
+  /**
+   * In-memory only: which body keys history had redacted, in order and with
+   * repeats. It records where the blanks came from, never how far the user has
+   * got filling them in -- that is recomputed from the body text, so there is
+   * no progress here to keep up to date.
+   */
+  bodyRedactedFields?: string[]
   /**
    * In-memory only: bumped by every write to `url` or `params` that did not
    * come from the URL bar itself. The URL bar uses it to tell its own echo

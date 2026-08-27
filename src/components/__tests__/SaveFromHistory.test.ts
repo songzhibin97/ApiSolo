@@ -150,7 +150,7 @@ describe("§10 the list of pending fields is complete, and says how many there a
   const thirty: PendingField[] = Array.from({ length: 30 }, (_unused, index) => ({
     kind: "refill",
     source: "header",
-    path: `Header · X-Field-${index}`,
+    name: `X-Field-${index}`,
   }))
 
   it("renders every field rather than the first few", () => {
@@ -211,7 +211,7 @@ describe("§12 the confirmation appears exactly when there is something to confi
   it("still asks for confirmation when only files need re-picking", () => {
     const wrapper = mount(PendingRefillNotice, {
       props: {
-        fields: [{ kind: "reselect-file", source: "file", path: "Form · avatar" }],
+        fields: [{ kind: "reselect-file", source: "file", name: "avatar" }],
       },
       global: { plugins: [pinia] },
     })
@@ -285,10 +285,12 @@ describe("§6 the two save entry points share one list and one acknowledgement",
   // the silent blank save this gate exists to stop.
   it("does not carry the acknowledgement over to a different request", () => {
     const gate = useSaveGateStore()
-    gate.acknowledge([{ kind: "refill", source: "header", path: "Header · Authorization" }])
+    gate.acknowledge([{ kind: "refill", source: "header", name: "Authorization" }])
 
     expect(
-      gate.blocksSave([{ kind: "refill", source: "auth", path: "Auth · Bearer token" }]),
+      gate.blocksSave([
+        { kind: "refill", source: "auth", slot: "bearer-token", name: "" },
+      ]),
     ).toBe(true)
   })
 })

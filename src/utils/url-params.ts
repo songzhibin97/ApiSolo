@@ -16,13 +16,97 @@ export function toParsableUrl(rawUrl: string) {
 export function syncParamsFromUrl(rawUrl: string, currentParams: KeyValuePair[]) {
   try {
     const parsed = new URL(toParsableUrl(rawUrl))
-    const params = [...parsed.searchParams.entries()].map(([key, value]) => ({
-      id: crypto.randomUUID(),
-      enabled: true,
-      key,
-      value,
-      description: "",
-    }))
+    /**
+     * The marker travels per key, not per row: if a key is one history blanked,
+     * every blank row of that key in the rebuilt list is marked.
+     *
+     * "A key history blanked" is read off the marker alone, not off the marker
+     * and an empty value together. The marker outlives the value it was set
+     * for, so a credential typed back in still carries it, and a key read as
+     * blanked only while one of its rows is still empty would stop being one the
+     * moment the last blank row was filled -- which is precisely when emptying
+     * it again has to be reported.
+     *
+     * This is not an approximation of a per-row rule, it is the absence of one,
+     * and that is the point. Two rows with the same key and the same value are
+     * indistinguishable -- there is no fact in a url that says which blank
+     * `apikey` is "the" blanked one. Every rule that tried to answer that
+     * question failed in one of two directions, and fixing one direction opened
+     * the other:
+     *
+     *   - Rebuild the rows blindly and the marker is lost, so a still-blank
+     *     credential stops being reported: the save goes through and the
+     *     request 401s in silence once someone uses it.
+     *   - Hand the marker to a row chosen by position, by ordinal among
+     *     same-named keys, or by order-preserving match, and it can land on a
+     *     row the user just added. Then filling in the value that really was
+     *     blanked leaves the notice up on a request that is already complete.
+     *
+     * Asking "is any `apikey` still empty" has an answer; asking "which one"
+     * does not. And the first question is the one that matters to the person
+     * reading the notice: an empty `apikey` goes out empty whichever row it
+     * came from.
+     *
+     * The cost, stated rather than hidden: deliberately sending one sensitive
+     * parameter empty alongside a filled one keeps the notice up, and the user
+     * has to tick the acknowledgement to save. That is the direction to err in,
+     * and it is a confirmation rather than a refusal.
+     */
+    const entries = [...parsed.searchParams.entries()]
+    const blanked = new Set<string>()
+
+    for (const item of currentParams) {
+      if (item.enabled && item.redacted === true) {
+        blanked.add(item.key)
+      }
+    }
+
+    /**
+     * Identity is only reused where it is unambiguous: a row whose key and
+     * non-empty value both still appear is the same row wherever it moved to.
+     * Blank rows are deliberately not matched -- that is the question with no
+     * answer -- so they get a fresh handle, which is what they got before any
+     * of this.
+     */
+    const enabled = currentParams.filter((item) => item.enabled)
+    const claimed = new Set<number>()
+
+    function claimSameValue(key: string, value: string): KeyValuePair | undefined {
+      if (value === "") {
+        return undefined
+      }
+
+      const index = enabled.findIndex(
+        (item, at) => !claimed.has(at) && item.key === key && item.value === value,
+      )
+
+      if (index === -1) {
+        return undefined
+      }
+
+      claimed.add(index)
+      return enabled[index]
+    }
+
+    const params = entries.map(([key, value]) => {
+      const previous = claimSameValue(key, value)
+
+      return {
+        id: previous?.id ?? crypto.randomUUID(),
+        enabled: true,
+        key,
+        value,
+        description: previous?.description ?? "",
+        // Two ways a rebuilt row can carry the marker, for the two kinds of row
+        // this rebuild can and cannot identify. A row it identified keeps
+        // whatever it already had: the marker outlives the value, so a
+        // credential typed back in and then deleted again has to report again,
+        // and dropping the marker here would be the only reason it could not.
+        // A blank row cannot be identified at all -- that is the question with
+        // no answer -- so `blanked` speaks for it by key instead.
+        ...(previous?.redacted || (value === "" && blanked.has(key)) ? { redacted: true } : {}),
+      }
+    })
     // Store URL without query string — params are the source of truth
     const { baseUrl, hash } = splitUrlParts(rawUrl)
     return {
@@ -34,6 +118,32 @@ export function syncParamsFromUrl(rawUrl: string, currentParams: KeyValuePair[])
       url: rawUrl,
       params: currentParams,
     }
+  }
+}
+
+/**
+ * A url's query read as rows, with no reconciliation against anything: fresh
+ * handles, no markers, disabled rows impossible. It is the one place this app
+ * reads a query string into rows — `syncParamsFromUrl` above and the history
+ * readers all end up here — because a second parser is a second thing to keep
+ * in step with `form_urlencoded`.
+ *
+ * `toParsableUrl` is load-bearing rather than tidy. Bare `new URL` throws on a
+ * relative url and on one that starts with a `{{template}}`, and a throw here
+ * reads as "this url has no query": the parameters are not reported missing,
+ * they are silently not there.
+ */
+export function deriveParamsFromUrl(rawUrl: string): KeyValuePair[] {
+  try {
+    return [...new URL(toParsableUrl(rawUrl)).searchParams.entries()].map(([key, value]) => ({
+      id: crypto.randomUUID(),
+      enabled: true,
+      key,
+      value,
+      description: "",
+    }))
+  } catch {
+    return []
   }
 }
 
