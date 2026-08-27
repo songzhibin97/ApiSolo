@@ -315,6 +315,50 @@ describe("D09 §26 the size-cap decisions are written down in both READMEs", () 
   })
 })
 
+/**
+ * D12 §1: the structural premise of "nothing overdraws its siblings" is that
+ * every container whose content can outgrow it clips itself. This gate pins
+ * that premise to the class strings on disk (the repository's existing
+ * scan-gate shape, judged as in A21: it proves the classes are bound in the
+ * template, not that the layout converges — the size-facing half of §1 has no
+ * automated gate and is carried by the manual acceptance items).
+ */
+describe("D12 §1 the history row's lines clip their own overflow", () => {
+  const panel = readFileSync("src/components/sidebar/HistoryPanel.vue", "utf8")
+
+  function classOf(testid: string): string {
+    const anchor = `data-testid="${testid}"`
+    const at = panel.indexOf(anchor)
+    expect(at, `${anchor} is missing from HistoryPanel.vue`).toBeGreaterThan(-1)
+    const tag = panel.slice(panel.lastIndexOf("<", at), panel.indexOf(">", at))
+    const match = tag.match(/ class="([^"]*)"/)
+    expect(match, `${testid} carries no static class attribute`).not.toBeNull()
+    return match![1]
+  }
+
+  it("the scan finds an anchor that predates this slice", () => {
+    // Fail-closed: a scan that finds nothing would otherwise read as "nothing
+    // is missing". history-row predates D12; its class is known to be non-empty.
+    expect(classOf("history-row")).toContain("flex")
+  })
+
+  it("line 1 clips its own overflow", () => {
+    expect(classOf("history-open")).toContain("overflow-hidden")
+  })
+
+  it("line 2 clips its own overflow", () => {
+    expect(classOf("history-line2")).toContain("overflow-hidden")
+  })
+
+  it("the response facts group clips its own overflow", () => {
+    expect(classOf("history-facts")).toContain("overflow-hidden")
+  })
+
+  it("the response facts group may shrink below its content", () => {
+    expect(classOf("history-facts")).toContain("min-w-0")
+  })
+})
+
 describe("§51 the annotation command cannot be handed a whole history row", () => {
   function annotationSignature(): string {
     const source = readFileSync("src-tauri/src/lib.rs", "utf8")
