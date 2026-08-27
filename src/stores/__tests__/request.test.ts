@@ -692,10 +692,19 @@ describe("useRequestStore", () => {
   })
 
   it("D09 §18 keeps the existing storage cut on a truncated body, both truncations intact", async () => {
+    // Same 51,000-char volume as before, but shaped as 80-char lines: a single
+    // 51,000-char token sends the redaction regex into O(n^2) backtracking
+    // (~1.4s idle, >5s under load — the D14 flake; the production-side cost is
+    // filed as D18). This test's contract is the storage cut, not redaction
+    // throughput, so the fixture shape must not pay for the latter.
+    const line = "a".repeat(80)
+    const oversizedBody = `${line}\n`
+      .repeat(Math.ceil((HISTORY_RESPONSE_BODY_LIMIT + 1000) / (line.length + 1)))
+      .slice(0, HISTORY_RESPONSE_BODY_LIMIT + 1000)
     invokeMock.mockImplementation(async (command: string) => {
       if (command === "send_request") {
         return buildResponse({
-          body: "a".repeat(HISTORY_RESPONSE_BODY_LIMIT + 1000),
+          body: oversizedBody,
           bodyTruncated: true,
         })
       }
