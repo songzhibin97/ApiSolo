@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { beforeEach, describe, expect, it, vi } from "vitest"
-import { mount, shallowMount } from "@vue/test-utils"
+import { mount, shallowMount, type VueWrapper } from "@vue/test-utils"
 import { createPinia, setActivePinia } from "pinia"
 import { nextTick } from "vue"
 
@@ -787,5 +787,121 @@ describe("editing an unrelated part of the url keeps the query gate", () => {
       (wrapper.find("[data-testid=\"request-save-submit\"]").element as HTMLButtonElement).disabled,
     ).toBe(true)
     expect(saveRequest).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * The list and the table used to read the same fact off two different
+ * derivations: the notice and the gate off `historyQueryRows`, whose marker is
+ * computed at read time and never written to `tab.params`, and the table's
+ * amber mark off `needsRefill` over the raw stored rows. For a blank row added
+ * by hand beside a marked one of the same key the two answered differently —
+ * the list said `Query · apikey` twice and the gate held the save, while the
+ * screen had one amber box — so the user was told to fill a field nothing
+ * pointed at. The table now renders the same reconciled rows the list is
+ * computed from.
+ *
+ * Assertions on CSS classes and element presence, not on wording: the
+ * `useI18n` stub in this file is a passthrough, so rendered copy cannot be
+ * asserted here (it is covered on real catalogs in the pure-function tests).
+ */
+describe("the params table shows an amber box for every query entry the list reports", () => {
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+  })
+
+  function valueBoxes(editor: VueWrapper<InstanceType<typeof KeyValueEditor>>) {
+    return editor
+      .findAll("input[type=\"text\"]")
+      .filter(
+        (input) =>
+          (input.element as HTMLInputElement).placeholder !== "keyValue.key" &&
+          (input.element as HTMLInputElement).placeholder !== "keyValue.description",
+      )
+  }
+
+  function amberValues(editor: VueWrapper<InstanceType<typeof KeyValueEditor>>) {
+    return valueBoxes(editor)
+      .filter((input) => input.classes().includes("border-amber-500"))
+      .map((input) => (input.element as HTMLInputElement).value)
+  }
+
+  it("marks the blank row the user adds beside a marked one of the same key", async () => {
+    const tabs = useTabsStore()
+    tabs.openHistoryEntry({
+      id: "h-6",
+      method: "GET",
+      url: `https://api.example.com/users?apikey=${REDACTION_SENTINEL}&page=1`,
+      status: 200,
+      time: 10,
+      size: 10,
+      timestamp: "2026-03-27T10:00:00Z",
+      contentType: "application/json",
+      requestHeaders: [],
+      requestParams: [],
+      requestBodyType: "none",
+      requestBodyFormData: [],
+    } as HistoryEntry)
+
+    const wrapper = mount(RequestPanel, { global: { plugins: [pinia] } })
+    await nextTick()
+
+    const editor = () => wrapper.findAllComponents(KeyValueEditor)[0]
+    // Self-check the pick: params and headers are the same component and
+    // differ only by template order.
+    expect((editor().props("modelValue") as KeyValuePair[]).map((row) => row.key)).toEqual([
+      "apikey",
+      "page",
+    ])
+
+    // The reachable path from the finding: a second, blank `apikey` typed into
+    // the table's trailing empty row. `updateParams` does not run
+    // `syncParamsFromUrl`, so no write path ever stamps a marker on this row —
+    // only the read-time reconciliation says it is one of the blanked key's
+    // blank rows.
+    const keyBoxes = editor()
+      .findAll("input[type=\"text\"]")
+      .filter((input) => (input.element as HTMLInputElement).placeholder === "keyValue.key")
+    await keyBoxes[keyBoxes.length - 1].setValue("apikey")
+    await nextTick()
+
+    // Self-check, not the subject: the list and the gate report both blank
+    // rows either way — this fix must not move what they say.
+    expect(pendingRefillFields(tabs.activeTab).map(identityTuple)).toEqual([
+      ["refill", "query", null, "apikey"],
+      ["refill", "query", null, "apikey"],
+    ])
+
+    // The subject: one amber box per reported entry, the hand-added row
+    // included — both blank, so two empty amber boxes.
+    expect(amberValues(editor())).toEqual(["", ""])
+  })
+
+  it("shows a url-only pending parameter as an amber row instead of naming a field with no box", async () => {
+    const tabs = useTabsStore()
+    // The shape a hand-edited or legacy saved request opens into: the url
+    // still carries a query key the params copy never had. The reconciliation
+    // contributes the row from the url copy, so the list reports it — the
+    // table, reading the raw rows, had nothing to point at.
+    tabs.updateTab(tabs.activeTab.id, {
+      url: `https://api.test/items?ghost=${REDACTION_SENTINEL}`,
+      params: [pair("page", "1")],
+    })
+
+    const wrapper = mount(RequestPanel, { global: { plugins: [pinia] } })
+    await nextTick()
+
+    // Self-check, not the subject: the gate already reports the url-only key.
+    expect(pendingRefillFields(tabs.activeTab).map(identityTuple)).toEqual([
+      ["refill", "query", null, "ghost"],
+    ])
+
+    // The subject: the row exists in the table and its value box is the amber
+    // one — an amber box holding the placeholder can only come from the
+    // url-contributed row being rendered.
+    expect(amberValues(wrapper.findAllComponents(KeyValueEditor)[0])).toEqual([
+      REDACTION_SENTINEL,
+    ])
   })
 })

@@ -60,6 +60,14 @@ import { deriveParamsFromUrl } from "./url-params"
  * held the value already typed back in was listed as outstanding by the history
  * row and as done by the panel. Adding a case to one of two rules is what put
  * that disagreement there; a second rule is not to be written here again.
+ *
+ * The panel's params table is held to the same rule: it renders this
+ * function's output rather than the raw `tab.params`, so its amber mark
+ * (`needsRefill` per row) and the pending list (`needsRefill` over the same
+ * rows) are two readings of one computation. Handing the table the raw rows
+ * was the same defect one layer up — a blank row this marks at read time was
+ * named by the notice and held by the gate while no box on screen pointed at
+ * it.
  */
 export function historyQueryRows(stored: KeyValuePair[], rawUrl: string): KeyValuePair[] {
   const fromUrl = deriveParamsFromUrl(rawUrl)

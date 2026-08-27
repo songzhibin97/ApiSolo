@@ -11,6 +11,7 @@ import { isUntitledTabLabel, useTabsStore } from "../../stores/tabs";
 import { flattenCollectionFolders } from "../../utils/collection-options";
 import { exportCurl } from "../../utils/curl-export";
 import { parseCurl } from "../../utils/curl-parser";
+import { historyQueryRows } from "../../utils/history-query";
 import {
   bannerFields,
   formatPendingField,
@@ -84,6 +85,29 @@ const collectionOptions = computed(() => [
  */
 const pendingFields = computed(() => pendingRefillFields(activeTab.value));
 const saveBlocked = computed(() => saveGate.blocksSave(pendingFields.value));
+
+/**
+ * What the params table shows: the reconciled rows the list and the gate are
+ * computed from, not the raw `tab.params`. `historyQueryRows` is the one rule
+ * for which query rows this request has and which of them history blanked; the
+ * list is `needsRefill` over its output and the table's amber mark is
+ * `needsRefill` over the rows the table is given — so handing the table the
+ * raw rows let the two part ways. A blank row added by hand beside a marked
+ * one of the same key carries no marker of its own; the reconciliation marks
+ * it at read time, so the notice named it and the gate held the save, while no
+ * box on screen turned amber to say where. Same rule, same inputs
+ * (`tab.params`, `tab.url`) as the gate above: every query entry the list
+ * names is a row this table shows.
+ *
+ * An edit in the table emits these reconciled rows back through
+ * `updateParams`, so a mark the reconciliation computed becomes part of
+ * `tab.params`. Deliberate: `openHistoryEntry` and `syncParamsFromUrl` already
+ * write exactly these rows, the write is idempotent under the reconciliation,
+ * and stripping the marks back out on emit would take a second rule for
+ * telling computed marks from stored ones — the kind of second rule this
+ * derivation exists to remove.
+ */
+const paramRows = computed(() => historyQueryRows(activeTab.value.params, activeTab.value.url));
 
 /**
  * The always-on notice reads the save gate's own list. It used to derive the
@@ -505,7 +529,7 @@ onUnmounted(() => {
 
     <div class="flex-1 min-h-0 overflow-auto p-4">
       <div v-show="activeSection === 'params'" class="h-full">
-        <KeyValueEditor :model-value="activeTab.params" @update:model-value="updateParams" />
+        <KeyValueEditor :model-value="paramRows" @update:model-value="updateParams" />
       </div>
 
       <div v-show="activeSection === 'headers'" class="h-full">
