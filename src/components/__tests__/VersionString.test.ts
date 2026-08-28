@@ -15,12 +15,18 @@ import zhCN from "../../i18n/zh-CN"
 /**
  * D19: the header, the status bar and the about panel each hardcoded "v0.1.0",
  * so the 0.2.0 build introduced itself as 0.1.0 on every surface at once. The
- * fix routes all three through __APP_VERSION__, injected by the define blocks
- * in vite.config.ts / vitest.config.ts from package.json. What is load-bearing
- * here is the whole chain: package.json -> define -> component -> rendered
- * text. The expected value is re-read from package.json with node:fs, not
- * taken from __APP_VERSION__, so a broken or missing define fails these tests
- * instead of cancelling out of the comparison. Real locale messages are
+ * fix routes all three through __APP_VERSION__, the one define object shared
+ * by both configs via version-define.ts. What these tests prove is the chain
+ * the vitest run actually executes: package.json -> versionDefine -> the
+ * vitest define -> component -> rendered text. They never run `vite build`,
+ * so the production half of the wiring — vite.config.ts handing the same
+ * object to its own define — is outside their reach on purpose: a value
+ * drift between the configs is structurally inexpressible (one shared
+ * object), and the two handoff lines that remain breakable are pinned by the
+ * source gate in source-gates.test.ts. The expected value is re-read from
+ * package.json with node:fs, not taken from __APP_VERSION__, so a broken or
+ * missing vitest-side define fails these tests instead of cancelling out of
+ * the comparison. Real locale messages are
  * installed (not a `t: key => key` stub) for the same reason the repository's
  * PendingRefillWording tests do it: these assertions are about what the user
  * reads.

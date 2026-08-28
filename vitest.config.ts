@@ -1,15 +1,13 @@
 import { defineConfig } from "vitest/config"
 import vue from "@vitejs/plugin-vue"
 
-import pkg from "./package.json"
+import { versionDefine } from "./version-define"
 
 export default defineConfig({
   plugins: [vue()],
-  // Mirrors the define in vite.config.ts: both read package.json, so the
-  // value the tests see is the value the build ships (D19).
-  define: {
-    __APP_VERSION__: JSON.stringify(pkg.version),
-  },
+  // The same define object vite.config.ts ships, imported from the one shared
+  // module so the tests cannot pass against a copy that drifted (D19).
+  define: versionDefine,
   test: {
     environment: "node",
     include: ["src/**/__tests__/**/*.test.ts"],

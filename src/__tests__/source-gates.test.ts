@@ -640,6 +640,40 @@ describe("D19 no shipped frontend source carries its own version literal", () =>
   })
 })
 
+/**
+ * D19 (review I2): the render tests in VersionString.test.ts run under the
+ * define of vitest.config.ts; no vitest run executes `vite build`, so the
+ * production side of the version wiring cannot be exercised by a test. The
+ * structural answer is that there is no production-only copy to test: both
+ * configs import the one define object from version-define.ts, so a value
+ * drift between them is inexpressible. What remains breakable is the two
+ * import/handoff lines themselves — finite, and pinned here as text (the
+ * repository's established text-gate shape: this proves the lines are on
+ * disk; an import line pointing at a module that does not exist cannot
+ * survive `vite build` on its own).
+ */
+describe("D19 both configs hand the one shared version define to vite", () => {
+  it("the shared module builds __APP_VERSION__ from package.json", () => {
+    // Fail-closed: two configs importing an empty shell would pass the
+    // handoff checks below while defining nothing.
+    const shared = readFileSync("version-define.ts", "utf8")
+    expect(shared).toContain('import pkg from "./package.json"')
+    expect(shared).toContain("__APP_VERSION__: JSON.stringify(pkg.version)")
+  })
+
+  it("vite.config.ts imports the shared define and hands it over", () => {
+    const config = readFileSync("vite.config.ts", "utf8")
+    expect(config).toContain('import { versionDefine } from "./version-define"')
+    expect(config).toContain("define: versionDefine,")
+  })
+
+  it("vitest.config.ts imports the shared define and hands it over", () => {
+    const config = readFileSync("vitest.config.ts", "utf8")
+    expect(config).toContain('import { versionDefine } from "./version-define"')
+    expect(config).toContain("define: versionDefine,")
+  })
+})
+
 describe("§51 the annotation command cannot be handed a whole history row", () => {
   function annotationSignature(): string {
     const source = readFileSync("src-tauri/src/lib.rs", "utf8")
