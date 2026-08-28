@@ -565,6 +565,81 @@ describe("D13 §17 the environment-panel layout decisions are written down in bo
   })
 })
 
+/**
+ * D19: the interface's version string comes from package.json through the
+ * __APP_VERSION__ define; no shipped frontend source may carry its own version
+ * literal, or the next bump ships an interface that introduces itself by the
+ * old number. The instrument, declared before use (PROCESS.md P15):
+ *
+ *   - files: every .ts/.vue under src/, excluding __tests__ directories —
+ *     test files do not ship, their fixtures legitimately carry Postman
+ *     schema URLs, and this gate's own known-bad sample lives in one;
+ *   - pattern: v-prefixed dotted triple, `\bv\d+\.\d+\.\d+\b`, the exact
+ *     shape the shipped defect had. The bare dotted triple is deliberately
+ *     outside this instrument's calibre: it matches 127.0.0.1 (invoke.ts) and
+ *     "curl 8.7.1" (curl-parser.ts comments), and the three surfaces that
+ *     actually display a version are pinned to package.json by
+ *     VersionString.test.ts;
+ *   - allowlist: hits accounted for below, keyed `path:match`. Every entry
+ *     must still be hit, so a stale entry fails the gate instead of rotting.
+ */
+describe("D19 no shipped frontend source carries its own version literal", () => {
+  const ALLOWED = [
+    // The Postman collection schema URL — a foreign format's version.
+    "src/utils/postman-export.ts:v2.1.0",
+  ]
+
+  /** Fresh regex per call — a module-level /g regex carries lastIndex state. */
+  function versionLiteral(): RegExp {
+    return /\bv\d+\.\d+\.\d+\b/g
+  }
+
+  function shippedFiles(dir: string): string[] {
+    return readdirSync(dir, { withFileTypes: true }).flatMap((item) => {
+      const path = join(dir, item.name)
+      if (item.isDirectory()) {
+        return item.name === "node_modules" || item.name === "__tests__" ? [] : shippedFiles(path)
+      }
+      return /\.(ts|vue)$/.test(item.name) ? [path] : []
+    })
+  }
+
+  function versionLiteralHits(): string[] {
+    return shippedFiles("src").flatMap((file) =>
+      [...readFileSync(file, "utf8").matchAll(versionLiteral())].map(
+        (match) => `${file}:${match[0]}`,
+      ),
+    )
+  }
+
+  it("the walk reaches the three surfaces that carried the defect", () => {
+    // Fail-closed: a walk that filtered them out would report a clean tree
+    // without having looked at the only files known to have lied.
+    const files = shippedFiles("src")
+    expect(files).toContain(join("src", "components", "layout", "AppHeader.vue"))
+    expect(files).toContain(join("src", "components", "layout", "StatusBar.vue"))
+    expect(files).toContain(join("src", "components", "settings", "SettingsModal.vue"))
+  })
+
+  it("the pattern kills a known-bad sample", () => {
+    // Fail-closed: a pattern that matches nothing would report a clean tree.
+    expect('<span class="shrink-0">v0.1.0</span>'.match(versionLiteral())).toEqual(["v0.1.0"])
+  })
+
+  it("every allowlist entry is still hit", () => {
+    // Doubles as proof the scan reads real file contents; a stale entry means
+    // the allowlist no longer describes the tree and must shrink.
+    const hits = versionLiteralHits()
+    for (const entry of ALLOWED) {
+      expect(hits).toContain(entry)
+    }
+  })
+
+  it("mentions no version literal beyond the ones accounted for", () => {
+    expect(versionLiteralHits().filter((hit) => !ALLOWED.includes(hit))).toEqual([])
+  })
+})
+
 describe("§51 the annotation command cannot be handed a whole history row", () => {
   function annotationSignature(): string {
     const source = readFileSync("src-tauri/src/lib.rs", "utf8")
