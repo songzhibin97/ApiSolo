@@ -371,26 +371,34 @@ describe("D12 §1 the history row's lines clip their own overflow", () => {
     return match![1]
   }
 
+  // Whole tokens, never substrings (D20 R1): `overflow-hidden` is a substring
+  // of `overflow-hiddenx`, which is not a class Tailwind emits — a substring
+  // gate reads such a typo as "the class is bound" and the protection is gone
+  // while the suite stays green.
+  function classTokensOf(testid: string): string[] {
+    return classOf(testid).split(/\s+/)
+  }
+
   it("the scan finds an anchor that predates this slice", () => {
     // Fail-closed: a scan that finds nothing would otherwise read as "nothing
     // is missing". history-row predates D12; its class is known to be non-empty.
-    expect(classOf("history-row")).toContain("flex")
+    expect(classTokensOf("history-row")).toContain("flex")
   })
 
   it("line 1 clips its own overflow", () => {
-    expect(classOf("history-open")).toContain("overflow-hidden")
+    expect(classTokensOf("history-open")).toContain("overflow-hidden")
   })
 
   it("line 2 clips its own overflow", () => {
-    expect(classOf("history-line2")).toContain("overflow-hidden")
+    expect(classTokensOf("history-line2")).toContain("overflow-hidden")
   })
 
   it("the response facts group clips its own overflow", () => {
-    expect(classOf("history-facts")).toContain("overflow-hidden")
+    expect(classTokensOf("history-facts")).toContain("overflow-hidden")
   })
 
   it("the response facts group may shrink below its content", () => {
-    expect(classOf("history-facts")).toContain("min-w-0")
+    expect(classTokensOf("history-facts")).toContain("min-w-0")
   })
 })
 
@@ -429,27 +437,34 @@ describe("D20 §5 line 2 spends its separators before the badges", () => {
     })
   }
 
+  // One token list per occurrence. Substring matching is what let `shrink-0` ->
+  // `shrink-00` through R1's mutation: the string still contains `shrink-0`, so
+  // the gate stayed green while the emitted CSS had no such rule and the badge
+  // was compressible again (D20 R1 IMPORTANT-2).
+  function tokensOf(testid: string): string[][] {
+    return classesOf(testid).map((cls) => cls.split(/\s+/))
+  }
+
   it("the scan finds an anchor that predates this slice", () => {
     // Fail-closed, as in the D12 gate: a scan that matches nothing would
     // otherwise read as "everything asserted below is satisfied".
-    expect(classesOf("history-line2")).toEqual([expect.stringContaining("flex")])
+    expect(tokensOf("history-line2")).toEqual([expect.arrayContaining(["flex"])])
   })
 
   it("line 2 carries no rigid gap of its own", () => {
     // A gap is spent whether or not the row has the width for it. Twelve pixels
     // of gap is what pushed the badges past the clip edge at window 700.
-    for (const cls of classesOf("history-line2")) {
-      expect(cls.split(/\s+/).filter((token) => token.startsWith("gap-"))).toEqual([])
+    for (const tokens of tokensOf("history-line2")) {
+      expect(tokens.filter((token) => token.startsWith("gap-"))).toEqual([])
     }
   })
 
   it("every separator on line 2 is the part that gives way", () => {
-    const separators = classesOf("history-line2-gap")
+    const separators = tokensOf("history-line2-gap")
     // One before each badge and one before the action bar; the badges are
     // v-if'd, so the template holds three.
     expect(separators).toHaveLength(3)
-    for (const cls of separators) {
-      const tokens = cls.split(/\s+/)
+    for (const tokens of separators) {
       expect(tokens).toContain("w-1")
       // `shrink` is the initial value, so the token is here to name the role
       // and to give this gate something to hold; `shrink-0` is the mutation
@@ -461,7 +476,7 @@ describe("D20 §5 line 2 spends its separators before the badges", () => {
 
   it("neither badge may be compressed by flex", () => {
     for (const testid of ["history-truncated-badge", "history-note-badge"]) {
-      expect(classesOf(testid)).toEqual([expect.stringContaining("shrink-0")])
+      expect(tokensOf(testid)).toEqual([expect.arrayContaining(["shrink-0"])])
     }
   })
 })
@@ -494,11 +509,11 @@ describe("D13 §7 the variable table's tracks and cells are the ones that conver
   it("the scan finds an anchor that predates this slice", () => {
     // Fail-closed: a scan that finds nothing would otherwise read as "nothing
     // is missing". environment-save predates D13; its class is known non-empty.
-    expect(classOf("environment-save")).toContain("flex")
+    expect(classTokensOf("environment-save")).toContain("flex")
   })
 
   it("the variable row uses the zero-minimum two-button track", () => {
-    expect(classOf("variable-row")).toContain("grid-cols-[minmax(0,1fr)_36px_36px]")
+    expect(classTokensOf("variable-row")).toContain("grid-cols-[minmax(0,1fr)_36px_36px]")
   })
 
   it("no fixed-minimum text track is left anywhere in the panel", () => {
@@ -509,13 +524,13 @@ describe("D13 §7 the variable table's tracks and cells are the ones that conver
   })
 
   it("the key cell clips its own overflow and may shrink below its content", () => {
-    expect(classOf("variable-key-cell")).toContain("overflow-hidden")
-    expect(classOf("variable-key-cell")).toContain("min-w-0")
+    expect(classTokensOf("variable-key-cell")).toContain("overflow-hidden")
+    expect(classTokensOf("variable-key-cell")).toContain("min-w-0")
   })
 
   it("the value input spans the full second line", () => {
-    expect(classOf("variable-value")).toContain("col-span-3")
-    expect(classOf("variable-value")).toContain("col-start-1")
+    expect(classTokensOf("variable-value")).toContain("col-span-3")
+    expect(classTokensOf("variable-value")).toContain("col-start-1")
   })
 
   it("the header labels its section and drops the del column label", () => {
@@ -554,7 +569,7 @@ describe("D13 §7 the variable table's tracks and cells are the ones that conver
     const form = panel.slice(panel.indexOf("<form"), panel.indexOf("</form>"))
     const match = form.match(/ class="([^"]*)"/)
     expect(match, "the form carries no static class attribute").not.toBeNull()
-    expect(match![1]).toContain("flex-col")
+    expect(match![1].split(/\s+/)).toContain("flex-col")
   })
 
   it("§18 both buttons live in their own right-aligned actions row", () => {
