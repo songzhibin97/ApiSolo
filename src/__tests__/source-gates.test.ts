@@ -674,6 +674,69 @@ describe("D19 both configs hand the one shared version define to vite", () => {
   })
 })
 
+/**
+ * D19 (review I1): the BACKLOG ruling bans the `v?\d+\.\d+\.\d+` shape inside
+ * components, not only the v-prefixed form the shipped defect happened to
+ * wear — a bare "0.1.0" rendered by a component lies just as well, and a
+ * planted one survived the v-only gate above. That gate keeps its v-prefixed
+ * calibre because the bare form false-positives in shipped non-component
+ * code: 127.0.0.1 (src/utils/invoke.ts), "curl 8.7.1" (src/utils/
+ * curl-parser.ts comments), the Postman schema URL (src/utils/
+ * postman-export.ts). None of that population lives under src/components —
+ * the optional-v instrument run over src/components excluding __tests__ hits
+ * nothing on the current tree — so the component contract carries the full
+ * ruling with no allowlist at all.
+ */
+describe("D19 no component carries a version literal, bare or v-prefixed", () => {
+  /** Fresh regex per call — a module-level /g regex carries lastIndex state. */
+  function componentVersionLiteral(): RegExp {
+    return /\bv?\d+\.\d+\.\d+\b/g
+  }
+
+  function componentFiles(dir: string): string[] {
+    return readdirSync(dir, { withFileTypes: true }).flatMap((item) => {
+      const path = join(dir, item.name)
+      if (item.isDirectory()) {
+        return item.name === "node_modules" || item.name === "__tests__" ? [] : componentFiles(path)
+      }
+      return /\.(ts|vue)$/.test(item.name) ? [path] : []
+    })
+  }
+
+  function componentVersionLiteralHits(): string[] {
+    return componentFiles(join("src", "components")).flatMap((file) =>
+      [...readFileSync(file, "utf8").matchAll(componentVersionLiteral())].map(
+        (match) => `${file}:${match[0]}`,
+      ),
+    )
+  }
+
+  it("the walk reaches the three surfaces that carried the defect", () => {
+    // Fail-closed: a walk that filtered them out would report a clean tree
+    // without having looked at the only files known to have lied.
+    const files = componentFiles(join("src", "components"))
+    expect(files).toContain(join("src", "components", "layout", "AppHeader.vue"))
+    expect(files).toContain(join("src", "components", "layout", "StatusBar.vue"))
+    expect(files).toContain(join("src", "components", "settings", "SettingsModal.vue"))
+  })
+
+  it("the pattern kills a v-prefixed known-bad sample", () => {
+    // Fail-closed in both directions (with the bare sample below): a pattern
+    // blind to either form would report a clean tree for that form.
+    expect('<span class="shrink-0">v0.1.0</span>'.match(componentVersionLiteral())).toEqual([
+      "v0.1.0",
+    ])
+  })
+
+  it("the pattern kills a bare known-bad sample", () => {
+    expect("<div>ApiSolo 0.1.0</div>".match(componentVersionLiteral())).toEqual(["0.1.0"])
+  })
+
+  it("mentions no version literal in any component", () => {
+    expect(componentVersionLiteralHits()).toEqual([])
+  })
+})
+
 describe("§51 the annotation command cannot be handed a whole history row", () => {
   function annotationSignature(): string {
     const source = readFileSync("src-tauri/src/lib.rs", "utf8")
