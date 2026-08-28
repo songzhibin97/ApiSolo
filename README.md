@@ -4,6 +4,12 @@ ApiSolo is a local-first desktop API client built with Tauri, Rust, Vue, and Pin
 
 [简体中文](./README.zh-CN.md)
 
+## Download
+
+- [GitHub Releases](https://github.com/songzhibin97/ApiSolo/releases) ships an unsigned macOS (Apple Silicon) DMG and .app.
+- The artifacts are not code-signed: right-click → Open on first launch, or run `xattr -dr com.apple.quarantine /Applications/ApiSolo.app`.
+- For other platforms, build from source (see Development below).
+
 ## Screenshots
 
 | HTTP workspace | JSON response tree |
