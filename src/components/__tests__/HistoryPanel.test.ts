@@ -590,6 +590,67 @@ describe("D12 §10 every row still carries all four action entries", () => {
   })
 })
 
+/**
+ * D20: the badges were inside the facts group, which is `flex-1 min-w-0
+ * overflow-hidden` — it shrinks below its own content and clips what is left,
+ * and `shrink-0` on a child stops flex from compressing it but not the parent
+ * from clipping it. At window 700 the group had 24px for 36px of content and
+ * the note badge kept 4 of its 12px. These assert the arrangement that makes
+ * the promise structural rather than width-dependent: the badges are siblings
+ * of the group, and the separators around them are what gives way.
+ *
+ * The source gate covers the class strings; these cover the rendered tree,
+ * which is where "inside" and "outside" are actually decided.
+ */
+describe("D20 §5 the badges sit outside the group that clips its content", () => {
+  const marked = entry({ id: "a", responseBodyTruncated: true, note: "worth keeping" })
+
+  async function line2() {
+    const wrapper = await mountPanel([marked])
+    const found = rows(wrapper, "history-line2")[0]
+    expect(found, "line 2 is not in the template").toBeDefined()
+    return found
+  }
+
+  it("the facts group holds neither badge", async () => {
+    const wrapper = await mountPanel([marked])
+    const facts = rows(wrapper, "history-facts")[0]
+    expect(facts, "the facts group is not in the template").toBeDefined()
+
+    expect(facts.find('[data-testid="history-truncated-badge"]').exists()).toBe(false)
+    expect(facts.find('[data-testid="history-note-badge"]').exists()).toBe(false)
+  })
+
+  it("both badges are children of line 2 itself", async () => {
+    const children = (await line2()).element.children
+    const ids = [...children].map((child) => child.getAttribute("data-testid"))
+
+    expect(ids).toContain("history-truncated-badge")
+    expect(ids).toContain("history-note-badge")
+  })
+
+  it("a collapsible separator precedes each badge and the action bar", async () => {
+    const ids = [...(await line2()).element.children].map((child) =>
+      child.getAttribute("data-testid"),
+    )
+
+    expect(ids.join(" ")).toBe(
+      "history-facts history-line2-gap history-truncated-badge history-line2-gap history-note-badge history-line2-gap history-actions",
+    )
+  })
+
+  it("a row with no badge spends exactly one separator", async () => {
+    // The separators are v-if'd with their badges: an unmarked row must not
+    // pay for the ones it does not use.
+    const wrapper = await mountPanel([entry({ id: "a" })])
+    const ids = [...rows(wrapper, "history-line2")[0].element.children].map((child) =>
+      child.getAttribute("data-testid"),
+    )
+
+    expect(ids.join(" ")).toBe("history-facts history-line2-gap history-actions")
+  })
+})
+
 describe("D12 §8 the truncated badge hands its wording to the tooltip and the screen reader", () => {
   // `t` is mocked to echo its key, so these assert "this key is bound to this
   // attribute" (A44/A49), not the Chinese or English wording — the wording

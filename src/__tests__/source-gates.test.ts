@@ -395,6 +395,78 @@ describe("D12 §1 the history row's lines clip their own overflow", () => {
 })
 
 /**
+ * D20: D12 §5 promises the two badges are never shortened, and the group that
+ * holds the response facts is exactly the thing that broke that promise —
+ * `flex-1 min-w-0 overflow-hidden` shrinks below its own content and then clips
+ * it, which `shrink-0` on a child cannot stop (measured at window 700: the
+ * group had 24px for 36px of content and the note badge kept 4 of its 12px).
+ * The fix is structural, so the gate is too: line 2 spaces its parts with
+ * separator elements that collapse to zero instead of a rigid gap, and the
+ * badges live out where the flex algorithm reserves their width.
+ *
+ * Same standing as the D12 gate above: it pins the classes on disk, not the
+ * resulting geometry. The four-width geometry is carried by the manual
+ * acceptance item.
+ */
+describe("D20 §5 line 2 spends its separators before the badges", () => {
+  const panel = readFileSync("src/components/sidebar/HistoryPanel.vue", "utf8")
+
+  function tagsOf(testid: string): string[] {
+    const anchor = `data-testid="${testid}"`
+    const tags: string[] = []
+    for (let at = panel.indexOf(anchor); at > -1; at = panel.indexOf(anchor, at + 1)) {
+      tags.push(panel.slice(panel.lastIndexOf("<", at), panel.indexOf(">", at)))
+    }
+    expect(tags.length, `${anchor} is missing from HistoryPanel.vue`).toBeGreaterThan(0)
+    return tags
+  }
+
+  function classesOf(testid: string): string[] {
+    return tagsOf(testid).map((tag) => {
+      const match = tag.match(/ class="([^"]*)"/)
+      expect(match, `${testid} carries no static class attribute`).not.toBeNull()
+      return match![1]
+    })
+  }
+
+  it("the scan finds an anchor that predates this slice", () => {
+    // Fail-closed, as in the D12 gate: a scan that matches nothing would
+    // otherwise read as "everything asserted below is satisfied".
+    expect(classesOf("history-line2")).toEqual([expect.stringContaining("flex")])
+  })
+
+  it("line 2 carries no rigid gap of its own", () => {
+    // A gap is spent whether or not the row has the width for it. Twelve pixels
+    // of gap is what pushed the badges past the clip edge at window 700.
+    for (const cls of classesOf("history-line2")) {
+      expect(cls.split(/\s+/).filter((token) => token.startsWith("gap-"))).toEqual([])
+    }
+  })
+
+  it("every separator on line 2 is the part that gives way", () => {
+    const separators = classesOf("history-line2-gap")
+    // One before each badge and one before the action bar; the badges are
+    // v-if'd, so the template holds three.
+    expect(separators).toHaveLength(3)
+    for (const cls of separators) {
+      const tokens = cls.split(/\s+/)
+      expect(tokens).toContain("w-1")
+      // `shrink` is the initial value, so the token is here to name the role
+      // and to give this gate something to hold; `shrink-0` is the mutation
+      // that would actually put the badges back over the clip edge.
+      expect(tokens).toContain("shrink")
+      expect(tokens).not.toContain("shrink-0")
+    }
+  })
+
+  it("neither badge may be compressed by flex", () => {
+    for (const testid of ["history-truncated-badge", "history-note-badge"]) {
+      expect(classesOf(testid)).toEqual([expect.stringContaining("shrink-0")])
+    }
+  })
+})
+
+/**
  * D13 §7: the structural premises of "the variable table converges instead of
  * overflowing" — a zero-minimum text track, fixed 36px button tracks, a
  * self-clipping key cell, a value input on its own spanned line, and an eye
