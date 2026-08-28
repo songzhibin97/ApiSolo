@@ -2,12 +2,23 @@ import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
 import tailwindcss from "@tailwindcss/vite";
 
+import pkg from "./package.json";
+
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
   plugins: [vue(), tailwindcss()],
+
+  // The one version string the interface is allowed to show. Injected at build
+  // time from package.json so a version bump cannot leave the UI claiming the
+  // old number (D19). vitest.config.ts carries the same define — the two
+  // configs do not share this file's plugin set, but both read package.json,
+  // so the value cannot drift between them.
+  define: {
+    __APP_VERSION__: JSON.stringify(pkg.version),
+  },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //

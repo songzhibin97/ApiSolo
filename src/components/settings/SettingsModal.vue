@@ -15,6 +15,8 @@ const { t } = useI18n()
 const { isSettingsOpen } = storeToRefs(uiStore)
 const { fontSize, locale, proxy, theme, tls } = storeToRefs(settingsStore)
 
+const appVersion = __APP_VERSION__
+
 const themeOptions = computed<Array<{ label: string; value: ThemeMode; description: string }>>(() => [
   { label: t("settings.light"), value: "light", description: t("settings.lightDescription") },
   { label: t("settings.dark"), value: "dark", description: t("settings.darkDescription") },
@@ -291,7 +293,7 @@ function updateProxy(patch: Partial<ProxyConfig>) {
               <div class="mt-4 grid gap-3 md:grid-cols-3">
                 <div class="rounded-lg border border-[var(--border)] bg-[var(--bg-primary)] p-4">
                   <div class="text-xs font-semibold uppercase tracking-[0.18em] text-[var(--text-secondary)]">{{ t("settings.version") }}</div>
-                  <div class="mt-2 text-lg font-semibold text-[var(--text-primary)]">v0.1.0</div>
+                  <div class="mt-2 text-lg font-semibold text-[var(--text-primary)]" data-testid="app-version">v{{ appVersion }}</div>
                 </div>
                 <div class="rounded-lg border border-[var(--border)] bg-[var(--bg-primary)] p-4">
                   <div class="text-xs font-semibold uppercase tracking-[0.18em] text-[var(--text-secondary)]">{{ t("settings.stack") }}</div>
