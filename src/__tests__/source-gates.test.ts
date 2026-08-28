@@ -565,6 +565,178 @@ describe("D13 §17 the environment-panel layout decisions are written down in bo
   })
 })
 
+/**
+ * D19: the interface's version string comes from package.json through the
+ * __APP_VERSION__ define; no shipped frontend source may carry its own version
+ * literal, or the next bump ships an interface that introduces itself by the
+ * old number. The instrument, declared before use (PROCESS.md P15):
+ *
+ *   - files: every .ts/.vue under src/, excluding __tests__ directories —
+ *     test files do not ship, their fixtures legitimately carry Postman
+ *     schema URLs, and this gate's own known-bad sample lives in one;
+ *   - pattern: v-prefixed dotted triple, `\bv\d+\.\d+\.\d+\b`, the exact
+ *     shape the shipped defect had. The bare dotted triple is deliberately
+ *     outside this instrument's calibre: it matches 127.0.0.1 (invoke.ts) and
+ *     "curl 8.7.1" (curl-parser.ts comments), and the three surfaces that
+ *     actually display a version are pinned to package.json by
+ *     VersionString.test.ts;
+ *   - allowlist: hits accounted for below, keyed `path:match`. Every entry
+ *     must still be hit, so a stale entry fails the gate instead of rotting.
+ */
+describe("D19 no shipped frontend source carries its own version literal", () => {
+  const ALLOWED = [
+    // The Postman collection schema URL — a foreign format's version.
+    "src/utils/postman-export.ts:v2.1.0",
+  ]
+
+  /** Fresh regex per call — a module-level /g regex carries lastIndex state. */
+  function versionLiteral(): RegExp {
+    return /\bv\d+\.\d+\.\d+\b/g
+  }
+
+  function shippedFiles(dir: string): string[] {
+    return readdirSync(dir, { withFileTypes: true }).flatMap((item) => {
+      const path = join(dir, item.name)
+      if (item.isDirectory()) {
+        return item.name === "node_modules" || item.name === "__tests__" ? [] : shippedFiles(path)
+      }
+      return /\.(ts|vue)$/.test(item.name) ? [path] : []
+    })
+  }
+
+  function versionLiteralHits(): string[] {
+    return shippedFiles("src").flatMap((file) =>
+      [...readFileSync(file, "utf8").matchAll(versionLiteral())].map(
+        (match) => `${file}:${match[0]}`,
+      ),
+    )
+  }
+
+  it("the walk reaches the three surfaces that carried the defect", () => {
+    // Fail-closed: a walk that filtered them out would report a clean tree
+    // without having looked at the only files known to have lied.
+    const files = shippedFiles("src")
+    expect(files).toContain(join("src", "components", "layout", "AppHeader.vue"))
+    expect(files).toContain(join("src", "components", "layout", "StatusBar.vue"))
+    expect(files).toContain(join("src", "components", "settings", "SettingsModal.vue"))
+  })
+
+  it("the pattern kills a known-bad sample", () => {
+    // Fail-closed: a pattern that matches nothing would report a clean tree.
+    expect('<span class="shrink-0">v0.1.0</span>'.match(versionLiteral())).toEqual(["v0.1.0"])
+  })
+
+  it("every allowlist entry is still hit", () => {
+    // Doubles as proof the scan reads real file contents; a stale entry means
+    // the allowlist no longer describes the tree and must shrink.
+    const hits = versionLiteralHits()
+    for (const entry of ALLOWED) {
+      expect(hits).toContain(entry)
+    }
+  })
+
+  it("mentions no version literal beyond the ones accounted for", () => {
+    expect(versionLiteralHits().filter((hit) => !ALLOWED.includes(hit))).toEqual([])
+  })
+})
+
+/**
+ * D19 (review I2): the render tests in VersionString.test.ts run under the
+ * define of vitest.config.ts; no vitest run executes `vite build`, so the
+ * production side of the version wiring cannot be exercised by a test. The
+ * structural answer is that there is no production-only copy to test: both
+ * configs import the one define object from version-define.ts, so a value
+ * drift between them is inexpressible. What remains breakable is the two
+ * import/handoff lines themselves — finite, and pinned here as text (the
+ * repository's established text-gate shape: this proves the lines are on
+ * disk; an import line pointing at a module that does not exist cannot
+ * survive `vite build` on its own).
+ */
+describe("D19 both configs hand the one shared version define to vite", () => {
+  it("the shared module builds __APP_VERSION__ from package.json", () => {
+    // Fail-closed: two configs importing an empty shell would pass the
+    // handoff checks below while defining nothing.
+    const shared = readFileSync("version-define.ts", "utf8")
+    expect(shared).toContain('import pkg from "./package.json"')
+    expect(shared).toContain("__APP_VERSION__: JSON.stringify(pkg.version)")
+  })
+
+  it("vite.config.ts imports the shared define and hands it over", () => {
+    const config = readFileSync("vite.config.ts", "utf8")
+    expect(config).toContain('import { versionDefine } from "./version-define"')
+    expect(config).toContain("define: versionDefine,")
+  })
+
+  it("vitest.config.ts imports the shared define and hands it over", () => {
+    const config = readFileSync("vitest.config.ts", "utf8")
+    expect(config).toContain('import { versionDefine } from "./version-define"')
+    expect(config).toContain("define: versionDefine,")
+  })
+})
+
+/**
+ * D19 (review I1): the BACKLOG ruling bans the `v?\d+\.\d+\.\d+` shape inside
+ * components, not only the v-prefixed form the shipped defect happened to
+ * wear — a bare "0.1.0" rendered by a component lies just as well, and a
+ * planted one survived the v-only gate above. That gate keeps its v-prefixed
+ * calibre because the bare form false-positives in shipped non-component
+ * code: 127.0.0.1 (src/utils/invoke.ts), "curl 8.7.1" (src/utils/
+ * curl-parser.ts comments), the Postman schema URL (src/utils/
+ * postman-export.ts). None of that population lives under src/components —
+ * the optional-v instrument run over src/components excluding __tests__ hits
+ * nothing on the current tree — so the component contract carries the full
+ * ruling with no allowlist at all.
+ */
+describe("D19 no component carries a version literal, bare or v-prefixed", () => {
+  /** Fresh regex per call — a module-level /g regex carries lastIndex state. */
+  function componentVersionLiteral(): RegExp {
+    return /\bv?\d+\.\d+\.\d+\b/g
+  }
+
+  function componentFiles(dir: string): string[] {
+    return readdirSync(dir, { withFileTypes: true }).flatMap((item) => {
+      const path = join(dir, item.name)
+      if (item.isDirectory()) {
+        return item.name === "node_modules" || item.name === "__tests__" ? [] : componentFiles(path)
+      }
+      return /\.(ts|vue)$/.test(item.name) ? [path] : []
+    })
+  }
+
+  function componentVersionLiteralHits(): string[] {
+    return componentFiles(join("src", "components")).flatMap((file) =>
+      [...readFileSync(file, "utf8").matchAll(componentVersionLiteral())].map(
+        (match) => `${file}:${match[0]}`,
+      ),
+    )
+  }
+
+  it("the walk reaches the three surfaces that carried the defect", () => {
+    // Fail-closed: a walk that filtered them out would report a clean tree
+    // without having looked at the only files known to have lied.
+    const files = componentFiles(join("src", "components"))
+    expect(files).toContain(join("src", "components", "layout", "AppHeader.vue"))
+    expect(files).toContain(join("src", "components", "layout", "StatusBar.vue"))
+    expect(files).toContain(join("src", "components", "settings", "SettingsModal.vue"))
+  })
+
+  it("the pattern kills a v-prefixed known-bad sample", () => {
+    // Fail-closed in both directions (with the bare sample below): a pattern
+    // blind to either form would report a clean tree for that form.
+    expect('<span class="shrink-0">v0.1.0</span>'.match(componentVersionLiteral())).toEqual([
+      "v0.1.0",
+    ])
+  })
+
+  it("the pattern kills a bare known-bad sample", () => {
+    expect("<div>ApiSolo 0.1.0</div>".match(componentVersionLiteral())).toEqual(["0.1.0"])
+  })
+
+  it("mentions no version literal in any component", () => {
+    expect(componentVersionLiteralHits()).toEqual([])
+  })
+})
+
 describe("§51 the annotation command cannot be handed a whole history row", () => {
   function annotationSignature(): string {
     const source = readFileSync("src-tauri/src/lib.rs", "utf8")

@@ -15,6 +15,8 @@ const { t } = useI18n()
 const { activeProject } = storeToRefs(projectsStore)
 const { activeEnv, environments } = storeToRefs(environmentsStore)
 
+const appVersion = __APP_VERSION__
+
 async function handleEnvironmentChange(event: Event) {
   await environmentsStore.setActiveEnv((event.target as HTMLSelectElement).value || null)
 }
@@ -33,7 +35,7 @@ async function handleEnvironmentChange(event: Event) {
       </div>
       <div class="flex items-baseline gap-2" data-tauri-drag-region>
         <span class="font-semibold tracking-wide text-[var(--text-primary)]">ApiSolo</span>
-        <span class="text-xs text-[var(--text-secondary)]">v0.1.0</span>
+        <span class="text-xs text-[var(--text-secondary)]" data-testid="app-version">v{{ appVersion }}</span>
       </div>
     </div>
     <div class="flex-1" data-tauri-drag-region></div>

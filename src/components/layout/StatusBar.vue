@@ -8,6 +8,8 @@ import { useConsoleStore } from "../../stores/console"
 const { t } = useI18n()
 const consoleStore = useConsoleStore()
 const { errorCount, isOpen } = storeToRefs(consoleStore)
+
+const appVersion = __APP_VERSION__
 </script>
 
 <template>
@@ -34,6 +36,6 @@ const { errorCount, isOpen } = storeToRefs(consoleStore)
       </button>
       <span class="truncate">{{ t("status.ready") }}</span>
     </div>
-    <span class="shrink-0">v0.1.0</span>
+    <span class="shrink-0" data-testid="app-version">v{{ appVersion }}</span>
   </footer>
 </template>
