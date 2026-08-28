@@ -371,26 +371,113 @@ describe("D12 §1 the history row's lines clip their own overflow", () => {
     return match![1]
   }
 
+  // Whole tokens, never substrings (D20 R1): `overflow-hidden` is a substring
+  // of `overflow-hiddenx`, which is not a class Tailwind emits — a substring
+  // gate reads such a typo as "the class is bound" and the protection is gone
+  // while the suite stays green.
+  function classTokensOf(testid: string): string[] {
+    return classOf(testid).split(/\s+/)
+  }
+
   it("the scan finds an anchor that predates this slice", () => {
     // Fail-closed: a scan that finds nothing would otherwise read as "nothing
     // is missing". history-row predates D12; its class is known to be non-empty.
-    expect(classOf("history-row")).toContain("flex")
+    expect(classTokensOf("history-row")).toContain("flex")
   })
 
   it("line 1 clips its own overflow", () => {
-    expect(classOf("history-open")).toContain("overflow-hidden")
+    expect(classTokensOf("history-open")).toContain("overflow-hidden")
   })
 
   it("line 2 clips its own overflow", () => {
-    expect(classOf("history-line2")).toContain("overflow-hidden")
+    expect(classTokensOf("history-line2")).toContain("overflow-hidden")
   })
 
   it("the response facts group clips its own overflow", () => {
-    expect(classOf("history-facts")).toContain("overflow-hidden")
+    expect(classTokensOf("history-facts")).toContain("overflow-hidden")
   })
 
   it("the response facts group may shrink below its content", () => {
-    expect(classOf("history-facts")).toContain("min-w-0")
+    expect(classTokensOf("history-facts")).toContain("min-w-0")
+  })
+})
+
+/**
+ * D20: D12 §5 promises the two badges are never shortened, and the group that
+ * holds the response facts is exactly the thing that broke that promise —
+ * `flex-1 min-w-0 overflow-hidden` shrinks below its own content and then clips
+ * it, which `shrink-0` on a child cannot stop (measured at window 700: the
+ * group had 24px for 36px of content and the note badge kept 4 of its 12px).
+ * The fix is structural, so the gate is too: line 2 spaces its parts with
+ * separator elements that collapse to zero instead of a rigid gap, and the
+ * badges live out where the flex algorithm reserves their width.
+ *
+ * Same standing as the D12 gate above: it pins the classes on disk, not the
+ * resulting geometry. The four-width geometry is carried by the manual
+ * acceptance item.
+ */
+describe("D20 §5 line 2 spends its separators before the badges", () => {
+  const panel = readFileSync("src/components/sidebar/HistoryPanel.vue", "utf8")
+
+  function tagsOf(testid: string): string[] {
+    const anchor = `data-testid="${testid}"`
+    const tags: string[] = []
+    for (let at = panel.indexOf(anchor); at > -1; at = panel.indexOf(anchor, at + 1)) {
+      tags.push(panel.slice(panel.lastIndexOf("<", at), panel.indexOf(">", at)))
+    }
+    expect(tags.length, `${anchor} is missing from HistoryPanel.vue`).toBeGreaterThan(0)
+    return tags
+  }
+
+  function classesOf(testid: string): string[] {
+    return tagsOf(testid).map((tag) => {
+      const match = tag.match(/ class="([^"]*)"/)
+      expect(match, `${testid} carries no static class attribute`).not.toBeNull()
+      return match![1]
+    })
+  }
+
+  // One token list per occurrence. Substring matching is what let `shrink-0` ->
+  // `shrink-00` through R1's mutation: the string still contains `shrink-0`, so
+  // the gate stayed green while the emitted CSS had no such rule and the badge
+  // was compressible again (D20 R1 IMPORTANT-2).
+  function tokensOf(testid: string): string[][] {
+    return classesOf(testid).map((cls) => cls.split(/\s+/))
+  }
+
+  it("the scan finds an anchor that predates this slice", () => {
+    // Fail-closed, as in the D12 gate: a scan that matches nothing would
+    // otherwise read as "everything asserted below is satisfied".
+    expect(tokensOf("history-line2")).toEqual([expect.arrayContaining(["flex"])])
+  })
+
+  it("line 2 carries no rigid gap of its own", () => {
+    // A gap is spent whether or not the row has the width for it. Twelve pixels
+    // of gap is what pushed the badges past the clip edge at window 700.
+    for (const tokens of tokensOf("history-line2")) {
+      expect(tokens.filter((token) => token.startsWith("gap-"))).toEqual([])
+    }
+  })
+
+  it("every separator on line 2 is the part that gives way", () => {
+    const separators = tokensOf("history-line2-gap")
+    // One before each badge and one before the action bar; the badges are
+    // v-if'd, so the template holds three.
+    expect(separators).toHaveLength(3)
+    for (const tokens of separators) {
+      expect(tokens).toContain("w-1")
+      // `shrink` is the initial value, so the token is here to name the role
+      // and to give this gate something to hold; `shrink-0` is the mutation
+      // that would actually put the badges back over the clip edge.
+      expect(tokens).toContain("shrink")
+      expect(tokens).not.toContain("shrink-0")
+    }
+  })
+
+  it("neither badge may be compressed by flex", () => {
+    for (const testid of ["history-truncated-badge", "history-note-badge"]) {
+      expect(tokensOf(testid)).toEqual([expect.arrayContaining(["shrink-0"])])
+    }
   })
 })
 
@@ -422,11 +509,11 @@ describe("D13 §7 the variable table's tracks and cells are the ones that conver
   it("the scan finds an anchor that predates this slice", () => {
     // Fail-closed: a scan that finds nothing would otherwise read as "nothing
     // is missing". environment-save predates D13; its class is known non-empty.
-    expect(classOf("environment-save")).toContain("flex")
+    expect(classTokensOf("environment-save")).toContain("flex")
   })
 
   it("the variable row uses the zero-minimum two-button track", () => {
-    expect(classOf("variable-row")).toContain("grid-cols-[minmax(0,1fr)_36px_36px]")
+    expect(classTokensOf("variable-row")).toContain("grid-cols-[minmax(0,1fr)_36px_36px]")
   })
 
   it("no fixed-minimum text track is left anywhere in the panel", () => {
@@ -437,13 +524,13 @@ describe("D13 §7 the variable table's tracks and cells are the ones that conver
   })
 
   it("the key cell clips its own overflow and may shrink below its content", () => {
-    expect(classOf("variable-key-cell")).toContain("overflow-hidden")
-    expect(classOf("variable-key-cell")).toContain("min-w-0")
+    expect(classTokensOf("variable-key-cell")).toContain("overflow-hidden")
+    expect(classTokensOf("variable-key-cell")).toContain("min-w-0")
   })
 
   it("the value input spans the full second line", () => {
-    expect(classOf("variable-value")).toContain("col-span-3")
-    expect(classOf("variable-value")).toContain("col-start-1")
+    expect(classTokensOf("variable-value")).toContain("col-span-3")
+    expect(classTokensOf("variable-value")).toContain("col-start-1")
   })
 
   it("the header labels its section and drops the del column label", () => {
@@ -482,7 +569,7 @@ describe("D13 §7 the variable table's tracks and cells are the ones that conver
     const form = panel.slice(panel.indexOf("<form"), panel.indexOf("</form>"))
     const match = form.match(/ class="([^"]*)"/)
     expect(match, "the form carries no static class attribute").not.toBeNull()
-    expect(match![1]).toContain("flex-col")
+    expect(match![1].split(/\s+/)).toContain("flex-col")
   })
 
   it("§18 both buttons live in their own right-aligned actions row", () => {

@@ -429,9 +429,25 @@ async function clearHistory() {
                 </span>
               </button>
 
+              <!--
+                D20: the two badges are siblings of the facts group, not members
+                of it. Inside it they were subject to its clipping: the group is
+                flex-1 min-w-0, so a narrow window shrinks it below its own
+                content, and shrink-0 only stops flex from compressing a child,
+                not the parent from clipping it (measured at window 700 / pane
+                143: group 24px against 36px of content, so the note badge kept
+                4 of its 12px). Out here their width is reserved by the flex
+                algorithm itself, at every width.
+
+                The separators are elements rather than a gap on this row for
+                the same reason: a gap is rigid, so it would spend 12px that the
+                narrowest rows need for the badges. These give way to 0 first,
+                and only then does the row clip from the right, where the known
+                out-of-range boundary already puts the action bar.
+              -->
               <div
                 data-testid="history-line2"
-                class="flex w-full min-w-0 items-center gap-1 overflow-hidden"
+                class="flex w-full min-w-0 items-center overflow-hidden"
               >
                 <div
                   data-testid="history-facts"
@@ -440,28 +456,6 @@ async function clearHistory() {
                   <span class="min-w-0 truncate text-xs text-[var(--text-secondary)]">
                     {{ formatTime(entry.time) }}
                   </span>
-                  <!-- Network truncation: this row's stored body is the prefix of
-                       a body that was never fully received. Same key as the
-                       response panel's badge — they state the same fact. The icon
-                       sits in a span with role="img" because aria-label on a
-                       generic span is naming-prohibited: the attribute would be
-                       present and the accessible name absent. -->
-                  <span
-                    v-if="entry.responseBodyTruncated"
-                    data-testid="history-truncated-badge"
-                    role="img"
-                    :title="t('response.networkTruncatedBadge')"
-                    :aria-label="t('response.networkTruncatedBadge')"
-                    class="shrink-0 text-amber-500"
-                  >
-                    <AlertTriangle :size="12" aria-hidden="true" />
-                  </span>
-                  <StickyNote
-                    v-if="entry.note"
-                    data-testid="history-note-badge"
-                    :size="12"
-                    class="shrink-0 text-[var(--accent)]"
-                  />
                   <span
                     v-if="entry.responseBody"
                     class="min-w-0 flex-1 truncate text-xs text-[var(--text-secondary)]"
@@ -470,7 +464,37 @@ async function clearHistory() {
                   </span>
                 </div>
 
-                <div class="flex shrink-0 items-center gap-0">
+                <!-- Network truncation: this row's stored body is the prefix of
+                     a body that was never fully received. Same key as the
+                     response panel's badge — they state the same fact. The icon
+                     sits in a span with role="img" because aria-label on a
+                     generic span is naming-prohibited: the attribute would be
+                     present and the accessible name absent. -->
+                <template v-if="entry.responseBodyTruncated">
+                  <div data-testid="history-line2-gap" class="w-1 shrink"></div>
+                  <span
+                    data-testid="history-truncated-badge"
+                    role="img"
+                    :title="t('response.networkTruncatedBadge')"
+                    :aria-label="t('response.networkTruncatedBadge')"
+                    class="shrink-0 text-amber-500"
+                  >
+                    <AlertTriangle :size="12" aria-hidden="true" />
+                  </span>
+                </template>
+
+                <template v-if="entry.note">
+                  <div data-testid="history-line2-gap" class="w-1 shrink"></div>
+                  <StickyNote
+                    data-testid="history-note-badge"
+                    :size="12"
+                    class="shrink-0 text-[var(--accent)]"
+                  />
+                </template>
+
+                <div data-testid="history-line2-gap" class="w-1 shrink"></div>
+
+                <div data-testid="history-actions" class="flex shrink-0 items-center gap-0">
                   <button
                     class="shrink-0 rounded p-0.5 text-[var(--text-secondary)] transition hover:text-[var(--text-primary)]"
                     data-testid="history-star"
