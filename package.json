@@ -14,7 +14,7 @@
     "test:watch": "vitest",
     "test:rust": "PATH=\"$(dirname \"$(rustup which rustc)\"):$PATH\" cargo test --manifest-path src-tauri/Cargo.toml -- --test-threads=1",
     "audit": "npm audit --registry=https://registry.npmjs.org",
-    "audit:cargo": "cd src-tauri && PATH=\"$(dirname \"$(rustup which rustc)\"):$PATH\" cargo audit",
+    "audit:cargo": "cd src-tauri && PATH=\"$(dirname \"$(rustup which rustc)\"):$PATH\" cargo audit --ignore RUSTSEC-2026-0258 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195",
     "tauri:build": "CI=true PATH=\"$(dirname \"$(rustup which rustc)\"):$PATH\" tauri build",
     "release:check": "npm run test && npm run build && npm run test:rust && npm run audit && npm run audit:cargo",
     "tauri": "tauri"

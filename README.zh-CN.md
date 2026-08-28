@@ -148,7 +148,7 @@ npm run audit:cargo
 
 测试覆盖 QuickJS 沙箱、脚本超时、pre-request 失败中止、vault 保存/读取/删除/迁移、历史脱敏、保存请求移除文件内容、HTTP 执行、历史重放响应处理、窗口状态持久化和开发桥接默认关闭。
 
-`cargo audit` 可能报告来自 Tauri/GTK/rand 依赖链的已知 upstream warning。新的直接漏洞仍必须在发布前修复。
+`cargo audit` 可能报告来自 Tauri/GTK/rand 依赖链的已知 upstream warning。新的直接漏洞仍必须在发布前修复。`audit:cargo` 脚本显式忽略三条被上游钉住的公告（h2——仅 wiremock 测试依赖引入，随 wiremock 升级复查；quick-xml ×2——被 tauri 2.10 经 plist 钉住，随 tauri 升级复查）；不在忽略清单里的任何新公告仍会让审计失败。
 
 ## 构建发布
 
