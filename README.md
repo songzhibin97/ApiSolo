@@ -148,7 +148,7 @@ npm run audit:cargo
 
 The test suite covers the QuickJS sandbox, script timeouts, pre-request failure aborts, vault save/read/delete/migration behavior, history redaction, saved request file stripping, HTTP execution, history replay response handling, window-state persistence, and development bridge gating.
 
-`cargo audit` may report allowed upstream warnings from the Tauri/GTK/rand dependency chain. New direct vulnerabilities must still be fixed before release.
+`cargo audit` may report allowed upstream warnings from the Tauri/GTK/rand dependency chain. New direct vulnerabilities must still be fixed before release. The `audit:cargo` script explicitly ignores three upstream-pinned advisories (h2 — pulled in only by the wiremock test dependency, revisit on a wiremock bump; quick-xml ×2 — pinned by tauri 2.10 via plist, revisit on a tauri bump); any new advisory not on that list still fails the audit.
 
 ## Build and Release
 
