@@ -61,7 +61,7 @@ const viewType = computed(() => {
 });
 
 const parsedJsonState = computed(() => {
-  if (viewType.value !== "json") {
+  if (viewType.value !== "json" || isTruncated.value) {
     return {
       isValid: false,
       value: null as unknown,
