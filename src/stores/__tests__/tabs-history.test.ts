@@ -5,8 +5,9 @@ import { useTabsStore } from "../tabs"
 import { historyEntryToRequest } from "../../utils/history-to-request"
 import { identityTuple, pendingRefillFields } from "../../utils/pending-refill"
 import { REDACTION_SENTINEL, sanitizeHistoryEntry } from "../../utils/redaction"
+import { buildSavedRequest } from "../../utils/saved-request"
 import { buildUrlWithParams } from "../../utils/url-params"
-import type { HistoryEntry, KeyValuePair, Tab } from "../../types"
+import type { HistoryEntry, KeyValuePair, SavedRequest, Tab } from "../../types"
 
 function pair(key: string, value: string): KeyValuePair {
   return { id: "", enabled: true, key, value, description: "" }
@@ -613,6 +614,8 @@ describe("the query rows a history entry describes come from both copies of it",
     expect(opened.params[1]).toEqual(
       expect.objectContaining({ key: "apikey", value: "", redacted: true }),
     )
+    expect(opened.params.every(({ id }) => id.length > 0)).toBe(true)
+    expect(new Set(opened.params.map(({ id }) => id)).size).toBe(2)
     // The rendered url bar is the same list, so the parameter is back on screen
     // as well as back in the request.
     expect(buildUrlWithParams(opened.url, opened.params)).toBe(
@@ -975,5 +978,60 @@ describe("the query rows a history entry describes come from both copies of it",
 
       expect(panelGate(store.activeTab)).toEqual(rowGate(entry))
     })
+  })
+})
+
+describe("D17 openSavedRequest applies the import contract to every pair face", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+  })
+
+  it("normalizes a URL-only sensitive param and every stored pair face exactly once", () => {
+    const store = useTabsStore()
+    const request = {
+      name: "Legacy markers",
+      method: "POST",
+      url: `https://api.example.com/users?apikey=${REDACTION_SENTINEL}&page=1`,
+      params: [pair("page", "1")],
+      headers: [pair("Authorization", REDACTION_SENTINEL)],
+      body: {
+        type: "form-data",
+        content: "",
+        formData: [pair("token", REDACTION_SENTINEL)],
+        binaryPath: "",
+      },
+      auth: { type: "none" },
+      preRequestScript: "",
+      testScript: "",
+    } satisfies SavedRequest
+
+    store.openSavedRequest("Project", "legacy.request.json", request)
+
+    expect(store.activeTab.url).not.toContain(REDACTION_SENTINEL)
+    expect(store.activeTab.params.map(({ key, value, redacted }) => [key, value, redacted])).toEqual([
+      ["page", "1", undefined],
+      ["apikey", "", true],
+    ])
+    expect(store.activeTab.headers[0]).toEqual(
+      expect.objectContaining({ key: "Authorization", value: "", redacted: true }),
+    )
+    expect(store.activeTab.body.formData[0]).toEqual(
+      expect.objectContaining({ key: "token", value: "", redacted: true }),
+    )
+    expect(
+      [
+        ...store.activeTab.params,
+        ...store.activeTab.headers,
+        ...store.activeTab.body.formData,
+      ].every(({ id }) => id.length > 0),
+    ).toBe(true)
+    expect(pendingRefillFields(store.activeTab).map(identityTuple)).toEqual([
+      ["refill", "header", null, "Authorization"],
+      ["refill", "query", null, "apikey"],
+      ["refill", "form", null, "token"],
+    ])
+
+    const savedAgain = buildSavedRequest(store.activeTab, "Saved again")
+    expect(savedAgain.url).not.toContain(REDACTION_SENTINEL)
   })
 })

@@ -13,111 +13,124 @@ export function toParsableUrl(rawUrl: string) {
   return rawUrl.includes("://") ? rawUrl : `http://placeholder${rawUrl.startsWith("/") || rawUrl.startsWith("?") ? "" : "/"}${rawUrl}`
 }
 
+/**
+ * Select the old rows that survive a group shrink.
+ * See `KeyValuePair.redacted` for the marker contract this selection preserves.
+ */
+export function pickSurvivors<T extends KeyValuePair>(rows: T[], count: number): T[] {
+  if (count <= 0) {
+    return []
+  }
+
+  if (count >= rows.length) {
+    return [...rows]
+  }
+
+  return rows
+    .map((row, index) => ({ row, index }))
+    .sort((left, right) => {
+      const markerOrder = Number(right.row.redacted === true) - Number(left.row.redacted === true)
+      return markerOrder || left.index - right.index
+    })
+    .slice(0, count)
+    .map(({ row }) => row)
+}
+
+function participatesInUrl(item: KeyValuePair): boolean {
+  return item.enabled && Boolean(item.key.trim())
+}
+
 export function syncParamsFromUrl(rawUrl: string, currentParams: KeyValuePair[]) {
   try {
     const parsed = new URL(toParsableUrl(rawUrl))
-    /**
-     * The marker travels per key, not per row: if a key is one history blanked,
-     * every blank row of that key in the rebuilt list is marked.
-     *
-     * "A key history blanked" is read off the marker alone, not off the marker
-     * and an empty value together. The marker outlives the value it was set
-     * for, so a credential typed back in still carries it, and a key read as
-     * blanked only while one of its rows is still empty would stop being one the
-     * moment the last blank row was filled -- which is precisely when emptying
-     * it again has to be reported.
-     *
-     * This is not an approximation of a per-row rule, it is the absence of one,
-     * and that is the point. Two rows with the same key and the same value are
-     * indistinguishable -- there is no fact in a url that says which blank
-     * `apikey` is "the" blanked one. Every rule that tried to answer that
-     * question failed in one of two directions, and fixing one direction opened
-     * the other:
-     *
-     *   - Rebuild the rows blindly and the marker is lost, so a still-blank
-     *     credential stops being reported: the save goes through and the
-     *     request 401s in silence once someone uses it.
-     *   - Hand the marker to a row chosen by position, by ordinal among
-     *     same-named keys, or by order-preserving match, and it can land on a
-     *     row the user just added. Then filling in the value that really was
-     *     blanked leaves the notice up on a request that is already complete.
-     *
-     * Asking "is any `apikey` still empty" has an answer; asking "which one"
-     * does not. And the first question is the one that matters to the person
-     * reading the notice: an empty `apikey` goes out empty whichever row it
-     * came from.
-     *
-     * The cost, stated rather than hidden: deliberately sending one sensitive
-     * parameter empty alongside a filled one keeps the notice up, and the user
-     * has to tick the acknowledgement to save. That is the direction to err in,
-     * and it is a confirmation rather than a refusal.
-     */
     const entries = [...parsed.searchParams.entries()]
-    const blanked = new Set<string>()
+    const candidates = currentParams.filter(participatesInUrl)
+    const passthrough = currentParams.filter((item) => !participatesInUrl(item))
+    const claimedRows = new Set<KeyValuePair>()
+    const claimedEntries = new Set<number>()
+    const byEntry = new Map<number, KeyValuePair>()
 
-    for (const item of currentParams) {
-      if (item.enabled && item.redacted === true) {
-        blanked.add(item.key)
+    function matchGroups(
+      tupleOfRow: (row: KeyValuePair) => readonly string[],
+      tupleOfEntry: (entry: [string, string]) => readonly string[],
+      selectRows: (rows: KeyValuePair[], count: number) => KeyValuePair[],
+    ) {
+      const entryGroups = new Map<string, number[]>()
+      const groupKey = (parts: readonly string[]) => JSON.stringify(parts)
+
+      entries.forEach((entry, index) => {
+        if (claimedEntries.has(index)) {
+          return
+        }
+        const group = groupKey(tupleOfEntry(entry))
+        const indexes = entryGroups.get(group)
+        if (indexes) {
+          indexes.push(index)
+        } else {
+          entryGroups.set(group, [index])
+        }
+      })
+
+      for (const [group, entryIndexes] of entryGroups) {
+        const rows = candidates.filter(
+          (row) => !claimedRows.has(row) && groupKey(tupleOfRow(row)) === group,
+        )
+        const survivors = selectRows(rows, Math.min(rows.length, entryIndexes.length))
+
+        survivors.forEach((row, offset) => {
+          const entryIndex = entryIndexes[offset]
+          const [key, value] = entries[entryIndex]
+          claimedRows.add(row)
+          claimedEntries.add(entryIndex)
+          byEntry.set(entryIndex, { ...row, key, value })
+        })
       }
     }
 
-    /**
-     * Identity is only reused where it is unambiguous: a row whose key and
-     * non-empty value both still appear is the same row wherever it moved to.
-     * Blank rows are deliberately not matched -- that is the question with no
-     * answer -- so they get a fresh handle, which is what they got before any
-     * of this.
-     */
-    const enabled = currentParams.filter((item) => item.enabled)
-    const claimed = new Set<number>()
+    // Stage 1: exact decoded key and value.
+    matchGroups(
+      (row) => [row.key, row.value],
+      ([key, value]) => [key, value],
+      (rows, count) => pickSurvivors(rows, count),
+    )
+    // Stage 2: the same key with a user-edited value.
+    matchGroups(
+      (row) => [row.key],
+      ([key]) => [key],
+      (rows, count) => pickSurvivors(rows, count),
+    )
 
-    function claimSameValue(key: string, value: string): KeyValuePair | undefined {
-      if (value === "") {
-        return undefined
-      }
+    // Stage 3: remaining rows and entries pair in order, after marked-first
+    // survivor selection. Mutating the three call sites independently is how
+    // the phase-specific regression tests prove each phase is connected.
+    const remainingRows = candidates.filter((row) => !claimedRows.has(row))
+    const remainingEntryIndexes = entries.map((_, index) => index).filter((index) => !claimedEntries.has(index))
+    const survivors = pickSurvivors(
+      remainingRows,
+      Math.min(remainingRows.length, remainingEntryIndexes.length),
+    )
 
-      const index = enabled.findIndex(
-        (item, at) => !claimed.has(at) && item.key === key && item.value === value,
-      )
+    survivors.forEach((row, offset) => {
+      const entryIndex = remainingEntryIndexes[offset]
+      const [key, value] = entries[entryIndex]
+      claimedRows.add(row)
+      claimedEntries.add(entryIndex)
+      byEntry.set(entryIndex, { ...row, key, value })
+    })
 
-      if (index === -1) {
-        return undefined
-      }
-
-      claimed.add(index)
-      return enabled[index]
-    }
-
-    const params = entries.map(([key, value]) => {
-      const previous = claimSameValue(key, value)
-
-      return {
-        id: previous?.id ?? crypto.randomUUID(),
+    const params = entries.map(([key, value], index) =>
+      byEntry.get(index) ?? {
+        id: crypto.randomUUID(),
         enabled: true,
         key,
         value,
-        description: previous?.description ?? "",
-        // Two ways a rebuilt row can carry the marker, for the two kinds of row
-        // this rebuild can and cannot identify. A row it identified keeps
-        // whatever it already had: the marker outlives the value, so a
-        // credential typed back in and then deleted again has to report again,
-        // and dropping the marker here would be the only reason it could not.
-        // A blank row cannot be identified at all -- that is the question with
-        // no answer -- so `blanked` speaks for it by key instead.
-        ...(previous?.redacted || (value === "" && blanked.has(key)) ? { redacted: true } : {}),
-      }
-    })
-    // Store URL without query string — params are the source of truth
+        description: "",
+      },
+    )
     const { baseUrl, hash } = splitUrlParts(rawUrl)
-    return {
-      url: `${baseUrl}${hash}`,
-      params: [...params, ...currentParams.filter((item) => !item.enabled)],
-    }
+    return { url: `${baseUrl}${hash}`, params: [...params, ...passthrough] }
   } catch {
-    return {
-      url: rawUrl,
-      params: currentParams,
-    }
+    return { url: rawUrl, params: currentParams }
   }
 }
 

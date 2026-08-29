@@ -103,13 +103,17 @@ describe("§7 every value history replaced is listed for re-entry", () => {
     expect(fields.map((f) => formatPendingField(f, translator("en")))).toEqual(["Auth · API key X-Api-Key"])
   })
 
-  it("lists a placeholder in a header, a param, the url query, the body and a form row", () => {
+  it("lists placeholders and marked rows from headers, params, and the body", () => {
     expect(
       labels(
         request({
           url: `https://api.example.com/s?access_token=${REDACTION_SENTINEL}&page=2`,
           headers: [pair("Authorization", REDACTION_SENTINEL), pair("Accept", "*/*")],
-          params: [pair("api_key", REDACTION_SENTINEL), pair("page", "2")],
+          params: [
+            pair("api_key", REDACTION_SENTINEL),
+            pair("access_token", "", { redacted: true }),
+            pair("page", "2"),
+          ],
           body: body({
             type: "json",
             content: `{"user":"bob","password":"${REDACTION_SENTINEL}"}`,
@@ -214,14 +218,8 @@ describe("§9 each entry says where it lives, not just what it is called", () =>
   })
 })
 
-/**
- * The query string arrives from two directions and the two have to be told
- * apart from a genuine repeat. Params are a request's source of truth; a tab
- * opened from history keeps the query in its url as well. Collapsing the
- * overlap is right; collapsing a repeat inside one source is a lie in the other
- * direction — the dialog would promise fewer fields to refill than there are.
- */
-describe("the query overlap collapses, a same-source repeat does not", () => {
+/** Imports reconcile duplicate query copies; readers consume params per row. */
+describe("D17 query pending fields read the authoritative rows without URL reconciliation", () => {
   it("reports one entry when params and the url name the same parameter", () => {
     expect(
       labels(
@@ -233,14 +231,14 @@ describe("the query overlap collapses, a same-source repeat does not", () => {
     ).toEqual(["Query · api_key"])
   })
 
-  it("reports both entries for a repeated parameter name in the url", () => {
+  it("does not infer rows from the URL after import", () => {
     expect(
       labels(
         request({
           url: `https://api.example.com/s?tag=${REDACTION_SENTINEL}&tag=${REDACTION_SENTINEL}`,
         }),
       ),
-    ).toEqual(["Query · tag", "Query · tag"])
+    ).toEqual([])
   })
 
   it("reports both entries for a repeated parameter name in the params", () => {
@@ -272,15 +270,8 @@ describe("the query overlap collapses, a same-source repeat does not", () => {
     ).toEqual([])
   })
 
-  /**
-   * MISSED GATE, and the reason the rule above is "does the params copy have
-   * this key", not "does the params copy have a value for it". The pair redactor
-   * leaves an already-empty value alone while the url redactor stamps any
-   * sensitive key, so a blank row can arrive with only the url saying it was
-   * blanked. Suppressing the url outright for every key the params copy names
-   * would lose exactly that.
-   */
-  it("still reports a blank params row that only the url says was blanked", () => {
+  /** URL state is not consulted after import, so it cannot mark this row. */
+  it("does not propagate a URL marker onto an unmarked params row", () => {
     expect(
       labels(
         request({
@@ -288,22 +279,11 @@ describe("the query overlap collapses, a same-source repeat does not", () => {
           params: [pair("apikey", "")],
         }),
       ),
-    ).toEqual(["Query · apikey"])
+    ).toEqual([])
   })
 
-  /**
-   * MISSED GATE, and the shape the per-key rule claimed to cover and did not:
-   * one key, one row holding the placeholder and one row blank. `apikey=SECRET`
-   * beside `apikey=` comes back exactly like this, because the pair redactor
-   * stamps the value it finds and leaves the empty one alone. The url's per-key
-   * answer used to be dropped for any key the params copy reported as blanked,
-   * so the blank row went unmarked, and typing the credential into the other row
-   * emptied the list while `apikey=""` was still on its way to the collection.
-   *
-   * Both orders, because "which row is the placeholder" is not a fact the rule
-   * may depend on -- a rule that reads the first row would pass one of these.
-   */
-  it("reports both rows when one holds the placeholder and the other is blank", () => {
+  /** Only the row carrying marker evidence is pending; siblings stay independent. */
+  it("reports only the row that carries the placeholder", () => {
     expect(
       labels(
         request({
@@ -311,10 +291,10 @@ describe("the query overlap collapses, a same-source repeat does not", () => {
           params: [pair("apikey", REDACTION_SENTINEL), pair("apikey", "", { id: "apikey-2" })],
         }),
       ),
-    ).toEqual(["Query · apikey", "Query · apikey"])
+    ).toEqual(["Query · apikey"])
   })
 
-  it("reports both rows when the blank one comes first", () => {
+  it("does not depend on whether the plain blank comes first", () => {
     expect(
       labels(
         request({
@@ -322,14 +302,14 @@ describe("the query overlap collapses, a same-source repeat does not", () => {
           params: [pair("apikey", ""), pair("apikey", REDACTION_SENTINEL, { id: "apikey-2" })],
         }),
       ),
-    ).toEqual(["Query · apikey", "Query · apikey"])
+    ).toEqual(["Query · apikey"])
   })
 
   // The same pair on an entry whose url kept no query -- what a tab records
   // when its URL bar was touched last, since `syncParamsFromUrl` stores the bare
   // url and moves the query into the params. Nothing but the params copy can
   // report the key as blanked here.
-  it("reports both rows of a blanked key when the url kept no query", () => {
+  it("does not propagate a placeholder row's marker to its plain blank sibling", () => {
     expect(
       labels(
         request({
@@ -337,7 +317,7 @@ describe("the query overlap collapses, a same-source repeat does not", () => {
           params: [pair("apikey", REDACTION_SENTINEL), pair("apikey", "", { id: "apikey-2" })],
         }),
       ),
-    ).toEqual(["Query · apikey", "Query · apikey"])
+    ).toEqual(["Query · apikey"])
   })
 
   /**
@@ -357,15 +337,8 @@ describe("the query overlap collapses, a same-source repeat does not", () => {
     ).toEqual([])
   })
 
-  /**
-   * MISSED GATE, the replayed spelling of the same fact. After `openHistoryEntry`
-   * neither copy holds a placeholder any more -- the rows carry the marker and
-   * the url has been cleared -- so the marker is the only thing left saying the
-   * key was blanked. A blank row added beside a marked one from the table
-   * editor, which does not go through `syncParamsFromUrl`, is reachable only
-   * through it.
-   */
-  it("marks a blank row beside a marked one once the placeholders are gone", () => {
+  /** A blank row added by the user does not inherit its sibling's marker. */
+  it("does not mark a user-added blank row beside a marked row", () => {
     expect(
       labels(
         request({
@@ -373,11 +346,11 @@ describe("the query overlap collapses, a same-source repeat does not", () => {
           params: [pair("apikey", "", { redacted: true }), pair("apikey", "", { id: "apikey-2" })],
         }),
       ),
-    ).toEqual(["Query · apikey", "Query · apikey"])
+    ).toEqual(["Query · apikey"])
   })
 
-  // FALSE GATE, the same pair once both rows hold a value. The marker outlives
-  // the value it was set for, so the key stays blanked and nothing is pending.
+  // FALSE GATE: the marker remains on its originating row after both values are
+  // filled, so neither that row nor its unmarked neighbour is pending.
   it("reports nothing for a marked row and its neighbour once both are filled", () => {
     expect(
       labels(
@@ -420,12 +393,7 @@ describe("§15 every source class survives the panel entry point on its own", ()
     ],
     [
       "a redacted query parameter row",
-      request({ params: [pair("apikey", REDACTION_SENTINEL)] }),
-      ["refill", "query", null, "apikey"],
-    ],
-    [
-      "a redacted parameter that exists only in the url",
-      request({ url: `https://api.example.com/s?apikey=${REDACTION_SENTINEL}` }),
+      request({ params: [pair("apikey", "", { enabled: false, redacted: true })] }),
       ["refill", "query", null, "apikey"],
     ],
     [
@@ -529,6 +497,47 @@ describe("§5-§8 the body list follows the body's current contents", () => {
     expect(
       pendingRefillFields(recorded("token:", ["token"], "text")).map(identityTuple),
     ).toEqual([["refill", "body", null, "token"]])
+  })
+})
+
+describe("D17 urlencoded segment metadata locates rows but does not enter identity", () => {
+  it("carries the literal-sentinel segment beside the decoded display name", () => {
+    const fields = pendingRefillFields(
+      request({
+        body: body({
+          type: "form-urlencoded",
+          content: `page=1&api%2Btoken=${REDACTION_SENTINEL}&token=${REDACTION_SENTINEL}`,
+        }),
+      }),
+    ).filter((field) => field.source === "body")
+
+    expect(fields.map(({ name, segment }) => [name, segment])).toEqual([
+      ["api+token", 1],
+      ["token", 2],
+    ])
+  })
+
+  it("carries current segments for replay-cleared recorded fields", () => {
+    const fields = pendingRefillFields(
+      request({
+        body: body({ type: "form-urlencoded", content: "page=1&token=&secret=" }),
+        bodyRedactedFields: ["token", "secret"],
+      }),
+    ).filter((field) => field.source === "body")
+
+    expect(fields.map(({ name, segment }) => [name, segment])).toEqual([
+      ["token", 1],
+      ["secret", 2],
+    ])
+  })
+
+  it("keeps IdentityTuple a four-tuple and ignores segment", () => {
+    const withoutSegment: PendingField = { kind: "refill", source: "body", name: "token" }
+    const withSegment: PendingField = { ...withoutSegment, segment: 4 }
+
+    expect(identityTuple(withSegment)).toHaveLength(4)
+    expect(identityTuple(withSegment)).toEqual(["refill", "body", null, "token"])
+    expect(identityTuple(withSegment)).toEqual(identityTuple(withoutSegment))
   })
 })
 

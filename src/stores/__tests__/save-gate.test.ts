@@ -203,3 +203,16 @@ describe("a field name cannot impersonate a different pending list", () => {
     expect(merges([injected], [injected])).toBe(true)
   })
 })
+
+describe("D17 A56 segment metadata is not part of acknowledgement identity", () => {
+  it("shares acknowledgement across otherwise identical fields at different segments", () => {
+    const atFirstSegment: PendingField[] = [
+      { kind: "refill", source: "body", name: "token", segment: 0 },
+    ]
+    const atLaterSegment: PendingField[] = [
+      { kind: "refill", source: "body", name: "token", segment: 3 },
+    ]
+
+    expect(merges(atFirstSegment, atLaterSegment)).toBe(true)
+  })
+})

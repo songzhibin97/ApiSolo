@@ -44,6 +44,17 @@ function makeTab(overrides: Partial<Tab> = {}): Tab {
 }
 
 describe("§40 the redacted marker never reaches a saved request", () => {
+  it.each([
+    ["params", (saved: ReturnType<typeof buildSavedRequest>) => saved.params],
+    ["headers", (saved: ReturnType<typeof buildSavedRequest>) => saved.headers],
+    ["body.formData", (saved: ReturnType<typeof buildSavedRequest>) => saved.body.formData],
+  ])("strips the marker from %s independently", (_name, select) => {
+    const rows = select(buildSavedRequest(makeTab(), "Token"))
+
+    expect(rows).toHaveLength(1)
+    expect(Object.prototype.hasOwnProperty.call(rows[0], "redacted")).toBe(false)
+  })
+
   it("never persists the redacted marker to a saved request", () => {
     const saved = buildSavedRequest(makeTab(), "  Get token  ")
     const serialized = JSON.stringify(saved)

@@ -18,7 +18,7 @@ import InlineError from "../ui/InlineError.vue"
 import { useProjectsStore } from "../../stores/projects"
 import { useSaveGateStore } from "../../stores/save-gate"
 import { REDACTION_SENTINEL } from "../../utils/redaction"
-import type { PendingField } from "../../utils/pending-refill"
+import { identityTuple, type PendingField } from "../../utils/pending-refill"
 import type { CollectionNode, HistoryEntry, KeyValuePair } from "../../types"
 
 let pinia: ReturnType<typeof createPinia>
@@ -266,6 +266,20 @@ describe("§16 a failed save says so and stays open", () => {
 })
 
 describe("§6 the two save entry points share one list and one acknowledgement", () => {
+  it("D17 blocks a legacy URL-only redacted parameter with a non-empty list", () => {
+    const legacy = entry({
+      url: `https://api.example.com/users?apikey=${REDACTION_SENTINEL}&page=1`,
+      requestParams: undefined,
+    })
+    const wrapper = mountDialog(legacy)
+    const fields = wrapper.findComponent(PendingRefillNotice).props("fields") as PendingField[]
+
+    expect(fields.map(identityTuple)).toEqual([["refill", "query", null, "apikey"]])
+    expect(
+      (wrapper.find('[data-testid="save-from-history-submit"]').element as HTMLButtonElement).disabled,
+    ).toBe(true)
+  })
+
   it("reads as acknowledged after the other entry point confirmed the same fields", async () => {
     const gate = useSaveGateStore()
     const wrapper = mountDialog(redactedEntry)

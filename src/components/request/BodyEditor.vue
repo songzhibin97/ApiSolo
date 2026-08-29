@@ -6,10 +6,12 @@ import CodeEditor from "../editor/CodeEditor.vue"
 import KeyValueEditor from "./KeyValueEditor.vue"
 import { readFileAsBase64 } from "../../utils/file-reader"
 import { MAX_UPLOAD_FILE_BYTES, formatBytesAsMib } from "../../utils/limits"
+import { needsRefill, type PendingField } from "../../utils/pending-refill"
 import type { BodyType, FormDataItem, KeyValuePair, RequestBody } from "../../types"
 
 const props = defineProps<{
   modelValue: RequestBody
+  pendingFields: PendingField[]
 }>()
 
 const emit = defineEmits<{
@@ -37,6 +39,19 @@ const defaultJsonBody = `{
 const jsonPlaceholder = defaultJsonBody
 
 const formUrlencodedRows = ref<KeyValuePair[]>([])
+const pendingUrlencodedSegments = computed(
+  () =>
+    new Set(
+      props.pendingFields
+        .filter((field) => field.source === "body" && field.segment !== undefined)
+        .map((field) => field.segment as number),
+    ),
+)
+const displayedFormUrlencodedRows = computed(() =>
+  formUrlencodedRows.value.map((row, segment) =>
+    pendingUrlencodedSegments.value.has(segment) ? { ...row, redacted: true } : row,
+  ),
+)
 
 watch(
   () => props.modelValue,
@@ -378,7 +393,7 @@ function buildBodyStateForType(type: BodyType, current: RequestBody): RequestBod
 
     <KeyValueEditor
       v-else-if="selectedType === 'form-urlencoded'"
-      :model-value="formUrlencodedRows"
+      :model-value="displayedFormUrlencodedRows"
       @update:model-value="updateFormUrlencoded"
     />
 
@@ -473,9 +488,10 @@ function buildBodyStateForType(type: BodyType, current: RequestBody): RequestBod
 
           <input
             v-else
-            class="h-9 w-full rounded border border-[var(--border)] bg-[var(--bg-primary)] px-3 font-mono text-sm text-[var(--text-primary)] outline-none transition placeholder:text-[color-mix(in_srgb,var(--text-secondary)_75%,transparent)] focus:border-[color-mix(in_srgb,var(--accent)_70%,white)]"
+            class="h-9 w-full rounded border bg-[var(--bg-primary)] px-3 font-mono text-sm text-[var(--text-primary)] outline-none transition placeholder:text-[color-mix(in_srgb,var(--text-secondary)_75%,transparent)] focus:border-[color-mix(in_srgb,var(--accent)_70%,white)]"
+            :class="needsRefill(row) ? 'border-amber-500' : 'border-[var(--border)]'"
             type="text"
-            :placeholder="t('keyValue.value')"
+            :placeholder="needsRefill(row) ? t('keyValue.redactedPlaceholder') : t('keyValue.value')"
             :value="row.value"
             @input="updateFormDataText(row.id, 'value', $event)"
           />

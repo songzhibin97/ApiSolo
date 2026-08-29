@@ -4,14 +4,13 @@ import { defineStore } from "pinia";
 import i18n from "../i18n";
 import { recordConsoleEntry } from "./console"
 import { useWebSocketStore } from "./websocket"
-import { historyQueryRows } from "../utils/history-query"
+import { mergeHistoryQueryRows } from "../utils/history-query"
 import { clearUrlSentinels } from "../utils/history-to-request"
 import {
   bodyKindFromBodyType,
   clearSentinelBody,
   clearSentinelPairs,
 } from "../utils/redaction"
-import { deriveParamsFromUrl } from "../utils/url-params"
 import type {
   AuthType,
   BodyType,
@@ -175,10 +174,10 @@ function sanitizeHistoryFormData(items: Tab["body"]["formData"]) {
   )
 }
 
-function historyQueryRowsFor(entry: HistoryEntry): KeyValuePair[] {
+function mergedHistoryQueryRowsFor(entry: HistoryEntry): KeyValuePair[] {
   // The url is read before `clearUrlSentinels` runs on it: afterwards the
   // placeholders are gone and there is nothing left to recognise them by.
-  return historyQueryRows(createEditablePairs(entry.requestParams ?? []), entry.url)
+  return mergeHistoryQueryRows(createEditablePairs(entry.requestParams ?? []), entry.url)
 }
 
 export const useTabsStore = defineStore("tabs", () => {
@@ -359,18 +358,21 @@ export const useTabsStore = defineStore("tabs", () => {
       return;
     }
 
+    const params = mergeHistoryQueryRows(createEditablePairs(request.params), request.url)
+    const url = clearUrlSentinels(request.url)
+
     const tab: Tab = {
       ...createSnapshotTab({
         label: request.name,
         method: request.method as HttpMethod,
-        url: request.url,
+        url,
       }),
-      params: request.params.length > 0 ? createEditablePairs(request.params) : deriveParamsFromUrl(request.url),
-      headers: createEditablePairs(request.headers),
+      params,
+      headers: clearSentinelPairs(createEditablePairs(request.headers)),
       body: {
         type: request.body.type,
         content: request.body.content,
-        formData: createEditablePairs(request.body.formData),
+        formData: clearSentinelPairs(createEditablePairs(request.body.formData)),
         binaryPath: request.body.binaryPath,
         binaryContent: request.body.binaryContent,
       },
@@ -400,7 +402,7 @@ export const useTabsStore = defineStore("tabs", () => {
     // the request's name and leaves with any export.
     tab.label = deriveHistoryLabel(clearUrlSentinels(entry.url))
 
-    tab.params = historyQueryRowsFor(entry)
+    tab.params = mergedHistoryQueryRowsFor(entry)
 
     if (entry.requestHeaders?.length) {
       tab.headers = createEditablePairs(entry.requestHeaders)
@@ -460,7 +462,7 @@ export const useTabsStore = defineStore("tabs", () => {
 
     // History stores sensitive values as the sentinel. Restore them as empty,
     // marked rows so replaying can never put the placeholder back on the wire.
-    // The params line is a no-op today — `historyQueryRows` normalizes
+    // The params line is a no-op today — `mergeHistoryQueryRows` normalizes
     // placeholder rows itself before they reach anything — and is kept as the
     // same second line of defense the other two lists get: a regression there
     // must not be what puts a replayable placeholder into a tab.
@@ -470,7 +472,7 @@ export const useTabsStore = defineStore("tabs", () => {
     const cleared = clearSentinelBody(bodyKindFromBodyType(tab.body.type), tab.body.content)
     tab.body.content = cleared.content
     tab.bodyRedactedFields = cleared.fields
-    // Has to stay below `historyQueryRowsFor` above: that is where the url's copy
+    // Has to stay below `mergedHistoryQueryRowsFor` above: that is where the url's copy
     // of the query is read, both for rows the params copy does not have and for
     // which keys were blanked. Reading an already-cleared url hands it empty
     // values with nothing left to recognise as a placeholder.
