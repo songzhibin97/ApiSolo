@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest"
+import { loadavg } from "node:os"
 
 import {
+  REDACTION_SENTINEL,
   clearSentinelBody,
   emptyBodyFields,
   firstSensitiveCut,
@@ -69,6 +71,17 @@ function oracle(line: string, defect: OracleDefect = "faithful"): Cut {
   return null
 }
 
+/** The oracle wearing `redactText`'s clothes, for the performance rungs. */
+function oracleRedactText(content: string): string {
+  const parts = content.split(/(\r\n|\n|\r)/)
+
+  for (let k = 0; k < parts.length; k += 2) {
+    const hit = oracle(parts[k])
+    parts[k] = hit ? parts[k].slice(0, hit.cut) + REDACTION_SENTINEL : parts[k]
+  }
+
+  return parts.join("")
+}
 
 function sameCut(a: Cut, b: Cut): boolean {
   if (a === null || b === null) return a === b
@@ -563,13 +576,164 @@ describe("D18 scan equivalence", () => {
 })
 
 describe("D18 boundary table", () => {
-  it.each(BOUNDARY)("EQ-5 boundary $name", (boundary) => {
-    const cleared = clearSentinelBody("text", boundary.input)
+  // Tuple form rather than `$name`: object interpolation renders the label as
+  // "boundary 'C01'" with quotes, and a test name that reads differently from
+  // the label it is keyed by makes the mutation ledger harder to check.
+  it.each(BOUNDARY.map((boundary) => [boundary.name, boundary] as const))(
+    "EQ-5 boundary %s",
+    (_name, boundary) => {
+      const cleared = clearSentinelBody("text", boundary.input)
 
-    expect(redactBodyText("text", boundary.input)).toBe(boundary.redact)
-    expect(cleared.content).toBe(boundary.clearedContent)
-    expect(cleared.fields).toEqual(boundary.clearedFields)
-    expect(sentinelBodyFields("text", boundary.input)).toEqual(boundary.sentinel)
-    expect(emptyBodyFields("text", boundary.input)).toEqual(boundary.empty)
-  })
+      expect(redactBodyText("text", boundary.input)).toBe(boundary.redact)
+      expect(cleared.content).toBe(boundary.clearedContent)
+      expect(cleared.fields).toEqual(boundary.clearedFields)
+      expect(sentinelBodyFields("text", boundary.input)).toEqual(boundary.sentinel)
+      expect(emptyBodyFields("text", boundary.input)).toEqual(boundary.empty)
+    },
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Performance rungs (TECH 4). These read a wall clock, which is normally a
+// mistake here -- a functional test with a 3.6x timeout margin was a
+// load-dependent false red on main for weeks (D14). Two things make these
+// different, and both are numbers rather than intentions:
+//
+//   1. they are dedicated rungs, not a timeout bolted onto a functional test;
+//   2. the margin is two orders of magnitude or better, not 3.6x.
+//
+// Measured on the shipped module. Each reading is the first scan of its own
+// fresh process -- one rung per process, because measuring both in sequence
+// lets the second inherit the first's warmed-up scanner and reports a figure
+// two to three times better than the truth.
+//
+//   PERF-1  worst of 20 cold processes  2.833 ms vs 1000 ms budget  = 353x
+//   PERF-2  worst of 48 cold processes  1.930 ms vs  200 ms budget  = 104x
+//                            (best 1.147 ms = 174x, at loadavg ~4.6)
+//
+// Failure sides, same protocol: 44,558 ms for the regex this replaced, 45x
+// over PERF-1's budget, and 9,261 ms for resuming the scan at keyStart + 1,
+// 46x over PERF-2's. Healthy and broken are three orders of magnitude apart,
+// so neither budget can be crossed by luck in either direction.
+//
+// PERF-2's margin is the load-sensitive one: on a box at loadavg ~8.9 its
+// worst cold median rose to 3.056 ms, i.e. 65x. Observed load amplification
+// was 1.7-2.7x, and a false red would need 65x more on top of the worst
+// reading, so the budget holds -- but PERF-2 is the rung to revisit first if
+// this ever flakes, and it is the one whose headroom is nearer 1.5 orders of
+// magnitude than 2.
+//
+// The budgets themselves are defined in TECH 4.2/4.3; these constants quote
+// them rather than redefining them.
+const PERF_1_BUDGET_MS = 1000
+const PERF_2_BUDGET_MS = 200
+
+// The value after the final separator in both rung inputs. The expected output
+// is the input truncated to the cut plus the sentinel, and the cut lands right
+// after that separator, so the sentinel replaces exactly this tail.
+const RUNG_TAIL = "abc"
+
+// A size at which the frozen oracle -- which IS the quadratic regex -- is still
+// affordable to run. See the note in PERF-1 for why the full-size inputs are
+// checked against a closed form instead.
+const ORACLE_TIE_LENGTH = 2000
+
+// base64url alphabet, and deliberately no ':' and no '=' anywhere in it
+function pathologicalRun(length: number): string {
+  const pool = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+  let out = ""
+  while (out.length < length) out += pool
+  return out.slice(0, length)
+}
+
+function medianOfThree(run: () => void): { median: number; raw: number[] } {
+  const raw: number[] = []
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const start = performance.now()
+    run()
+    raw.push(performance.now() - start)
+  }
+  const sorted = [...raw].sort((a, b) => a - b)
+  return { median: sorted[1], raw }
+}
+
+/** The cut lands just after the last separator, so the tail is what goes. */
+function expectedRungOutput(input: string): string {
+  return input.slice(0, input.length - RUNG_TAIL.length) + REDACTION_SENTINEL
+}
+
+function reportOverBudget(rung: string, median: number, budget: number, raw: number[]): void {
+  throw new Error(
+    `${rung} median ${median.toFixed(3)} ms exceeded ${budget} ms; raw=[${raw
+      .map((n) => n.toFixed(3))
+      .join(", ")}] loadavg=${loadavg()
+      .map((n) => n.toFixed(2))
+      .join("/")}`,
+  )
+}
+
+describe("D18 performance rungs", () => {
+  // Both rung inputs append a real sensitive hit to the pathological body on
+  // purpose. Without it the correct return is \`null\` and the correct output
+  // equals the input -- so the anti-cheat assertion below would hold for a
+  // \`return null\` body too, an assertion whose two sides are identical by
+  // construction. Verified on the shipped module: the correct output ends with
+  // the sentinel, while a \`return null\` variant leaves output === input and
+  // is caught here.
+  it(
+    "PERF-1 a pathological line plus a real hit stays linear",
+    { timeout: 120_000 },
+    () => {
+      const input = `${pathologicalRun(200000 - 10)}@token=abc`
+      let output = ""
+      const { median, raw } = medianOfThree(() => {
+        output = redactBodyText("text", input)
+      })
+
+      // PERF-3, the anti-cheat side, asserted on the very same input the clock
+      // was reading, so no shortcut can buy speed here.
+      //
+      // The expectation is a closed form rather than a live oracle run. The
+      // oracle is the backtracking regex, and running it on this input costs
+      // about 30 s -- measured, not guessed -- which would make the healthy
+      // gate slower than the regression it exists to catch and would put a
+      // quadratic scan inside the test that removes one. The tie to the oracle
+      // is kept below at a size where the oracle is cheap, on the same shape.
+      expect(output).not.toBe(input)
+      expect(output).toBe(expectedRungOutput(input))
+      expect(output.endsWith(REDACTION_SENTINEL)).toBe(true)
+
+      const tie = `${pathologicalRun(ORACLE_TIE_LENGTH - 10)}@token=abc`
+      expect(redactBodyText("text", tie)).toBe(oracleRedactText(tie))
+      expect(expectedRungOutput(tie)).toBe(oracleRedactText(tie))
+
+      if (median >= PERF_1_BUDGET_MS) {
+        reportOverBudget("PERF-1", median, PERF_1_BUDGET_MS, raw)
+      }
+    },
+  )
+
+  it(
+    "PERF-2 one huge non-sensitive match plus a real hit stays linear",
+    { timeout: 120_000 },
+    () => {
+      const input = `${pathologicalRun(50000 - 12)}=1 token=abc`
+      let output = ""
+      const { median, raw } = medianOfThree(() => {
+        output = redactBodyText("text", input)
+      })
+
+      expect(output).not.toBe(input)
+      expect(output).toBe(expectedRungOutput(input))
+      expect(output.endsWith(REDACTION_SENTINEL)).toBe(true)
+
+      // This shape leaves the regex a separator to find early, so the oracle is
+      // affordable on the full input here and is run on it directly.
+      expect(output).toBe(oracleRedactText(input))
+
+      if (median >= PERF_2_BUDGET_MS) {
+        reportOverBudget("PERF-2", median, PERF_2_BUDGET_MS, raw)
+      }
+    },
+  )
 })

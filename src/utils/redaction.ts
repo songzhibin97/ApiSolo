@@ -372,25 +372,124 @@ interface SensitiveCut {
   cut: number
 }
 
+const isKeyChar = (c: number) =>
+  (c >= 97 && c <= 122) /* a-z */ ||
+  (c >= 65 && c <= 90) /* A-Z */ ||
+  (c >= 48 && c <= 57) /* 0-9 */ ||
+  c === 95 /* _ */ ||
+  c === 46 /* . */ ||
+  c === 45 /* - */
+const isQuoteChar = (c: number) => c === 34 /* " */ || c === 39 /* ' */
+const isBlankChar = (c: number) => c === 32 /* space */ || c === 9 /* tab */
+const isSepChar = (c: number) => c === 58 /* : */ || c === 61 /* = */
+
 /**
- * The scan regex is built per call on purpose: a `g` regex whose `exec` loop
- * returns early keeps a non-zero `lastIndex`, which would leak scan state
- * between lines and between calls.
+ * The first "sensitive key, then separator" run in a line, and where the value
+ * after it starts.
+ *
+ * One left-to-right pass, no backtracking, no regex. The regex this replaced
+ * asked for the same five things in the same order -- optional opening quote,
+ * maximal key run, optional closing quote, blanks, separator -- but on failure
+ * an engine retries the whole shape one character to the right, and a long run
+ * with no separator in it makes that quadratic. A 50,000-character single line
+ * cost seconds of blocked main thread on the way into history.
+ *
+ * The four character classes below are pairwise disjoint, which is what makes
+ * the retry provably pointless and this pass provably equivalent: after a
+ * maximal key run the next character is not a key character, so shortening the
+ * run only re-offers a key character where a quote, a blank or a separator is
+ * required. The tests hold the whole argument -- a frozen copy of the regex as
+ * a differential oracle, and a check that the four predicates agree with the
+ * regex classes across all 65,536 code units and never overlap.
+ *
+ * This scan holds no state across calls. The regex it replaced needed to be
+ * rebuilt on every call to guarantee that, because a `g` regex whose `exec`
+ * loop returns early keeps a non-zero `lastIndex`; here there is no object to
+ * leak, so that whole failure mode is gone by construction -- and with it the
+ * mutant that used to prove the guarantee, which is why it is argued here
+ * instead of tested.
+ *
+ * The claim "any input is covered" rests on the corpus exhausting every
+ * combination of five adjacent character classes, and on this scan deciding
+ * with a five-position window. CHANGING THE DECISION STRUCTURE -- adding a
+ * branch that looks further ahead -- invalidates that argument, and the
+ * argument then has to be redone. Re-running the corpus at a greater depth
+ * does not substitute for it.
  *
  * Exported for tests only: the four consumers below each use a different part
  * of the return value, so `key` is invisible from every export unless the rest
  * of the line happens to equal the sentinel or the empty string. A differential
- * test that watched only the exports would therefore compare `cut` and call it
+ * test that watched only the exports would compare `cut` and call that
  * equivalence.
  */
 export function firstSensitiveCut(line: string): SensitiveCut | null {
-  const scan = /["']?([A-Za-z0-9_.\-]+)["']?[ \t]*[:=][ \t]*/g
-  let match: RegExpExecArray | null
+  const n = line.length
+  let i = 0
 
-  while ((match = scan.exec(line)) !== null) {
-    if (isSensitiveKey(match[1])) {
-      return { key: match[1], cut: match.index + match[0].length }
+  while (i < n) {
+    // An opening quote is consumed if present. Dropping this step is
+    // unobservable today -- a leading quote moves only where the match starts,
+    // and this function reports where it ends -- so no equivalence test fails
+    // without it. It stays because it keeps this pass in step-for-step
+    // correspondence with the regex it replaced, and because that invisibility
+    // depends on quotes being outside the key class: widen the key class and
+    // the version without this step diverges silently. NOT dead code.
+    let j = i
+    if (isQuoteChar(line.charCodeAt(j))) {
+      j += 1
     }
+
+    const keyStart = j
+    while (j < n && isKeyChar(line.charCodeAt(j))) {
+      j += 1
+    }
+
+    if (j === keyStart) {
+      i += 1
+      continue
+    }
+
+    let k = j
+    if (k < n && isQuoteChar(line.charCodeAt(k))) {
+      k += 1
+    }
+
+    while (k < n && isBlankChar(line.charCodeAt(k))) {
+      k += 1
+    }
+
+    if (k < n && isSepChar(line.charCodeAt(k))) {
+      k += 1
+
+      while (k < n && isBlankChar(line.charCodeAt(k))) {
+        k += 1
+      }
+
+      const key = line.slice(keyStart, j)
+
+      if (isSensitiveKey(key)) {
+        return { key, cut: k }
+      }
+
+      // Resuming at the end of the match, the way the regex loop advanced
+      // `lastIndex`. Correctness cannot see this line -- any suffix of a
+      // non-sensitive key run is also non-sensitive, so rescanning inside it
+      // never changes the verdict -- but performance can: resuming at
+      // `keyStart + 1` turns "one huge non-sensitive key, then a separator"
+      // from under a millisecond into seconds. Its killer is the second
+      // performance rung, not any equivalence test.
+      i = k
+      continue
+    }
+
+    // The tail check failed, so nothing in [i, j) can match: every start
+    // inside the key run recomputes the same run end `j` and fails the same
+    // way, and `line[j]` is not a separator or the branch above would have
+    // taken it. Jumping to `j` rather than `j + 1` is the choice that can be
+    // argued -- `j + 1` happens to be equivalent too, but only by accident of
+    // what may follow a key run. Both are unobservable in the equivalence
+    // tests, and neither is caught by a performance rung.
+    i = j
   }
 
   return null
