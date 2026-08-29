@@ -145,4 +145,27 @@ describe("D17 §3 legacy URL-only history uses the same normalized request shape
     ])
     expect(JSON.stringify(saved.params)).not.toContain("redacted")
   })
+
+  it("normalizes a history header at the adapter call site", () => {
+    const request = historyEntryToRequest(
+      entry({ requestHeaders: [pair("Authorization", REDACTION_SENTINEL)] }),
+    )
+
+    expect(request.headers).toEqual([
+      expect.objectContaining({ key: "Authorization", value: "", redacted: true }),
+    ])
+  })
+
+  it("normalizes a history form-data text row at the adapter call site", () => {
+    const request = historyEntryToRequest(
+      entry({
+        requestBodyType: "form-data",
+        requestBodyFormData: [pair("token", REDACTION_SENTINEL)],
+      }),
+    )
+
+    expect(request.body.formData).toEqual([
+      expect.objectContaining({ key: "token", value: "", redacted: true }),
+    ])
+  })
 })
