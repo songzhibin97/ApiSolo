@@ -185,6 +185,33 @@ describe("§10 the panel forwards the writes that come from outside the field", 
       expect.objectContaining({ key: "token", value: "", redacted: true }),
     )
   })
+
+  it("normalizes every pair face imported through the cURL dialog", async () => {
+    const tabs = useTabsStore()
+    const wrapper = mountPanel()
+    await wrapper.find('button[aria-label="request.moreActions"]').trigger("click")
+    const openImport = wrapper
+      .findAll("button")
+      .find((button) => button.text().includes("request.importCurl"))
+    await openImport!.trigger("click")
+    await wrapper.find("textarea").setValue(
+      `curl -H 'Cookie: ${REDACTION_SENTINEL}' -F 'token=${REDACTION_SENTINEL}' 'https://api.test/items?apikey=${REDACTION_SENTINEL}'`,
+    )
+    const applyImport = wrapper
+      .findAll("button")
+      .find((button) => button.text() === "request.import")
+    await applyImport!.trigger("click")
+
+    expect(tabs.activeTab.params[0]).toEqual(
+      expect.objectContaining({ key: "apikey", value: "", redacted: true }),
+    )
+    expect(tabs.activeTab.headers[0]).toEqual(
+      expect.objectContaining({ key: "Cookie", value: "", redacted: true }),
+    )
+    expect(tabs.activeTab.body.formData[0]).toEqual(
+      expect.objectContaining({ key: "token", value: "", redacted: true }),
+    )
+  })
 })
 
 /**
