@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
+import { exportCurl } from "../curl-export"
 import { collectPostmanExportWarnings, exportPostmanCollection } from "../postman-export"
-import type { CollectionNode, FormDataItem, SavedRequest } from "../../types"
+import type { CollectionNode, FormDataItem, SavedRequest, Tab } from "../../types"
 
 function makeRequest(overrides: Partial<SavedRequest> = {}): SavedRequest {
   return {
@@ -18,6 +19,46 @@ function makeRequest(overrides: Partial<SavedRequest> = {}): SavedRequest {
 }
 
 describe("exportPostmanCollection", () => {
+  it("D17 §16 exports no transient marker in Postman or cURL output", () => {
+    const marked = makeRequest({
+      params: [
+        {
+          id: "query",
+          enabled: true,
+          key: "apikey",
+          value: "REAL",
+          description: "",
+          redacted: true,
+        },
+      ],
+      headers: [
+        {
+          id: "header",
+          enabled: true,
+          key: "Authorization",
+          value: "Bearer REAL",
+          description: "",
+          redacted: true,
+        },
+      ],
+    })
+    const postman = exportPostmanCollection("My API", [marked], [])
+    const curl = exportCurl({
+      ...marked,
+      id: "tab",
+      label: marked.name,
+      protocol: "http",
+      isDirty: false,
+      projectName: null,
+      savedRequestPath: null,
+      urlRevision: 0,
+    } as Tab)
+
+    expect(postman).not.toContain('"redacted"')
+    expect(curl).not.toContain("redacted")
+    expect(curl).toContain("apikey=REAL")
+  })
+
   it("generates valid Postman collection JSON", () => {
     const requests = [
       makeRequest({

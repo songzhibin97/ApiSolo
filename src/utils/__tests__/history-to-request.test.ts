@@ -6,6 +6,7 @@ import {
   historyEntryToRequest,
 } from "../history-to-request"
 import { REDACTION_SENTINEL } from "../redaction"
+import { pendingRefillFields } from "../pending-refill"
 import type { HistoryEntry, KeyValuePair } from "../../types"
 
 function pair(key: string, value: string, overrides: Partial<KeyValuePair> = {}): KeyValuePair {
@@ -114,5 +115,34 @@ describe("§14 everything history did not rewrite is carried over unchanged", ()
     expect(request.url).toBe("https://api.example.com/users")
     expect(request.headers.map((item) => item.key)).toEqual(["Accept"])
     expect(request.body.type).toBe("json")
+  })
+})
+
+describe("D17 §3 legacy URL-only history uses the same normalized request shape", () => {
+  const legacy = entry({
+    url: `https://api.example.com/users?apikey=${REDACTION_SENTINEL}&page=1`,
+    requestParams: undefined,
+  })
+
+  it("adapts every URL row into params and keeps the redacted row identity", () => {
+    const request = historyEntryToRequest(legacy)
+
+    expect(request.params.map(({ key, value, redacted }) => [key, value, redacted === true])).toEqual([
+      ["apikey", "", true],
+      ["page", "1", false],
+    ])
+    expect(pendingRefillFields(request).map(({ source, name }) => [source, name])).toEqual([
+      ["query", "apikey"],
+    ])
+  })
+
+  it("writes URL-only params into the saved request without persisting the marker", () => {
+    const saved = buildSavedRequestFromHistory(legacy, "Legacy")
+
+    expect(saved.params.map(({ key, value }) => [key, value])).toEqual([
+      ["apikey", ""],
+      ["page", "1"],
+    ])
+    expect(JSON.stringify(saved.params)).not.toContain("redacted")
   })
 })

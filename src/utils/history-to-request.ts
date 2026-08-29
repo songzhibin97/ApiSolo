@@ -8,15 +8,16 @@ import type {
   SavedRequest,
 } from "../types"
 import type { PendingRefillSource } from "./pending-refill"
-import { REDACTION_SENTINEL, bodyKindFromBodyType, clearSentinelBody } from "./redaction"
+import { mergeHistoryQueryRows } from "./history-query"
+import {
+  REDACTION_SENTINEL,
+  bodyKindFromBodyType,
+  clearSentinelBody,
+  clearSentinelPairs,
+} from "./redaction"
 import { buildSavedRequest } from "./saved-request"
 
-/**
- * The request a history row describes, as an editable shape. Sentinels survive
- * this step on purpose: the save dialog has to name the fields that need
- * re-entering, and once a placeholder is cleared the key it sat under is no
- * longer distinguishable from a key the user genuinely left blank.
- */
+/** The normalized request shape shared by both history save entry points. */
 export interface HistoryRequest extends PendingRefillSource {
   method: string
   preRequestScript: string
@@ -36,7 +37,7 @@ function historyBody(entry: HistoryEntry): RequestBody {
   return {
     type,
     content: entry.requestBodyContent || "",
-    formData: editablePairs(entry.requestBodyFormData),
+    formData: clearSentinelPairs(editablePairs(entry.requestBodyFormData)),
     binaryPath: entry.requestBodyBinaryPath || "",
     binaryContent: entry.requestBodyBinaryContent,
   } as RequestBody
@@ -59,8 +60,8 @@ export function historyEntryToRequest(entry: HistoryEntry): HistoryRequest {
   return {
     method: (entry.method || "GET").toUpperCase(),
     url: entry.url,
-    headers: editablePairs(entry.requestHeaders),
-    params: editablePairs(entry.requestParams),
+    headers: clearSentinelPairs(editablePairs(entry.requestHeaders)),
+    params: mergeHistoryQueryRows(editablePairs(entry.requestParams), entry.url),
     body: historyBody(entry),
     auth: historyAuth(entry),
     preRequestScript: entry.preRequestScript || "",
@@ -81,6 +82,8 @@ export function defaultRequestName(entry: HistoryEntry): string {
 }
 
 function clearPairSentinels(items: KeyValuePair[]): KeyValuePair[] {
+  // Import normalization already removed these. Keep this persistence-boundary
+  // pass as a second defense against a future unnormalized constructor.
   return items.map((item) =>
     item.value.trim() === REDACTION_SENTINEL ? { ...item, value: "" } : item,
   )

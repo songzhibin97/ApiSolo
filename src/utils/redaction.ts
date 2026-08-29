@@ -7,6 +7,12 @@ const EMPTY_JSON_STRING = JSON.stringify("")
 
 export type BodyKind = "json" | "urlencoded" | "text"
 
+export interface BodyFieldLocation {
+  name: string
+  /** Zero-based form-urlencoded segment; rendering metadata, never identity. */
+  segment?: number
+}
+
 /**
  * Field-name hard list. Kept in lock step with `is_sensitive_key` in
  * `src-tauri/src/lib.rs`; both sides are substring matches over the lowercased
@@ -723,24 +729,24 @@ function sentinelJsonKeys(content: string): string[] | null {
   return spans.filter((span) => content.slice(span.start, span.end) === SENTINEL_JSON).map((span) => span.name)
 }
 
-function sentinelUrlencodedKeys(content: string): string[] {
-  const keys: string[] = []
+function sentinelUrlencodedFields(content: string): BodyFieldLocation[] {
+  const fields: BodyFieldLocation[] = []
 
-  for (const part of content.split("&")) {
+  content.split("&").forEach((part, segment) => {
     const separator = part.indexOf("=")
 
     if (separator === -1 || part.slice(separator + 1) !== REDACTION_SENTINEL) {
-      continue
+      return
     }
 
     const key = lenientDecodeKey(part.slice(0, separator))
 
     if (isSensitiveKey(key)) {
-      keys.push(key)
+      fields.push({ name: key, segment })
     }
-  }
+  })
 
-  return keys
+  return fields
 }
 
 function sentinelTextKeys(content: string): string[] {
@@ -757,23 +763,32 @@ function sentinelTextKeys(content: string): string[] {
   return keys
 }
 
-export function sentinelBodyFields(kind: BodyKind, content: string): string[] {
+export function sentinelBodyFieldLocations(
+  kind: BodyKind,
+  content: string,
+): BodyFieldLocation[] {
   if (!content) {
     return []
   }
 
   if (kind === "urlencoded") {
-    return sentinelUrlencodedKeys(content)
+    return sentinelUrlencodedFields(content)
   }
 
   if (kind === "json") {
-    return sentinelJsonKeys(content) ?? sentinelTextKeys(content)
+    return (sentinelJsonKeys(content) ?? sentinelTextKeys(content)).map((name) => ({ name }))
   }
 
-  return sentinelTextKeys(content)
+  return sentinelTextKeys(content).map((name) => ({ name }))
+}
+
+export function sentinelBodyFields(kind: BodyKind, content: string): string[] {
+  return sentinelBodyFieldLocations(kind, content).map(({ name }) => name)
 }
 
 function sentinelPairFields<T extends KeyValuePair>(items: T[]): string[] {
+  // Unlike the persistence gate, this asks only what can reach the wire.
+  // Disabled rows are intentionally absent because they are not sent.
   return items
     .filter((item) => item.enabled && item.value.trim() === REDACTION_SENTINEL)
     .map((item) => item.key)
@@ -808,7 +823,10 @@ export function findSentinelFields(tab: Tab): string[] {
  * string, so the field would read as refilled and the gate would disappear at
  * exactly the moment the body is least trustworthy.
  */
-export function emptyBodyFields(kind: BodyKind, content: string): string[] | null {
+export function emptyBodyFieldLocations(
+  kind: BodyKind,
+  content: string,
+): BodyFieldLocation[] | null {
   if (kind === "json") {
     const spans = tryScanJsonSpans(content)
 
@@ -818,40 +836,44 @@ export function emptyBodyFields(kind: BodyKind, content: string): string[] | nul
 
     return spans
       .filter((span) => content.slice(span.start, span.end) === EMPTY_JSON_STRING)
-      .map((span) => span.name)
+      .map((span) => ({ name: span.name }))
   }
 
   if (kind === "urlencoded") {
-    const keys: string[] = []
+    const fields: BodyFieldLocation[] = []
 
-    for (const part of content.split("&")) {
+    content.split("&").forEach((part, segment) => {
       const separator = part.indexOf("=")
 
       if (separator === -1 || part.slice(separator + 1) !== "") {
-        continue
+        return
       }
 
       const key = lenientDecodeKey(part.slice(0, separator))
 
       if (isSensitiveKey(key)) {
-        keys.push(key)
+        fields.push({ name: key, segment })
       }
-    }
+    })
 
-    return keys
+    return fields
   }
 
-  const keys: string[] = []
+  const fields: BodyFieldLocation[] = []
 
   for (const line of content.split(/\r\n|\n|\r/)) {
     const hit = firstSensitiveCut(line)
 
     if (hit && line.slice(hit.cut) === "") {
-      keys.push(hit.key)
+      fields.push({ name: hit.key })
     }
   }
 
-  return keys
+  return fields
+}
+
+export function emptyBodyFields(kind: BodyKind, content: string): string[] | null {
+  return emptyBodyFieldLocations(kind, content)?.map(({ name }) => name) ?? null
 }
 
 /**
@@ -872,32 +894,36 @@ export function remainingRedactedBodyFields(
   content: string,
   recorded: string[],
 ): string[] {
+  return remainingRedactedBodyFieldLocations(kind, content, recorded).map(({ name }) => name)
+}
+
+export function remainingRedactedBodyFieldLocations(
+  kind: BodyKind,
+  content: string,
+  recorded: string[],
+): BodyFieldLocation[] {
   if (recorded.length === 0) {
     return []
   }
 
-  const empty = emptyBodyFields(kind, content)
+  const empty = emptyBodyFieldLocations(kind, content)
 
   if (empty === null) {
-    return [...recorded]
+    return recorded.map((name) => ({ name }))
   }
 
-  const budget = new Map<string, number>()
+  const available = new Map<string, BodyFieldLocation[]>()
 
-  for (const name of empty) {
-    budget.set(name, (budget.get(name) ?? 0) + 1)
-  }
-
-  return recorded.filter((name) => {
-    const left = budget.get(name) ?? 0
-
-    if (left === 0) {
-      return false
+  for (const location of empty) {
+    const matches = available.get(location.name)
+    if (matches) {
+      matches.push(location)
+    } else {
+      available.set(location.name, [location])
     }
+  }
 
-    budget.set(name, left - 1)
-    return true
-  })
+  return recorded.flatMap((name) => available.get(name)?.shift() ?? [])
 }
 
 /**

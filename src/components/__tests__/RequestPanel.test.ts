@@ -12,6 +12,7 @@ vi.mock("vue-i18n", async (importOriginal) => ({
 }))
 
 import RequestPanel from "../panels/RequestPanel.vue"
+import BodyEditor from "../request/BodyEditor.vue"
 import KeyValueEditor from "../request/KeyValueEditor.vue"
 import PendingRefillNotice from "../request/PendingRefillNotice.vue"
 import UrlBar from "../request/UrlBar.vue"
@@ -21,12 +22,12 @@ import { useTabsStore } from "../../stores/tabs"
 import { historyEntryToRequest } from "../../utils/history-to-request"
 import { identityTuple, pendingRefillFields, type PendingField } from "../../utils/pending-refill"
 import { REDACTION_SENTINEL } from "../../utils/redaction"
-import type { AuthConfig, HistoryEntry, KeyValuePair } from "../../types"
+import type { AuthConfig, HistoryEntry, KeyValuePair, SavedRequest } from "../../types"
 
 let pinia: ReturnType<typeof createPinia>
 
-function pair(key: string, value: string): KeyValuePair {
-  return { id: `${key}-1`, enabled: true, key, value, description: "" }
+function pair(key: string, value: string, overrides: Partial<KeyValuePair> = {}): KeyValuePair {
+  return { id: `${key}-1`, enabled: true, key, value, description: "", ...overrides }
 }
 
 function mountPanel() {
@@ -107,6 +108,21 @@ describe("§10 the panel forwards the writes that come from outside the field", 
     setActivePinia(pinia)
   })
 
+  it("passes the authoritative params array to the table including disabled rows", () => {
+    const tabs = useTabsStore()
+    tabs.updateTab(tabs.activeTab.id, {
+      params: [pair("page", "1"), pair("debug", "1", { enabled: false })],
+    })
+
+    const model = mountPanel().findAllComponents(KeyValueEditor)[0].props("modelValue")
+
+    expect(model).toBe(tabs.activeTab.params)
+    expect((model as KeyValuePair[]).map(({ key, enabled }) => [key, enabled])).toEqual([
+      ["page", true],
+      ["debug", false],
+    ])
+  })
+
   it("carries a params-table edit into the request, the rendered url and the revision", async () => {
     const tabs = useTabsStore()
     tabs.updateTab(tabs.activeTab.id, {
@@ -148,6 +164,26 @@ describe("§10 the panel forwards the writes that come from outside the field", 
     // the user's old draft sitting on top of an imported request.
     expect(tabs.activeTab.urlRevision).toBe(before + 1)
     expect(wrapper.findComponent(UrlBar).props("url")).toBe("https://api.test/items?q=a+b")
+  })
+
+  it("normalizes every pair face imported by pasted cURL", async () => {
+    const tabs = useTabsStore()
+    const wrapper = mountPanel()
+
+    await wrapper.findComponent(UrlBar).vm.$emit(
+      "pasteCurl",
+      `curl -H 'Cookie: ${REDACTION_SENTINEL}' -F 'token=${REDACTION_SENTINEL}' 'https://api.test/items?apikey=${REDACTION_SENTINEL}'`,
+    )
+
+    expect(tabs.activeTab.params[0]).toEqual(
+      expect.objectContaining({ key: "apikey", value: "", redacted: true }),
+    )
+    expect(tabs.activeTab.headers[0]).toEqual(
+      expect.objectContaining({ key: "Cookie", value: "", redacted: true }),
+    )
+    expect(tabs.activeTab.body.formData[0]).toEqual(
+      expect.objectContaining({ key: "token", value: "", redacted: true }),
+    )
   })
 })
 
@@ -671,18 +707,16 @@ describe("editing an unrelated part of the url keeps the query gate", () => {
     await nextTick()
     const urlBar = wrapper.findComponent(UrlBar)
 
-    // The user adds a second, empty apikey of their own. Both are blank and the
-    // key was blanked, so both are reported — the accepted cost of not
-    // pretending to know which row is which.
+    // The user adds a second, empty apikey of their own. Marker state stays on
+    // the imported row instead of propagating by key to the new row.
     await urlBar.vm.$emit("update:url", "https://api.example.com/users?apikey=&apikey=")
     await nextTick()
-    expect(pendingRefillFields(tabs.activeTab)).toHaveLength(2)
+    expect(pendingRefillFields(tabs.activeTab)).toHaveLength(1)
 
-    // Filling one still leaves an empty apikey, which is reported accurately.
+    // One blank still survives. Marked-first selection keeps the imported
+    // marker on that survivor instead of transferring it to the filled row.
     await urlBar.vm.$emit("update:url", "https://api.example.com/users?apikey=SECRET&apikey=")
     await nextTick()
-    // Self-check on the step that matters: if the gate had already cleared here,
-    // the final assertion would pass without the release path being exercised.
     expect(pendingRefillFields(tabs.activeTab)).toHaveLength(1)
     expect(wrapper.find("[data-testid=\"history-redacted-banner\"]").exists()).toBe(true)
 
@@ -791,19 +825,9 @@ describe("editing an unrelated part of the url keeps the query gate", () => {
 })
 
 /**
- * The list and the table used to read the same fact off two different
- * derivations: the notice and the gate off `historyQueryRows`, whose marker is
- * computed at read time and never written to `tab.params`, and the table's
- * amber mark off `needsRefill` over the raw stored rows. For a blank row added
- * by hand beside a marked one of the same key the two answered differently —
- * the list said `Query · apikey` twice and the gate held the save, while the
- * screen had one amber box — so the user was told to fill a field nothing
- * pointed at. The table now renders the same reconciled rows the list is
- * computed from.
- *
- * Assertions on CSS classes and element presence, not on wording: the
- * `useI18n` stub in this file is a passthrough, so rendered copy cannot be
- * asserted here (it is covered on real catalogs in the pure-function tests).
+ * The table and gate now read the same authoritative `tab.params` rows.
+ * Assertions stay on the approved named class connection, not rendered color,
+ * geometry or copy.
  */
 describe("the params table shows an amber box for every query entry the list reports", () => {
   beforeEach(() => {
@@ -843,7 +867,21 @@ describe("the params table shows an amber box for every query entry the list rep
     return valueBoxes(editor)[row]
   }
 
-  it("marks the blank row the user adds beside a marked one of the same key", async () => {
+  function openSaved(tabs: ReturnType<typeof useTabsStore>, url: string, params: KeyValuePair[]) {
+    tabs.openSavedRequest("Project", `request-${crypto.randomUUID()}.json`, {
+      name: "Imported",
+      method: "GET",
+      url,
+      params,
+      headers: [],
+      body: { type: "none", content: "", formData: [], binaryPath: "" },
+      auth: { type: "none" },
+      preRequestScript: "",
+      testScript: "",
+    } satisfies SavedRequest)
+  }
+
+  it("does not mark the blank row the user adds beside a marked one", async () => {
     const tabs = useTabsStore()
     tabs.openHistoryEntry({
       id: "h-6",
@@ -871,39 +909,31 @@ describe("the params table shows an amber box for every query entry the list rep
       "page",
     ])
 
-    // The reachable path from the finding: a second, blank `apikey` typed into
-    // the table's trailing empty row. `updateParams` does not run
-    // `syncParamsFromUrl`, so no write path ever stamps a marker on this row —
-    // only the read-time reconciliation says it is one of the blanked key's
-    // blank rows.
+    // A second, blank `apikey` typed into the trailing row is an ordinary user
+    // edit. Only opening/importing may assign a history marker.
     const keyBoxes = editor()
       .findAll("input[type=\"text\"]")
       .filter((input) => (input.element as HTMLInputElement).placeholder === "keyValue.key")
     await keyBoxes[keyBoxes.length - 1].setValue("apikey")
     await nextTick()
 
-    // Self-check, not the subject: the list and the gate report both blank
-    // rows either way — this fix must not move what they say.
+    // The imported row remains pending; the user-created sibling does not.
     expect(pendingRefillFields(tabs.activeTab).map(identityTuple)).toEqual([
-      ["refill", "query", null, "apikey"],
       ["refill", "query", null, "apikey"],
     ])
 
-    // The subject: one amber box per reported entry, the hand-added row
-    // included — both blank, so two empty amber boxes.
-    expect(amberValues(editor())).toEqual(["", ""])
+    expect(amberValues(editor())).toEqual([""])
   })
 
   it("shows a url-only pending parameter as an amber row instead of naming a field with no box", async () => {
     const tabs = useTabsStore()
-    // The shape a hand-edited or legacy saved request opens into: the url
-    // still carries a query key the params copy never had. The reconciliation
-    // contributes the row from the url copy, so the list reports it — the
-    // table, reading the raw rows, had nothing to point at.
-    tabs.updateTab(tabs.activeTab.id, {
-      url: `https://api.test/items?ghost=${REDACTION_SENTINEL}`,
-      params: [pair("page", "1")],
-    })
+    // The shape a hand-edited or legacy saved request opens into: import merges
+    // the URL-only row into the authoritative params before the panel reads it.
+    openSaved(
+      tabs,
+      `https://api.test/items?ghost=${REDACTION_SENTINEL}`,
+      [pair("page", "1")],
+    )
 
     const wrapper = mount(RequestPanel, { global: { plugins: [pinia] } })
     await nextTick()
@@ -939,10 +969,11 @@ describe("the params table shows an amber box for every query entry the list rep
     projects.activeProject = "My API"
     const saveRequest = vi.spyOn(projects, "saveRequest").mockResolvedValue(undefined)
     const tabs = useTabsStore()
-    tabs.updateTab(tabs.activeTab.id, {
-      url: `https://api.test/items?ghost=${REDACTION_SENTINEL}`,
-      params: [pair("page", "1")],
-    })
+    openSaved(
+      tabs,
+      `https://api.test/items?ghost=${REDACTION_SENTINEL}`,
+      [pair("page", "1")],
+    )
     const wrapper = mount(RequestPanel, { global: { plugins: [pinia] } })
     await nextTick()
 
@@ -982,10 +1013,10 @@ describe("the params table shows an amber box for every query entry the list rep
    */
   it("holds the gate again when a filled-in stored placeholder row is deleted", async () => {
     const tabs = useTabsStore()
-    tabs.updateTab(tabs.activeTab.id, {
-      url: "https://api.test/items",
-      params: [pair("apikey", REDACTION_SENTINEL), pair("page", "1")],
-    })
+    openSaved(tabs, "https://api.test/items", [
+      pair("apikey", REDACTION_SENTINEL),
+      pair("page", "1"),
+    ])
     const wrapper = mount(RequestPanel, { global: { plugins: [pinia] } })
     await nextTick()
 
@@ -1003,5 +1034,64 @@ describe("the params table shows an amber box for every query entry the list rep
     expect(pendingRefillFields(tabs.activeTab).map(identityTuple)).toEqual([
       ["refill", "query", null, "apikey"],
     ])
+  })
+})
+
+describe("D17 body pending fields stay connected to the editor and save gate", () => {
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+  })
+
+  function setRecordedUrlencodedBody() {
+    const tabs = useTabsStore()
+    tabs.updateTab(tabs.activeTab.id, {
+      body: {
+        type: "form-urlencoded",
+        content: "token=",
+        formData: [],
+        binaryPath: "",
+      },
+      bodyRedactedFields: ["token"],
+    })
+    return tabs
+  }
+
+  it("passes the gate's same pending value to BodyEditor with its segment", () => {
+    const tabs = setRecordedUrlencodedBody()
+    const wrapper = mountPanel()
+    const fields = wrapper.findComponent(BodyEditor).props("pendingFields") as PendingField[]
+
+    expect(fields.map(({ source, name, segment }) => [source, name, segment])).toEqual([
+      ["body", "token", 0],
+    ])
+    expect(fields.map(identityTuple)).toEqual(pendingRefillFields(tabs.activeTab).map(identityTuple))
+  })
+
+  it("keeps an acknowledgement after an unrelated segment is inserted in front", async () => {
+    const projects = useProjectsStore()
+    projects.activeProject = "My API"
+    const tabs = setRecordedUrlencodedBody()
+    const gate = useSaveGateStore()
+    const wrapper = mountPanel()
+
+    const save = wrapper.findAll("button").find((button) => button.text().includes("request.save"))
+    await save!.trigger("click")
+    gate.acknowledge(pendingRefillFields(tabs.activeTab))
+    await nextTick()
+    expect(
+      (wrapper.find('[data-testid="request-save-submit"]').element as HTMLButtonElement).disabled,
+    ).toBe(false)
+
+    await wrapper.findComponent(BodyEditor).vm.$emit("update:modelValue", {
+      ...tabs.activeTab.body,
+      content: "page=1&token=",
+    })
+    await nextTick()
+
+    expect(pendingRefillFields(tabs.activeTab)[0].segment).toBe(1)
+    expect(
+      (wrapper.find('[data-testid="request-save-submit"]').element as HTMLButtonElement).disabled,
+    ).toBe(false)
   })
 })

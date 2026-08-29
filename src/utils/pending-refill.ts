@@ -1,11 +1,10 @@
 import type { AuthConfig, KeyValuePair, RequestBody } from "../types"
-import { historyQueryRows } from "./history-query"
 import {
   REDACTION_SENTINEL,
   bodyKindFromBodyType,
   isUnverifiableBody,
-  remainingRedactedBodyFields,
-  sentinelBodyFields,
+  remainingRedactedBodyFieldLocations,
+  sentinelBodyFieldLocations,
 } from "./redaction"
 
 /**
@@ -36,8 +35,8 @@ export type AuthSlot = "basic-password" | "bearer-token" | "api-key"
  * signature change with the interface language.
  */
 export type PendingField =
-  | { kind: PendingKind; source: NonAuthSource; name: string }
-  | { kind: PendingKind; source: "auth"; slot: AuthSlot; name: string }
+  | { kind: PendingKind; source: NonAuthSource; name: string; segment?: number }
+  | { kind: PendingKind; source: "auth"; slot: AuthSlot; name: string; segment?: number }
 
 export type IdentityTuple = readonly [PendingKind, PendingSource, AuthSlot | null, string]
 
@@ -137,8 +136,13 @@ export function formatPendingField(f: PendingField, t: TranslateFn): string {
   return `${t(SOURCE_KEY[source])} · ${positionName(source, slot, name, t)}`
 }
 
-function field(kind: PendingKind, source: NonAuthSource, name: string): PendingField {
-  return { kind, source, name }
+function field(
+  kind: PendingKind,
+  source: NonAuthSource,
+  name: string,
+  segment?: number,
+): PendingField {
+  return { kind, source, name, ...(segment === undefined ? {} : { segment }) }
 }
 
 /**
@@ -168,6 +172,8 @@ export function needsRefill(item: KeyValuePair): boolean {
 }
 
 function pairFields(items: KeyValuePair[], source: NonAuthSource): PendingField[] {
+  // Disabled rows remain here intentionally: the save gate asks whether
+  // persistence would write an empty credential, not whether the row is sent.
   return items.filter(needsRefill).map((item) => field("refill", source, item.key))
 }
 
@@ -214,18 +220,20 @@ function bodyFields(source: PendingRefillSource): PendingField[] {
     ? "refill-unverifiable"
     : "refill"
 
-  const named = sentinelBodyFields(kind, body.content)
+  const named = sentinelBodyFieldLocations(kind, body.content)
   if (named.length > 0) {
-    return named.map((name) => field(pendingKind, "body", name))
+    return named.map(({ name, segment }) => field(pendingKind, "body", name, segment))
   }
 
   // Replay already stripped the placeholders out of the body text, so the keys
   // cannot be found there any more. They were written down when they were
   // cleared; which of them still need typing back in is decided by what the
   // body holds now, not by whether anything has been edited since.
-  return remainingRedactedBodyFields(kind, body.content, source.bodyRedactedFields ?? []).map(
-    (name) => field(pendingKind, "body", name),
-  )
+  return remainingRedactedBodyFieldLocations(
+    kind,
+    body.content,
+    source.bodyRedactedFields ?? [],
+  ).map(({ name, segment }) => field(pendingKind, "body", name, segment))
 }
 
 /**
@@ -250,28 +258,10 @@ function fileFields(body: RequestBody): PendingField[] {
   return []
 }
 
-/**
- * The query string is reachable from two places at once. Params are a request's
- * source of truth, but a tab opened from history also keeps the query in its
- * url, so a redacted parameter would otherwise be listed twice and inflate the
- * count the dialog reports.
- *
- * Reconciling the two copies is `historyQueryRows`' job and only its job. This
- * used to hold a second rule for the same overlap, phrased over pending
- * *entries* rather than rows -- suppressing the url's copy of a key only when
- * the params copy was itself pending -- and the two rules answered differently
- * for a key the url still spelled `[redacted]` and the params copy held a real
- * value for: the panel called the request complete, the history row beside it
- * demanded the credential be typed back in. Reading the reconciled rows here
- * instead means neither entry point owns a rule the other can drift from.
- *
- * What stays local is the per-row question, and it is asked per row rather than
- * per name: collapsing by name would swallow a genuine repeat within one copy,
- * and `?tag=a&tag=b` with both values redacted is two rows the user has to
- * refill. Reporting one is the same class of lie as reporting three.
- */
 function queryFields(source: PendingRefillSource): PendingField[] {
-  return pairFields(historyQueryRows(source.params, source.url), "query")
+  // Imports reconcile the two query copies once. Reading the gate is strictly
+  // per row; propagating markers by key here would mark rows added by the user.
+  return pairFields(source.params, "query")
 }
 
 export function pendingRefillFields(source: PendingRefillSource): PendingField[] {

@@ -9,7 +9,9 @@ import {
   bodyKindFromContentType,
   clearSentinelBody,
   clearSentinelPairs,
+  emptyBodyFieldLocations,
   emptyBodyFields,
+  findSentinelFields,
   isSensitiveKey,
   isUnverifiableBody,
   lenientDecodeKey,
@@ -18,10 +20,12 @@ import {
   redactUrlQuery,
   redactValue,
   remainingRedactedBodyFields,
+  sanitizeHistoryEntry,
+  sentinelBodyFieldLocations,
   sentinelBodyFields,
   tryScanJsonSpans,
 } from "../redaction"
-import type { KeyValuePair } from "../../types"
+import type { HistoryEntry, KeyValuePair } from "../../types"
 
 // `~` stands for a single backslash everywhere in this file. Escapes written as
 // literals have been silently eaten by the writing chain before (repo rule P6),
@@ -371,6 +375,71 @@ describe("§14 urlencoded bodies", () => {
     expect(redactBodyText("urlencoded", "token=abc=def&page=2")).toBe(
       `token=${REDACTION_SENTINEL}&page=2`,
     )
+  })
+})
+
+describe("D17 urlencoded scanners retain segment locations", () => {
+  it("locates literal sentinels without using the decoded key as row identity", () => {
+    expect(
+      sentinelBodyFieldLocations(
+        "urlencoded",
+        `page=1&api%2Btoken=${REDACTION_SENTINEL}&token=${REDACTION_SENTINEL}`,
+      ),
+    ).toEqual([
+      { name: "api+token", segment: 1 },
+      { name: "token", segment: 2 },
+    ])
+  })
+
+  it("locates empty sensitive segments while preserving the existing name API", () => {
+    expect(emptyBodyFieldLocations("urlencoded", "page=1&api%2Btoken=&token=")).toEqual([
+      { name: "api+token", segment: 1 },
+      { name: "token", segment: 2 },
+    ])
+    expect(emptyBodyFields("urlencoded", "page=1&api%2Btoken=&token=")).toEqual([
+      "api+token",
+      "token",
+    ])
+  })
+})
+
+describe("D17 disabled rows have distinct save and outbound meanings", () => {
+  it("does not send a disabled placeholder row to the outbound gate", () => {
+    const tab = {
+      headers: [pair("Authorization", REDACTION_SENTINEL, { enabled: false })],
+      params: [],
+      body: { type: "none", content: "", formData: [] },
+    }
+
+    expect(findSentinelFields(tab as never)).toEqual([])
+  })
+})
+
+describe("D17 §15 history persistence strips each marker path independently", () => {
+  const source = {
+    id: "history-marker",
+    method: "POST",
+    url: "https://api.example.com/x",
+    status: 200,
+    time: 1,
+    size: 1,
+    timestamp: "2026-08-29T00:00:00Z",
+    contentType: "application/json",
+    requestParams: [pair("apikey", "", { redacted: true })],
+    requestHeaders: [pair("Authorization", "", { redacted: true })],
+    requestBodyType: "form-data",
+    requestBodyFormData: [pair("token", "", { redacted: true })],
+  } as HistoryEntry
+
+  it.each([
+    ["requestParams", (entry: HistoryEntry) => entry.requestParams],
+    ["requestHeaders", (entry: HistoryEntry) => entry.requestHeaders],
+    ["requestBodyFormData", (entry: HistoryEntry) => entry.requestBodyFormData],
+  ] as const)("strips %s markers", (_name, select) => {
+    const rows = select(sanitizeHistoryEntry(source)) ?? []
+
+    expect(rows).toHaveLength(1)
+    expect(Object.prototype.hasOwnProperty.call(rows[0], "redacted")).toBe(false)
   })
 })
 

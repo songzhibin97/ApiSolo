@@ -6,7 +6,7 @@ import { historyEntryToRequest } from "../../utils/history-to-request"
 import { identityTuple, pendingRefillFields } from "../../utils/pending-refill"
 import { REDACTION_SENTINEL, sanitizeHistoryEntry } from "../../utils/redaction"
 import { buildUrlWithParams } from "../../utils/url-params"
-import type { HistoryEntry, KeyValuePair, Tab } from "../../types"
+import type { HistoryEntry, KeyValuePair, SavedRequest, Tab } from "../../types"
 
 function pair(key: string, value: string): KeyValuePair {
   return { id: "", enabled: true, key, value, description: "" }
@@ -975,5 +975,49 @@ describe("the query rows a history entry describes come from both copies of it",
 
       expect(panelGate(store.activeTab)).toEqual(rowGate(entry))
     })
+  })
+})
+
+describe("D17 openSavedRequest applies the import contract to every pair face", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+  })
+
+  it("normalizes URL-only params, headers and form-data text rows exactly once", () => {
+    const store = useTabsStore()
+    const request = {
+      name: "Legacy markers",
+      method: "POST",
+      url: `https://api.example.com/users?apikey=${REDACTION_SENTINEL}&page=1`,
+      params: [],
+      headers: [pair("Authorization", REDACTION_SENTINEL)],
+      body: {
+        type: "form-data",
+        content: "",
+        formData: [pair("token", REDACTION_SENTINEL)],
+        binaryPath: "",
+      },
+      auth: { type: "none" },
+      preRequestScript: "",
+      testScript: "",
+    } satisfies SavedRequest
+
+    store.openSavedRequest("Project", "legacy.request.json", request)
+
+    expect(store.activeTab.params.map(({ key, value, redacted }) => [key, value, redacted])).toEqual([
+      ["apikey", "", true],
+      ["page", "1", undefined],
+    ])
+    expect(store.activeTab.headers[0]).toEqual(
+      expect.objectContaining({ key: "Authorization", value: "", redacted: true }),
+    )
+    expect(store.activeTab.body.formData[0]).toEqual(
+      expect.objectContaining({ key: "token", value: "", redacted: true }),
+    )
+    expect(pendingRefillFields(store.activeTab).map(identityTuple)).toEqual([
+      ["refill", "header", null, "Authorization"],
+      ["refill", "query", null, "apikey"],
+      ["refill", "form", null, "token"],
+    ])
   })
 })

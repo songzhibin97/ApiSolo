@@ -3,117 +3,71 @@ import { REDACTION_SENTINEL } from "./redaction"
 import { deriveParamsFromUrl } from "./url-params"
 
 /**
- * The query rows a history entry describes. It records its query twice and
- * neither copy is a superset of the other, so this reads both rather than
- * picking one:
+ * Merge the two ordered query copies carried by an imported request.
  *
- *   - `requestParams` holds the rows that actually went on the wire — the send
- *     path strips the url's own query and sends this list — but it did not
- *     exist for early entries.
- *   - The url holds the query as the tab was displaying it, which is where an
- *     early entry's parameters live, and where a parameter can appear that the
- *     params copy never had.
- *
- * Taking one and discarding the other was the defect. Discarding the url lost
- * a url-only parameter outright: it is not merely hidden, because the rows are
- * what gets sent, so a parameter missing from this list is a parameter that
- * never goes out — and since `openHistoryEntry` goes on to clear the
- * placeholder out of the url, it disappeared without leaving a mark on screen
- * either.
- *
- * The overlap is resolved per key: rows the params copy already has are kept as
- * they are, and the url contributes only keys it does not have. Params win
- * because params are what gets sent, so a real value there is a real value on
- * the wire whatever the url's stale copy of that key still spells.
- *
- * Which keys this entry blanked is a second question, and it is asked of both
- * copies together. The two do not spell the answer the same way — the url
- * redactor stamps a placeholder on any sensitive key, while the pair redactor
- * leaves an already empty value alone — so either copy can be the only one that
- * still says a key was blanked, and neither ever contradicts the other on it.
- * Marked per key rather than per row, for the reason set out above
- * `syncParamsFromUrl`: two identical blank parameters hold no fact saying which
- * is which.
- *
- * This used to read the url's answer *minus* the keys the params copy reports
- * as blanked, to keep a key from being "counted twice". It counted nothing
- * twice — a row holding the placeholder is not empty, so the marker never lands
- * on it and it is already reported by the placeholder alone — and what the
- * subtraction did drop was the key both copies name, which is the shape most in
- * need of reporting: `apikey=SECRET&apikey=` comes back as one placeholder row
- * and one blank row, the subtraction left the blank row unmarked, and typing
- * the credential back into the marked row emptied the list, took the notice
- * down, unlocked the save and wrote `apikey=""` into the collection.
- *
- * The blank row in that pair may well be one the user meant to send empty. The
- * entry holds no fact that separates it from a credential blanked by an earlier
- * generation of the same row and never typed back in — the url stamps both the
- * same way — so this errs where the rest of the slice errs, per
- * `applyPairEdit`: over-reporting costs a confirmation, under-reporting costs a
- * credential.
- *
- * This lives in its own module because it is the *one* answer to the question,
- * not one of two. Both save entry points reach it — the panel through the rows
- * this builds for the tab, the history row through `queryFields` in
- * `pending-refill.ts` — and when the two had a rule each they disagreed about
- * the same row: a key the url still spelled `[redacted]` while the params copy
- * held the value already typed back in was listed as outstanding by the history
- * row and as done by the panel. Adding a case to one of two rules is what put
- * that disagreement there; a second rule is not to be written here again.
- *
- * The panel's params table is held to the same rule: it renders this
- * function's output rather than the raw `tab.params`, so its amber mark
- * (`needsRefill` per row) and the pending list (`needsRefill` over the same
- * rows) are two readings of one computation. Handing the table the raw rows
- * was the same defect one layer up — a blank row this marks at read time was
- * named by the notice and held by the gate while no box on screen pointed at
- * it.
+ * Exact (key, value) pairs cancel one-for-one. The URL may then contribute at
+ * most its per-key row surplus, so a stale value cannot duplicate a row while
+ * genuinely repeated URL rows are not discarded. Marker reconciliation is an
+ * import-only step; after this returns, the row is the authoritative carrier.
+ * See the marker contract on `KeyValuePair.redacted`.
  */
-export function historyQueryRows(stored: KeyValuePair[], rawUrl: string): KeyValuePair[] {
+export function mergeHistoryQueryRows(
+  stored: KeyValuePair[],
+  rawUrl: string,
+): KeyValuePair[] {
   const fromUrl = deriveParamsFromUrl(rawUrl)
+  const claimedStored = new Set<number>()
+  const unmatchedUrl: KeyValuePair[] = []
 
-  /**
-   * Says a row was blanked, in either of the two spellings the fact has: a row
-   * read straight off disk still holds the placeholder, a row that has been
-   * through the replay path holds the marker instead. Deliberately *not*
-   * `needsRefill`, which adds "and is still empty": that answers a per-row
-   * question, and the set below is a per-key one. A key would stop counting as
-   * blanked the moment its last blank row was filled, which is exactly when
-   * emptying one again has to be reported.
-   */
-  const isBlanked = (item: KeyValuePair) =>
-    item.value.trim() === REDACTION_SENTINEL || item.redacted === true
+  for (const urlRow of fromUrl) {
+    const match = stored.findIndex(
+      (storedRow, index) =>
+        !claimedStored.has(index) &&
+        storedRow.key === urlRow.key &&
+        storedRow.value === urlRow.value,
+    )
 
-  // Which keys the params copy speaks for. A question about *rows*: params are
-  // what the send path puts on the wire, so a key they list is a key they own,
-  // and the url may only contribute rows for keys they never had.
-  const storedKeys = new Set(stored.map((item) => item.key))
-  // Which keys this entry blanked. A question about *keys*, answered by the two
-  // copies together — the union, not one of them minus the other.
-  const blankedKeys = new Set([...stored, ...fromUrl].filter(isBlanked).map((item) => item.key))
+    if (match === -1) {
+      unmatchedUrl.push(urlRow)
+    } else {
+      claimedStored.add(match)
+    }
+  }
 
-  return [...stored, ...fromUrl.filter((item) => !storedKeys.has(item.key))].map((item) => {
-    // A row still holding the literal placeholder leaves here as an empty,
-    // marked row — the same shape `clearSentinelPairs` gives a stored row — so
-    // the placeholder text never reaches anything editable. Handing it out
-    // as-is is what let a url-contributed row lose its origin: the row carried
-    // the fact in its *value* and nothing in its marker, so typing over the
-    // placeholder and deleting again left an ordinary-looking blank row that
-    // no reader could tell from one the user meant to send empty — gate gone,
-    // empty credential saved without a word. It also kept the placeholder one
-    // keystroke away from the wire, and the placeholder must never be
-    // replayable.
-    if (item.value.trim() === REDACTION_SENTINEL) {
-      return { ...item, value: "", redacted: true }
+  const storedCounts = countByKey(stored)
+  const urlCounts = countByKey(fromUrl)
+  const contributedCounts = new Map<string, number>()
+  const urlContribution = unmatchedUrl.filter((row) => {
+    const limit = Math.max(0, (urlCounts.get(row.key) ?? 0) - (storedCounts.get(row.key) ?? 0))
+    const used = contributedCounts.get(row.key) ?? 0
+
+    if (used >= limit) {
+      return false
     }
 
-    // `value === ""` is what keeps the two entry points agreeing on a key whose
-    // copies disagree: the url still holding a placeholder for a key the params
-    // copy holds a real value for says only that the url is stale, and marking
-    // the filled row would gate a request the user has already completed. It is
-    // also why nothing is marked over a row that holds a value — the marker
-    // means "this blank came from history", and putting it on a non-blank row
-    // would be inventing it.
-    return item.value === "" && blankedKeys.has(item.key) ? { ...item, redacted: true } : item
+    contributedCounts.set(row.key, used + 1)
+    return true
   })
+
+  const wasBlanked = (row: KeyValuePair) =>
+    row.value.trim() === REDACTION_SENTINEL || row.redacted === true
+  const blankedKeys = new Set([...stored, ...fromUrl].filter(wasBlanked).map((row) => row.key))
+
+  return [...stored, ...urlContribution].map((row) => {
+    if (row.value.trim() === REDACTION_SENTINEL) {
+      return { ...row, value: "", redacted: true }
+    }
+
+    return row.value === "" && blankedKeys.has(row.key) ? { ...row, redacted: true } : row
+  })
+}
+
+function countByKey(rows: KeyValuePair[]): Map<string, number> {
+  const counts = new Map<string, number>()
+
+  for (const row of rows) {
+    counts.set(row.key, (counts.get(row.key) ?? 0) + 1)
+  }
+
+  return counts
 }

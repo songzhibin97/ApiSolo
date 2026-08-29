@@ -16,16 +16,16 @@ export interface KeyValuePair {
    *
    *   - It is **stripped** before a row is persisted or written to history. It
    *     is session state, not data.
+   *   - Opening or importing a complete external request is the only transition
+   *     that may create it. That transition reconciles duplicate query copies
+   *     once; after it finishes the marker travels only with its row. Ordinary
+   *     edits and readers never propagate it by key.
    *   - A rebuild must not lose it, and must not invent it. Losing it silently
    *     removes the save gate on a blanked credential; inventing it blocks a
-   *     request that is already complete. Where rows can be told apart, carry
-   *     it per row — including onto a row that now holds a value, because
-   *     deleting that value again has to be reported and this is the only
-   *     record that can say so. Where they cannot -- the query string, whose
-   *     two identical blank `apikey` parameters hold no fact saying which is
-   *     which -- carry it per key instead: see `syncParamsFromUrl`. Do not
-   *     invent a tie-break; three attempts to do that each failed in one
-   *     direction or the other.
+   *     request that is already complete. A query string cannot distinguish
+   *     identical rows, so URL edits preserve the observable facts instead:
+   *     how many rows survive and how many of them are marked. Marked rows win
+   *     when such a group shrinks; equally marked rows keep original order.
    *
    *     Nothing clears it. Editing a value answers "is this row pending" on its
    *     own, so there is nothing left for a clear to do, and a clear is how the
