@@ -571,7 +571,7 @@ describe("the marker stays on its originating row and unmarked siblings are not 
   })
 
   /** Filling one row does not transfer its marker to an unmarked blank sibling. */
-  it("still treats a key as blanked once its blank has been filled", () => {
+  it("keeps the marker on the filled originating row without marking a blank sibling", () => {
     const after = syncParamsFromUrl(`${BASE}?apikey=&apikey=ALREADY`, [
       { ...redacted("apikey"), value: "ALREADY" },
     ]).params
