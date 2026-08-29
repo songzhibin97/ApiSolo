@@ -769,4 +769,29 @@ describe("D17 §8-§9 URL edits preserve row identity with marked-first survivor
 
     expect(synced).toEqual({ url: "http://[invalid", params: current })
   })
+
+  it("keeps relative URL parsing and whitespace passthrough on one participation rule", () => {
+    const synced = syncParamsFromUrl("/items?new=1", [
+      row("old", "old", "1"),
+      row("space", "   ", "kept"),
+    ])
+
+    expect(synced.url).toBe("/items")
+    expect(synced.params.map(({ id, key, value }) => [id, key, value])).toEqual([
+      ["old", "new", "1"],
+      ["space", "   ", "kept"],
+    ])
+  })
+
+  it("keeps both same-key groups attached to their rows when URL order changes", () => {
+    const synced = syncParamsFromUrl(`${BASE}?beta=new-b&alpha=new-a`, [
+      row("alpha", "alpha", "old-a"),
+      row("beta", "beta", "old-b"),
+    ])
+
+    expect(synced.params.map(({ id, key, value }) => [id, key, value])).toEqual([
+      ["beta", "beta", "new-b"],
+      ["alpha", "alpha", "new-a"],
+    ])
+  })
 })

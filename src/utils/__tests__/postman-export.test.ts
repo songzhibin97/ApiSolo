@@ -42,7 +42,17 @@ describe("exportPostmanCollection", () => {
         },
       ],
     })
-    const postman = exportPostmanCollection("My API", [marked], [])
+    const tree: CollectionNode[] = [
+      {
+        name: marked.name,
+        path: "marked.request.json",
+        nodeType: "request",
+        children: [],
+        method: marked.method,
+      },
+    ]
+    const postman = exportPostmanCollection("My API", [marked], tree)
+    const parsedPostman = JSON.parse(postman)
     const curl = exportCurl({
       ...marked,
       id: "tab",
@@ -54,6 +64,14 @@ describe("exportPostmanCollection", () => {
       urlRevision: 0,
     } as Tab)
 
+    expect(parsedPostman.item).toHaveLength(1)
+    expect(parsedPostman.item[0].request.method).toBe("GET")
+    expect(parsedPostman.item[0].request.header.map(({ key }: { key: string }) => key)).toEqual([
+      "Authorization",
+    ])
+    expect(
+      parsedPostman.item[0].request.url.query.map(({ key }: { key: string }) => key),
+    ).toEqual(["apikey"])
     expect(postman).not.toContain('"redacted"')
     expect(curl).not.toContain("redacted")
     expect(curl).toContain("apikey=REAL")

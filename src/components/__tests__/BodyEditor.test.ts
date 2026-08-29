@@ -49,7 +49,7 @@ function formDataBody(): RequestBody {
 
 function mountEditor(modelValue: RequestBody) {
   return mount(BodyEditor, {
-    props: { modelValue },
+    props: { modelValue, pendingFields: [] },
     global: { stubs: { CodeEditor: true, KeyValueEditor: true } },
   })
 }

@@ -11,7 +11,7 @@ import type { BodyType, FormDataItem, KeyValuePair, RequestBody } from "../../ty
 
 const props = defineProps<{
   modelValue: RequestBody
-  pendingFields?: PendingField[]
+  pendingFields: PendingField[]
 }>()
 
 const emit = defineEmits<{
@@ -42,7 +42,7 @@ const formUrlencodedRows = ref<KeyValuePair[]>([])
 const pendingUrlencodedSegments = computed(
   () =>
     new Set(
-      (props.pendingFields ?? [])
+      props.pendingFields
         .filter((field) => field.source === "body" && field.segment !== undefined)
         .map((field) => field.segment as number),
     ),

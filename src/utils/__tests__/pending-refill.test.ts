@@ -393,7 +393,7 @@ describe("§15 every source class survives the panel entry point on its own", ()
     ],
     [
       "a redacted query parameter row",
-      request({ params: [pair("apikey", REDACTION_SENTINEL)] }),
+      request({ params: [pair("apikey", "", { enabled: false, redacted: true })] }),
       ["refill", "query", null, "apikey"],
     ],
     [

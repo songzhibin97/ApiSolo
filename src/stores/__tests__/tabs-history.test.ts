@@ -985,13 +985,13 @@ describe("D17 openSavedRequest applies the import contract to every pair face", 
     setActivePinia(createPinia())
   })
 
-  it("normalizes URL-only params, headers and form-data text rows exactly once", () => {
+  it("normalizes a URL-only sensitive param and every stored pair face exactly once", () => {
     const store = useTabsStore()
     const request = {
       name: "Legacy markers",
       method: "POST",
       url: `https://api.example.com/users?apikey=${REDACTION_SENTINEL}&page=1`,
-      params: [],
+      params: [pair("page", "1")],
       headers: [pair("Authorization", REDACTION_SENTINEL)],
       body: {
         type: "form-data",
@@ -1007,8 +1007,8 @@ describe("D17 openSavedRequest applies the import contract to every pair face", 
     store.openSavedRequest("Project", "legacy.request.json", request)
 
     expect(store.activeTab.params.map(({ key, value, redacted }) => [key, value, redacted])).toEqual([
-      ["apikey", "", true],
       ["page", "1", undefined],
+      ["apikey", "", true],
     ])
     expect(store.activeTab.headers[0]).toEqual(
       expect.objectContaining({ key: "Authorization", value: "", redacted: true }),

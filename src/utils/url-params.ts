@@ -37,28 +37,33 @@ export function pickSurvivors<T extends KeyValuePair>(rows: T[], count: number):
     .map(({ row }) => row)
 }
 
+function participatesInUrl(item: KeyValuePair): boolean {
+  return item.enabled && Boolean(item.key.trim())
+}
+
 export function syncParamsFromUrl(rawUrl: string, currentParams: KeyValuePair[]) {
   try {
     const parsed = new URL(toParsableUrl(rawUrl))
     const entries = [...parsed.searchParams.entries()]
-    const candidates = currentParams.filter((item) => item.enabled && item.key.trim())
-    const passthrough = currentParams.filter((item) => !item.enabled || !item.key.trim())
+    const candidates = currentParams.filter(participatesInUrl)
+    const passthrough = currentParams.filter((item) => !participatesInUrl(item))
     const claimedRows = new Set<KeyValuePair>()
     const claimedEntries = new Set<number>()
     const byEntry = new Map<number, KeyValuePair>()
 
     function matchGroups(
-      groupOfRow: (row: KeyValuePair) => string,
-      groupOfEntry: (entry: [string, string]) => string,
+      tupleOfRow: (row: KeyValuePair) => readonly string[],
+      tupleOfEntry: (entry: [string, string]) => readonly string[],
       selectRows: (rows: KeyValuePair[], count: number) => KeyValuePair[],
     ) {
       const entryGroups = new Map<string, number[]>()
+      const groupKey = (parts: readonly string[]) => JSON.stringify(parts)
 
       entries.forEach((entry, index) => {
         if (claimedEntries.has(index)) {
           return
         }
-        const group = groupOfEntry(entry)
+        const group = groupKey(tupleOfEntry(entry))
         const indexes = entryGroups.get(group)
         if (indexes) {
           indexes.push(index)
@@ -69,7 +74,7 @@ export function syncParamsFromUrl(rawUrl: string, currentParams: KeyValuePair[])
 
       for (const [group, entryIndexes] of entryGroups) {
         const rows = candidates.filter(
-          (row) => !claimedRows.has(row) && groupOfRow(row) === group,
+          (row) => !claimedRows.has(row) && groupKey(tupleOfRow(row)) === group,
         )
         const survivors = selectRows(rows, Math.min(rows.length, entryIndexes.length))
 
@@ -85,14 +90,14 @@ export function syncParamsFromUrl(rawUrl: string, currentParams: KeyValuePair[])
 
     // Stage 1: exact decoded key and value.
     matchGroups(
-      (row) => JSON.stringify([row.key, row.value]),
-      ([key, value]) => JSON.stringify([key, value]),
+      (row) => [row.key, row.value],
+      ([key, value]) => [key, value],
       (rows, count) => pickSurvivors(rows, count),
     )
     // Stage 2: the same key with a user-edited value.
     matchGroups(
-      (row) => JSON.stringify([row.key]),
-      ([key]) => JSON.stringify([key]),
+      (row) => [row.key],
+      ([key]) => [key],
       (rows, count) => pickSurvivors(rows, count),
     )
 
