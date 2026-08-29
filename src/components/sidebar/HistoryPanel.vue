@@ -196,7 +196,11 @@ function formatTimestamp(value: string) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString(locale.value)
 }
 
-function summarizeResponseBody(value?: string) {
+function summarizeResponseBody(value: string | undefined, kind?: HistoryEntry["responseBodyKind"]) {
+  if (kind === "binary") {
+    return t("response.binaryBody")
+  }
+
   if (!value) {
     return ""
   }
@@ -458,9 +462,10 @@ async function clearHistory() {
                   </span>
                   <span
                     v-if="entry.responseBody"
+                    data-testid="history-response-summary"
                     class="min-w-0 flex-1 truncate text-xs text-[var(--text-secondary)]"
                   >
-                    {{ summarizeResponseBody(entry.responseBody) }}
+                    {{ summarizeResponseBody(entry.responseBody, entry.responseBodyKind) }}
                   </span>
                 </div>
 
