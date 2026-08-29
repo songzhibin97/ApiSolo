@@ -124,6 +124,17 @@ function hasFormDataValue(item: FormDataItem) {
   )
 }
 
+function decodeFormUrlencodedComponent(component: string) {
+  try {
+    return decodeURIComponent(component)
+  } catch (error) {
+    if (error instanceof URIError) {
+      return component
+    }
+    throw error
+  }
+}
+
 function deserializeFormUrlencoded(content: string): KeyValuePair[] {
   if (!content.trim()) {
     return []
@@ -133,8 +144,8 @@ function deserializeFormUrlencoded(content: string): KeyValuePair[] {
     const [rawKey = "", ...rawValue] = segment.split("=")
     return {
       ...createEmptyPair(),
-      key: decodeURIComponent(rawKey),
-      value: decodeURIComponent(rawValue.join("=")),
+      key: decodeFormUrlencodedComponent(rawKey),
+      value: decodeFormUrlencodedComponent(rawValue.join("=")),
     }
   })
 }
