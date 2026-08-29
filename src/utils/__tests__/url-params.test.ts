@@ -472,7 +472,7 @@ describe("rebuilding params from the url keeps a still-blank row's marker", () =
 })
 
 /** Row-local markers survive edits without spreading to newly created rows. */
-describe("carrying the marker holds both directions shut", () => {
+describe("the marker stays on its originating row and unmarked siblings are not pending", () => {
   const redacted = (key: string, id = `${key}-r`): KeyValuePair => ({
     id,
     enabled: true,

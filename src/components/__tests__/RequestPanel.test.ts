@@ -738,15 +738,10 @@ describe("editing an unrelated part of the url keeps the query gate", () => {
   })
 
   /**
-   * FALSE GATE, end to end. The other direction from everything above: once no
-   * `apikey` is blank any more, the notice must go and the save must unlock.
-   *
-   * The release condition is "the key has no blank rows left", not "the
-   * particular row history blanked got filled in". The second phrasing needs to
-   * know which of two identical blank parameters is which, and a url does not
-   * say — so this walks the whole way to no blanks rather than stopping at one.
+   * FALSE GATE, end to end: once the marked row is filled, the notice must go
+   * and the save must unlock. Its unmarked sibling does not inherit that state.
    */
-  it("clears the gate once no parameter of that key is blank", async () => {
+  it("clears the gate once the marked row is filled", async () => {
     const projects = useProjectsStore()
     projects.activeProject = "My API"
     const tabs = useTabsStore()

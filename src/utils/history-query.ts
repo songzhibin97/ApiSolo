@@ -3,13 +3,8 @@ import { REDACTION_SENTINEL } from "./redaction"
 import { deriveParamsFromUrl } from "./url-params"
 
 /**
- * Merge the two ordered query copies carried by an imported request.
- *
- * Exact (key, value) pairs cancel one-for-one. The URL may then contribute at
- * most its per-key row surplus, so a stale value cannot duplicate a row while
- * genuinely repeated URL rows are not discarded. Marker reconciliation is an
- * import-only step; after this returns, the row is the authoritative carrier.
- * See the marker contract on `KeyValuePair.redacted`.
+ * Merge the two ordered query copies without dropping genuine repeats.
+ * See `KeyValuePair.redacted` for the marker contract this merge preserves.
  */
 export function mergeHistoryQueryRows(
   stored: KeyValuePair[],

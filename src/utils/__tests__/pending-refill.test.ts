@@ -103,7 +103,7 @@ describe("§7 every value history replaced is listed for re-entry", () => {
     expect(fields.map((f) => formatPendingField(f, translator("en")))).toEqual(["Auth · API key X-Api-Key"])
   })
 
-  it("lists a placeholder in a header, a param, the url query, the body and a form row", () => {
+  it("lists placeholders and marked rows from headers, params, and the body", () => {
     expect(
       labels(
         request({
@@ -349,8 +349,8 @@ describe("D17 query pending fields read the authoritative rows without URL recon
     ).toEqual(["Query · apikey"])
   })
 
-  // FALSE GATE, the same pair once both rows hold a value. The marker outlives
-  // the value it was set for, so the key stays blanked and nothing is pending.
+  // FALSE GATE: the marker remains on its originating row after both values are
+  // filled, so neither that row nor its unmarked neighbour is pending.
   it("reports nothing for a marked row and its neighbour once both are filled", () => {
     expect(
       labels(

@@ -14,9 +14,8 @@ export function toParsableUrl(rawUrl: string) {
 }
 
 /**
- * Select the old rows that survive a group shrink. Marked rows win; rows with
- * the same priority retain their original order. Returning all rows unchanged
- * when no shrink is needed prevents identity swaps inside a stable group.
+ * Select the old rows that survive a group shrink.
+ * See `KeyValuePair.redacted` for the marker contract this selection preserves.
  */
 export function pickSurvivors<T extends KeyValuePair>(rows: T[], count: number): T[] {
   if (count <= 0) {

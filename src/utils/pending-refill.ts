@@ -259,8 +259,8 @@ function fileFields(body: RequestBody): PendingField[] {
 }
 
 function queryFields(source: PendingRefillSource): PendingField[] {
-  // Imports reconcile the two query copies once. Reading the gate is strictly
-  // per row; propagating markers by key here would mark rows added by the user.
+  // Query marker semantics are defined by `KeyValuePair.redacted`; this reader
+  // consumes the rows prepared under that contract.
   return pairFields(source.params, "query")
 }
 
