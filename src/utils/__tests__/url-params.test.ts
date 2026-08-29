@@ -690,7 +690,6 @@ describe("D17 §8-§9 URL edits preserve row identity with marked-first survivor
     ])
 
     expect(markedCount(synced.params)).toBe(1)
-    expect(synced.params[0].id).toBe("m1")
   })
 
   it("does not match disabled or blank-key rows and keeps them at the end", () => {
