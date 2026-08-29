@@ -391,6 +391,15 @@ describe("D17 urlencoded scanners retain segment locations", () => {
     ])
   })
 
+  it("skips segments without an equals sign and decodes a sensitive key", () => {
+    expect(
+      sentinelBodyFieldLocations(
+        "urlencoded",
+        `token-without-value&%70assword=${REDACTION_SENTINEL}`,
+      ),
+    ).toEqual([{ name: "password", segment: 1 }])
+  })
+
   it("locates empty sensitive segments while preserving the existing name API", () => {
     expect(emptyBodyFieldLocations("urlencoded", "page=1&api%2Btoken=&token=")).toEqual([
       { name: "api+token", segment: 1 },
@@ -398,6 +407,20 @@ describe("D17 urlencoded scanners retain segment locations", () => {
     ])
     expect(emptyBodyFields("urlencoded", "page=1&api%2Btoken=&token=")).toEqual([
       "api+token",
+      "token",
+    ])
+  })
+
+  it("skips empty segments without an equals sign and decodes the remaining key", () => {
+    expect(emptyBodyFieldLocations("urlencoded", "token-without-value&%70assword=")).toEqual([
+      { name: "password", segment: 1 },
+    ])
+  })
+})
+
+describe("D17 recorded body fields consume empty occurrences one for one", () => {
+  it("returns only one location when two records compete for one empty segment", () => {
+    expect(remainingRedactedBodyFields("urlencoded", "token=", ["token", "token"])).toEqual([
       "token",
     ])
   })

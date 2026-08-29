@@ -212,6 +212,41 @@ describe("§10 the panel forwards the writes that come from outside the field", 
       expect.objectContaining({ key: "token", value: "", redacted: true }),
     )
   })
+
+  it("keeps the cURL dialog open with the parser error after an invalid import", async () => {
+    const tabs = useTabsStore()
+    tabs.updateTab(tabs.activeTab.id, { url: "https://keep.test/path" })
+    const wrapper = mountPanel()
+    await wrapper.find('button[aria-label="request.moreActions"]').trigger("click")
+    await wrapper
+      .findAll("button")
+      .find((button) => button.text().includes("request.importCurl"))!
+      .trigger("click")
+    await wrapper.find("textarea").setValue("this is not curl")
+    await wrapper
+      .findAll("button")
+      .find((button) => button.text() === "request.import")!
+      .trigger("click")
+
+    expect(wrapper.find("textarea").exists()).toBe(true)
+    expect(wrapper.find(".text-rose-300").text().length).toBeGreaterThan(0)
+    expect(tabs.activeTab.url).toBe("https://keep.test/path")
+  })
+
+  it("silently leaves the tab unchanged when pasted text is not cURL", async () => {
+    const tabs = useTabsStore()
+    tabs.updateTab(tabs.activeTab.id, { url: "https://keep.test/path", params: [pair("page", "1")] })
+    const errorHandler = vi.fn()
+    const wrapper = shallowMount(RequestPanel, {
+      global: { plugins: [pinia], config: { errorHandler } },
+    })
+
+    await wrapper.findComponent(UrlBar).vm.$emit("pasteCurl", "this is not curl")
+
+    expect(errorHandler).not.toHaveBeenCalled()
+    expect(tabs.activeTab.url).toBe("https://keep.test/path")
+    expect(tabs.activeTab.params.map(({ key, value }) => [key, value])).toEqual([["page", "1"]])
+  })
 })
 
 /**

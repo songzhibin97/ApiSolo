@@ -613,6 +613,8 @@ describe("the query rows a history entry describes come from both copies of it",
     expect(opened.params[1]).toEqual(
       expect.objectContaining({ key: "apikey", value: "", redacted: true }),
     )
+    expect(opened.params.every(({ id }) => id.length > 0)).toBe(true)
+    expect(new Set(opened.params.map(({ id }) => id)).size).toBe(2)
     // The rendered url bar is the same list, so the parameter is back on screen
     // as well as back in the request.
     expect(buildUrlWithParams(opened.url, opened.params)).toBe(
@@ -1014,6 +1016,13 @@ describe("D17 openSavedRequest applies the import contract to every pair face", 
     expect(store.activeTab.body.formData[0]).toEqual(
       expect.objectContaining({ key: "token", value: "", redacted: true }),
     )
+    expect(
+      [
+        ...store.activeTab.params,
+        ...store.activeTab.headers,
+        ...store.activeTab.body.formData,
+      ].every(({ id }) => id.length > 0),
+    ).toBe(true)
     expect(pendingRefillFields(store.activeTab).map(identityTuple)).toEqual([
       ["refill", "header", null, "Authorization"],
       ["refill", "query", null, "apikey"],

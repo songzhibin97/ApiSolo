@@ -148,24 +148,38 @@ describe("D17 §3 legacy URL-only history uses the same normalized request shape
 
   it("normalizes a history header at the adapter call site", () => {
     const request = historyEntryToRequest(
-      entry({ requestHeaders: [pair("Authorization", REDACTION_SENTINEL)] }),
+      entry({ requestHeaders: [pair("Authorization", REDACTION_SENTINEL, { id: "" })] }),
     )
 
     expect(request.headers).toEqual([
       expect.objectContaining({ key: "Authorization", value: "", redacted: true }),
     ])
+    expect(request.headers[0].id).not.toBe("")
   })
 
   it("normalizes a history form-data text row at the adapter call site", () => {
     const request = historyEntryToRequest(
       entry({
         requestBodyType: "form-data",
-        requestBodyFormData: [pair("token", REDACTION_SENTINEL)],
+        requestBodyFormData: [pair("token", REDACTION_SENTINEL, { id: "" })],
       }),
     )
 
     expect(request.body.formData).toEqual([
       expect.objectContaining({ key: "token", value: "", redacted: true }),
     ])
+    expect(request.body.formData[0].id).not.toBe("")
+  })
+
+  it("assigns an editable id to a stored params row before merging", () => {
+    const request = historyEntryToRequest(
+      entry({
+        url: "https://api.example.com/users?page=1",
+        requestParams: [pair("page", "1", { id: "" })],
+      }),
+    )
+
+    expect(request.params).toHaveLength(1)
+    expect(request.params[0].id).not.toBe("")
   })
 })

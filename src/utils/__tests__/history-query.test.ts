@@ -73,4 +73,28 @@ describe("D17 §6 history query copies merge without losing or duplicating rows"
       ["debug", "1"],
     ])
   })
+
+  it("cancels identical pairs one for one when the URL repeats them", () => {
+    const rows = mergeHistoryQueryRows(
+      [pair("tag", "a", { id: "stored" })],
+      "https://api.example.com/x?tag=a&tag=a",
+    )
+
+    expect(rows.map(({ key, value }) => [key, value])).toEqual([
+      ["tag", "a"],
+      ["tag", "a"],
+    ])
+  })
+
+  it("uses an existing row marker during the import-time union", () => {
+    const rows = mergeHistoryQueryRows(
+      [pair("apikey", "", { id: "marked", redacted: true }), pair("apikey", "", { id: "plain" })],
+      "https://api.example.com/x",
+    )
+
+    expect(rows.map(({ id, redacted }) => [id, redacted === true])).toEqual([
+      ["marked", true],
+      ["plain", true],
+    ])
+  })
 })

@@ -720,4 +720,53 @@ describe("D17 §8-§9 URL edits preserve row identity with marked-first survivor
       }),
     )
   })
+
+  it("keeps original order when an exact group does not shrink", () => {
+    const synced = syncParamsFromUrl(`${BASE}?apikey=&apikey=`, [
+      row("u", "apikey", ""),
+      row("m", "apikey", "", true),
+    ])
+
+    expect(synced.params.map(({ id }) => id)).toEqual(["u", "m"])
+  })
+
+  it("keeps claimed rows and entries isolated across all three phases", () => {
+    const synced = syncParamsFromUrl(`${BASE}?exact=1&same=new&renamed=fallback`, [
+      row("exact", "exact", "1", true),
+      row("same", "same", "old", true),
+      row("fallback", "old-key", "fallback"),
+    ])
+
+    expect(synced.params.map(({ id, key, value }) => [id, key, value])).toEqual([
+      ["exact", "exact", "1"],
+      ["same", "same", "new"],
+      ["fallback", "renamed", "fallback"],
+    ])
+  })
+
+  it("matches exact same-key values rather than collapsing the group by key", () => {
+    const synced = syncParamsFromUrl(`${BASE}?q=b&q=a`, [
+      row("a", "q", "a"),
+      row("b", "q", "b"),
+    ])
+
+    expect(synced.params.map(({ id, value }) => [id, value])).toEqual([
+      ["b", "b"],
+      ["a", "a"],
+    ])
+  })
+
+  it("gives every newly added URL row a distinct non-empty id", () => {
+    const rows = syncParamsFromUrl(`${BASE}?a=1&b=2`, []).params
+
+    expect(rows.every(({ id }) => id.length > 0)).toBe(true)
+    expect(new Set(rows.map(({ id }) => id)).size).toBe(2)
+  })
+
+  it("preserves the previous rows when the URL cannot be parsed", () => {
+    const current = [row("keep", "page", "1", true, "keep me")]
+    const synced = syncParamsFromUrl("http://[invalid", current)
+
+    expect(synced).toEqual({ url: "http://[invalid", params: current })
+  })
 })

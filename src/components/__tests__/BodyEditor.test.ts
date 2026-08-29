@@ -233,6 +233,15 @@ describe("D17 §10-§12 pending body rows point to exactly one amber value box",
     expect(valueBoxByKey(wrapper, "apikey").classes()).not.toContain("border-amber-500")
   })
 
+  it("ignores segment metadata from a non-body pending source", () => {
+    const wrapper = mountRowEditor(
+      { type: "form-urlencoded", content: "page=1&apikey=", formData: [], binaryPath: "" },
+      [{ kind: "refill", source: "query", name: "apikey", segment: 1 }],
+    )
+
+    expect(valueBoxByKey(wrapper, "apikey").classes()).not.toContain("border-amber-500")
+  })
+
   it("marks a pending form-data text row and leaves a clean sibling plain", () => {
     const wrapper = mountRowEditor({
       type: "form-data",
@@ -260,6 +269,31 @@ describe("D17 §10-§12 pending body rows point to exactly one amber value box",
     })
 
     expect(valueBoxByKey(wrapper, "token").classes()).toContain("border-amber-500")
+    expect(valueBoxByKey(wrapper, "token").attributes("placeholder")).toBe(
+      "keyValue.redactedPlaceholder",
+    )
     expect(valueBoxByKey(wrapper, "page").classes()).not.toContain("border-amber-500")
+  })
+
+  it("does not mark a filled form-data row whose origin marker remains", () => {
+    const wrapper = mountRowEditor({
+      type: "form-data",
+      content: "",
+      formData: [
+        {
+          id: "token",
+          enabled: true,
+          key: "token",
+          value: "REAL",
+          description: "",
+          valueType: "text",
+          redacted: true,
+        },
+      ],
+      binaryPath: "",
+    })
+
+    expect(valueBoxByKey(wrapper, "token").classes()).not.toContain("border-amber-500")
+    expect(valueBoxByKey(wrapper, "token").attributes("placeholder")).toBe("keyValue.value")
   })
 })
