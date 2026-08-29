@@ -344,3 +344,63 @@ describe("D17 §10-§12 pending body rows point to exactly one amber value box",
     expect(valueBoxByKey(wrapper, "apikey").classes()).toContain("border-amber-500")
   })
 })
+
+describe("D21 malformed form-urlencoded escapes remain editable", () => {
+  function body(content: string): RequestBody {
+    return { type: "form-urlencoded", content, formData: [], binaryPath: "" }
+  }
+
+  function keyBoxes(wrapper: ReturnType<typeof mountRowEditor>) {
+    return wrapper
+      .findAll('input[type="text"]')
+      .filter((input) => input.attributes("placeholder") === "keyValue.key")
+  }
+
+  function valueBoxes(wrapper: ReturnType<typeof mountRowEditor>) {
+    return wrapper
+      .findAll('input[type="text"]')
+      .filter((input) => input.attributes("placeholder") === "keyValue.value")
+  }
+
+  it("renders a malformed key as its original literal", () => {
+    const wrapper = mountRowEditor(body("account%zz=active%20now"))
+
+    expect(wrapper.findComponent(KeyValueEditor).exists()).toBe(true)
+    expect((keyBoxes(wrapper)[0].element as HTMLInputElement).value).toBe("account%zz")
+    expect((valueBoxes(wrapper)[0].element as HTMLInputElement).value).toBe("active now")
+  })
+
+  it("renders a malformed value as its original literal", () => {
+    const wrapper = mountRowEditor(body("token%20name=secret%zz"))
+
+    expect(wrapper.findComponent(KeyValueEditor).exists()).toBe(true)
+    expect((keyBoxes(wrapper)[0].element as HTMLInputElement).value).toBe("token name")
+    expect((valueBoxes(wrapper)[0].element as HTMLInputElement).value).toBe("secret%zz")
+  })
+
+  it("keeps decoding valid percent escapes without treating plus as a space", () => {
+    const wrapper = mountRowEditor(body("first%20name=Alice%2BBob&literalPlus=a+b"))
+
+    expect(
+      keyBoxes(wrapper)
+        .slice(0, 2)
+        .map((input) => (input.element as HTMLInputElement).value),
+    ).toEqual(["first name", "literalPlus"])
+    expect(
+      valueBoxes(wrapper)
+        .slice(0, 2)
+        .map((input) => (input.element as HTMLInputElement).value),
+    ).toEqual(["Alice+Bob", "a+b"])
+  })
+
+  it("keeps the component mounted when the watched body changes to malformed escapes", async () => {
+    const wrapper = mountRowEditor(body("status=ready"))
+
+    await wrapper.setProps({ modelValue: body("account%zz=secret%xy") })
+    await flushPromises()
+
+    expect(wrapper.findComponent(KeyValueEditor).exists()).toBe(true)
+    expect((keyBoxes(wrapper)[0].element as HTMLInputElement).value).toBe("account%zz")
+    expect((valueBoxes(wrapper)[0].element as HTMLInputElement).value).toBe("secret%xy")
+  })
+})
