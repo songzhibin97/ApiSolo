@@ -186,3 +186,37 @@ describe("D09 §12-§15 the network truncation notice", () => {
     expect(wrapper.find(NETWORK_NOTICE).exists()).toBe(true)
   })
 })
+
+describe("D15 large JSON display cap", () => {
+  it("does not parse a complete JSON body once the display cap applies", () => {
+    const body = JSON.stringify({ payload: "x".repeat(500_000) })
+    expect(body.length).toBeGreaterThan(500_000)
+
+    const parseSpy = vi.spyOn(JSON, "parse")
+    try {
+      const wrapper = mountBody({ body, contentType: "application/json" })
+
+      expect(wrapper.findComponent(CodeEditor).props("modelValue")).toBe(
+        `${body.slice(0, 500_000)}\n\nresponse.largeBodyTruncated`,
+      )
+      expect(wrapper.findComponent(JsonTreeView).exists()).toBe(false)
+      expect(parseSpy.mock.calls.filter(([input]) => input === body)).toHaveLength(0)
+    } finally {
+      parseSpy.mockRestore()
+    }
+  })
+
+  it("still parses a complete small JSON body for the tree view", () => {
+    const body = '{"answer":42}'
+    const parseSpy = vi.spyOn(JSON, "parse")
+    try {
+      const wrapper = mountBody({ body, contentType: "application/json" })
+
+      expect(parseSpy.mock.calls.filter(([input]) => input === body)).toHaveLength(1)
+      expect(wrapper.findComponent(JsonTreeView).props("data")).toEqual({ answer: 42 })
+      expect(wrapper.findComponent(CodeEditor).exists()).toBe(false)
+    } finally {
+      parseSpy.mockRestore()
+    }
+  })
+})
