@@ -194,6 +194,14 @@ function mulberry32(seed: number): () => number {
   }
 }
 
+const DEFAULT_DEPTH = 4
+
+// Depth 7 would be 268,435,456 exhaustive strings, all materialised in one
+// array; it exhausts memory rather than finishing. The range therefore stops at
+// 6, which is the deepest anybody has run (18,095,744 strings, ~38 s, once, by
+// the spec review).
+const MAX_DEPTH = 6
+
 /**
  * Depth 4 is the committed size (269,952 strings, well under a second). Depth 5
  * is 1,318,528 and is what a reviewer runs by hand:
@@ -201,11 +209,48 @@ function mulberry32(seed: number): () => number {
  *   D18_SCAN_DEPTH=5 npx vitest run redaction-scan-equivalence
  *
  * Only an environment variable is read; no product-side switch exists.
+ *
+ * FAIL-CLOSED, and not as a matter of taste (D18 R1 finding I2). This was a
+ * bare `Number(process.env.D18_SCAN_DEPTH ?? "4")`. `Number("not-a-depth")` is
+ * NaN, `for (d = 1; d <= NaN; ...)` never enters even once, and the entire
+ * exhaustive corpus silently vanished -- while the run still reported 60/60
+ * green in 1.27 s against depth 4's 1.47 s. Nothing in the output said the
+ * enumeration had not happened, so "the harness was silent" read as "it ran and
+ * found nothing".
+ *
+ * An unusable value must abort. It must also NOT fall back to the default:
+ * falling back turns "I ran depth 6" into a silent depth 4, which is the same
+ * lie one step quieter.
  */
-const DEPTH = Number(process.env.D18_SCAN_DEPTH ?? "4")
+function resolveDepth(raw: string | undefined): number {
+  if (raw === undefined) return DEFAULT_DEPTH
 
-function buildCorpus(depth: number): string[] {
-  const out: string[] = [""]
+  const trimmed = raw.trim()
+  const depth = Number(trimmed)
+
+  if (trimmed === "" || !Number.isInteger(depth) || depth < 1 || depth > MAX_DEPTH) {
+    throw new Error(
+      `D18_SCAN_DEPTH must be an integer from 1 to ${MAX_DEPTH}; got ${JSON.stringify(raw)}. ` +
+        "Refusing to run: an unusable depth skips the exhaustive corpus and still reports green.",
+    )
+  }
+
+  return depth
+}
+
+const DEPTH = resolveDepth(process.env.D18_SCAN_DEPTH)
+
+/**
+ * Returns the corpus AND `levels` -- how many strings were actually generated
+ * at each depth. `levels` is not decoration: it is the only value in this file
+ * that can tell "the enumeration ran to depth N" apart from "the loop never
+ * entered". Every `mismatches === 0` below is a count over CORPUS, and a count
+ * that cannot say which enumeration produced it is exactly the reading that
+ * hid finding I2 for a whole implementation round.
+ */
+function buildCorpus(depth: number): { corpus: string[]; levels: number[] } {
+  const corpus: string[] = [""]
+  const levels: number[] = []
   let frontier: string[] = [""]
 
   for (let d = 1; d <= depth; d += 1) {
@@ -214,26 +259,36 @@ function buildCorpus(depth: number): string[] {
       for (const symbol of ALPHABET) {
         const s = prefix + symbol
         next.push(s)
-        out.push(s)
+        corpus.push(s)
       }
     }
+    levels.push(next.length)
     frontier = next
   }
 
-  for (const fixture of FIXTURES) out.push(fixture)
+  for (const fixture of FIXTURES) corpus.push(fixture)
 
   const random = mulberry32(FUZZ_SEED)
   for (let n = 0; n < FUZZ_COUNT; n += 1) {
     const length = 1 + Math.floor(random() * 12)
     let s = ""
     for (let k = 0; k < length; k += 1) s += ALPHABET[Math.floor(random() * ALPHABET.length)]
-    out.push(s)
+    corpus.push(s)
   }
 
-  return out
+  return { corpus, levels }
 }
 
-const CORPUS = buildCorpus(DEPTH)
+const { corpus: CORPUS, levels: CORPUS_LEVELS } = buildCorpus(DEPTH)
+const EXHAUSTIVE_COUNT = 1 + CORPUS_LEVELS.reduce((sum, count) => sum + count, 0)
+
+// Make the reading carry its own provenance: whatever "mismatches = 0" means
+// below, it means it over this corpus, printed by the same run that produced it.
+console.info(
+  `[D18] corpus depth=${DEPTH} levels=[${CORPUS_LEVELS.join(", ")}] ` +
+    `exhaustive=${EXHAUSTIVE_COUNT} fixtures=${FIXTURES.length} fuzz=${FUZZ_COUNT} ` +
+    `total=${CORPUS.length}`,
+)
 
 /** Counts one mismatch per corpus string; the unit is strings, not characters. */
 function countMismatches(left: (s: string) => Cut, right: (s: string) => Cut): number {
@@ -466,6 +521,33 @@ describe("D18 scan equivalence", () => {
     expect(BOUNDARY[32].input.charCodeAt(5)).toBe(12)
     expect(BOUNDARY[33].input.charCodeAt(5)).toBe(160)
     expect(BOUNDARY[45].input.charCodeAt(6)).toBe(0)
+  })
+
+  // The name carries the reading on purpose: with `--reporter=verbose` the
+  // corpus size is in the run's own output, so a "zero mismatches at depth 5"
+  // claim can be checked against the line that produced it instead of being
+  // taken on trust. Module load also prints the same figures (see the
+  // console.info above), which covers a filtered run.
+  it(`corpus provenance: depth ${DEPTH}, ${CORPUS.length} strings (levels ${CORPUS_LEVELS.join("/")})`, () => {
+    // P12: every layer below reports a count over CORPUS. That sentence is
+    // worth nothing unless something states how big CORPUS is and proves the
+    // enumeration behind it actually ran, so this asserts the generator's own
+    // record of what it walked. `CORPUS_LEVELS` has one entry per completed
+    // depth, so a depth that never entered the loop cannot look like one that
+    // finished -- which is the substitution finding I2 was about.
+    expect(CORPUS_LEVELS).toHaveLength(DEPTH)
+    CORPUS_LEVELS.forEach((count, index) => {
+      expect(count, `level ${index + 1} is incomplete`).toBe(ALPHABET.length ** (index + 1))
+    })
+    expect(CORPUS).toHaveLength(EXHAUSTIVE_COUNT + FIXTURES.length + FUZZ_COUNT)
+
+    // And pin the two totals this file and TECH 3.2 both quote by name. Unlike
+    // the mismatch counts in EQ-2, corpus size is fully determined (fixed
+    // alphabet, fixed fixture list, fixed seed and draw count), so pinning it
+    // is a drift guard rather than a gate that can fail for the wrong reason:
+    // add a fixture and this goes red until the quoted numbers are updated.
+    if (DEPTH === 4) expect(CORPUS).toHaveLength(269952)
+    if (DEPTH === 5) expect(CORPUS).toHaveLength(1318528)
   })
 
   it("EQ-0a oracle equals the shipped scanner, value for value", () => {
