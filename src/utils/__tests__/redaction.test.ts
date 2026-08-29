@@ -379,6 +379,32 @@ describe("§14 urlencoded bodies", () => {
 })
 
 describe("D17 urlencoded scanners retain segment locations", () => {
+  it.each([
+    ["raw", REDACTION_SENTINEL],
+    ["uppercase percent encoding", "%5Bredacted%5D"],
+    ["lowercase percent encoding", "%5bredacted%5d"],
+  ])("recognizes a %s sentinel value", (_name, value) => {
+    const content = `page=1&apikey=${value}`
+
+    expect(clearSentinelBody("urlencoded", content)).toEqual({
+      content: "page=1&apikey=",
+      fields: ["apikey"],
+    })
+    expect(sentinelBodyFieldLocations("urlencoded", content)).toEqual([
+      { name: "apikey", segment: 1 },
+    ])
+  })
+
+  it.each([
+    ["malformed encoding", "%5Bredacted%5"],
+    ["double encoding", "%255Bredacted%255D"],
+  ])("does not mistake %s for a sentinel", (_name, value) => {
+    const content = `page=1&apikey=${value}`
+
+    expect(clearSentinelBody("urlencoded", content)).toEqual({ content, fields: [] })
+    expect(sentinelBodyFieldLocations("urlencoded", content)).toEqual([])
+  })
+
   it("locates literal sentinels without using the decoded key as row identity", () => {
     expect(
       sentinelBodyFieldLocations(

@@ -520,6 +520,18 @@ function redactText(content: string): string {
 // urlencoded path
 // ---------------------------------------------------------------------------
 
+function isUrlencodedSentinelValue(rawValue: string): boolean {
+  if (rawValue === REDACTION_SENTINEL) {
+    return true
+  }
+
+  try {
+    return decodeURIComponent(rawValue) === REDACTION_SENTINEL
+  } catch {
+    return false
+  }
+}
+
 function redactUrlencoded(content: string): string {
   return content
     .split("&")
@@ -664,7 +676,7 @@ function clearSentinelUrlencoded(content: string): ClearedBody {
     .map((part) => {
       const separator = part.indexOf("=")
 
-      if (separator === -1 || part.slice(separator + 1) !== REDACTION_SENTINEL) {
+      if (separator === -1 || !isUrlencodedSentinelValue(part.slice(separator + 1))) {
         return part
       }
 
@@ -735,7 +747,7 @@ function sentinelUrlencodedFields(content: string): BodyFieldLocation[] {
   content.split("&").forEach((part, segment) => {
     const separator = part.indexOf("=")
 
-    if (separator === -1 || part.slice(separator + 1) !== REDACTION_SENTINEL) {
+    if (separator === -1 || !isUrlencodedSentinelValue(part.slice(separator + 1))) {
       return
     }
 

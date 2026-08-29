@@ -23,8 +23,10 @@ vi.mock("../../utils/file-reader", () => ({
 }))
 
 import BodyEditor from "../request/BodyEditor.vue"
+import KeyValueEditor from "../request/KeyValueEditor.vue"
 import { MAX_UPLOAD_FILE_BYTES, formatBytesAsMib } from "../../utils/limits"
-import type { PendingField } from "../../utils/pending-refill"
+import { pendingRefillFields, type PendingField } from "../../utils/pending-refill"
+import { REDACTION_SENTINEL, clearSentinelBody, findSentinelFields } from "../../utils/redaction"
 import type { FormDataItem, RequestBody } from "../../types"
 
 function binaryBody(): RequestBody {
@@ -295,5 +297,50 @@ describe("D17 §10-§12 pending body rows point to exactly one amber value box",
 
     expect(valueBoxByKey(wrapper, "token").classes()).not.toContain("border-amber-500")
     expect(valueBoxByKey(wrapper, "token").attributes("placeholder")).toBe("keyValue.value")
+  })
+
+  it("keeps a sentinel pending after a neighbouring urlencoded row is edited", async () => {
+    const initialBody: RequestBody = {
+      type: "form-urlencoded",
+      content: `page=1&apikey=${REDACTION_SENTINEL}`,
+      formData: [],
+      binaryPath: "",
+    }
+    const sourceFor = (body: RequestBody) => ({
+      url: "https://api.example.com/items",
+      headers: [],
+      params: [],
+      body,
+      auth: { type: "none" as const },
+    })
+    const initialPending = pendingRefillFields(sourceFor(initialBody))
+    const wrapper = mountRowEditor(initialBody, initialPending)
+
+    await valueBoxByKey(wrapper, "page").setValue("2")
+    const emitted = wrapper.emitted("update:modelValue")
+    expect(emitted).toHaveLength(1)
+    const editedBody = emitted![0][0] as RequestBody
+    expect(editedBody.content).toBe("page=2&apikey=%5Bredacted%5D")
+
+    expect(clearSentinelBody("urlencoded", editedBody.content)).toEqual({
+      content: "page=2&apikey=",
+      fields: ["apikey"],
+    })
+    const editedPending = pendingRefillFields(sourceFor(editedBody))
+    expect(editedPending.map(({ source, name, segment }) => [source, name, segment])).toEqual([
+      ["body", "apikey", 1],
+    ])
+    expect(
+      findSentinelFields({
+        headers: [],
+        params: [],
+        body: editedBody,
+      } as never),
+    ).toEqual(["apikey"])
+
+    await wrapper.setProps({ modelValue: editedBody, pendingFields: editedPending })
+    await flushPromises()
+    expect(wrapper.findComponent(KeyValueEditor).exists()).toBe(true)
+    expect(valueBoxByKey(wrapper, "apikey").classes()).toContain("border-amber-500")
   })
 })
