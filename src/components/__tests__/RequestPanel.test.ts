@@ -1154,3 +1154,70 @@ describe("D17 body pending fields stay connected to the editor and save gate", (
     ).toBe(false)
   })
 })
+
+describe("D23 request dialogs stay inside the viewport", () => {
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+  })
+
+  function expectClassTokens(selector: ReturnType<VueWrapper["get"]>, tokens: string[]) {
+    for (const token of tokens) {
+      expect(selector.classes(), `missing class token: ${token}`).toContain(token)
+    }
+  }
+
+  function expectViewportPosition(selector: ReturnType<VueWrapper["get"]>) {
+    const positionTokens = selector.classes().filter((token) => ["fixed", "absolute"].includes(token))
+
+    expect(positionTokens).toEqual(["fixed"])
+  }
+
+  it("opens save as a viewport modal with a scrolling body and fixed footer", async () => {
+    useProjectsStore().activeProject = "My API"
+    const wrapper = mountPanel()
+
+    await wrapper.get('button[title="request.save"]').trigger("click")
+
+    const overlay = wrapper.get('[data-testid="request-save-modal"]')
+    expectViewportPosition(overlay)
+    expectClassTokens(overlay, ["inset-0", "z-30"])
+    expectClassTokens(wrapper.get('[data-testid="request-save-dialog"]'), [
+      "flex",
+      "max-h-full",
+      "flex-col",
+    ])
+    expectClassTokens(wrapper.get('[data-testid="request-save-modal-body"]'), [
+      "min-h-0",
+      "flex-1",
+      "overflow-auto",
+    ])
+    expectClassTokens(wrapper.get('[data-testid="request-save-modal-footer"]'), ["shrink-0"])
+  })
+
+  it("opens cURL import with the same viewport and overflow contract", async () => {
+    const wrapper = mountPanel()
+
+    await wrapper.get('button[title="request.moreActions"]').trigger("click")
+    const importCurl = wrapper
+      .findAll("button")
+      .find((button) => button.text().includes("request.importCurl"))
+    expect(importCurl, "the cURL import action is not rendered").toBeDefined()
+    await importCurl!.trigger("click")
+
+    const overlay = wrapper.get('[data-testid="request-curl-modal"]')
+    expectViewportPosition(overlay)
+    expectClassTokens(overlay, ["inset-0", "z-30"])
+    expectClassTokens(wrapper.get('[data-testid="request-curl-dialog"]'), [
+      "flex",
+      "max-h-full",
+      "flex-col",
+    ])
+    expectClassTokens(wrapper.get('[data-testid="request-curl-modal-body"]'), [
+      "min-h-0",
+      "flex-1",
+      "overflow-auto",
+    ])
+    expectClassTokens(wrapper.get('[data-testid="request-curl-modal-footer"]'), ["shrink-0"])
+  })
+})

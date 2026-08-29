@@ -546,41 +546,47 @@ onUnmounted(() => {
 
     <div
       v-if="showSaveDialog"
-      class="absolute inset-0 z-20 flex items-center justify-center bg-black/45 p-4"
+      data-testid="request-save-modal"
+      class="fixed inset-0 z-30 flex items-center justify-center bg-black/45 p-4"
     >
-      <div class="w-full max-w-md rounded-lg border border-[var(--border)] bg-[var(--bg-primary)] p-4 shadow-lg">
+      <div
+        data-testid="request-save-dialog"
+        class="flex max-h-full w-full max-w-md flex-col rounded-lg border border-[var(--border)] bg-[var(--bg-primary)] p-4 shadow-lg"
+      >
         <div class="mb-4 text-lg font-semibold text-[var(--text-primary)]">{{ t("request.saveRequest") }}</div>
 
-        <div class="space-y-3">
-          <div>
-            <div class="mb-2 text-sm font-medium text-[var(--text-primary)]">
-              {{ t("request.saveLocation") }}
+        <div data-testid="request-save-modal-body" class="min-h-0 flex-1 overflow-auto">
+          <div class="space-y-3">
+            <div>
+              <div class="mb-2 text-sm font-medium text-[var(--text-primary)]">
+                {{ t("request.saveLocation") }}
+              </div>
             </div>
+            <select
+              v-model="saveCollection"
+              class="h-9 w-full rounded border border-[var(--border)] bg-[var(--bg-secondary)] px-3 text-sm text-[var(--text-primary)] outline-none transition focus:border-[color-mix(in_srgb,var(--accent)_70%,white)]"
+            >
+              <option v-for="option in collectionOptions" :key="option.value || 'root'" :value="option.value">
+                {{ option.label }}
+              </option>
+            </select>
+
+            <input
+              v-model="saveName"
+              class="h-9 w-full rounded border border-[var(--border)] bg-[var(--bg-secondary)] px-3 text-sm text-[var(--text-primary)] outline-none transition focus:border-[color-mix(in_srgb,var(--accent)_70%,white)]"
+              type="text"
+              :placeholder="t('request.requestNameExample')"
+            />
+
+            <PendingRefillNotice :fields="pendingFields" />
           </div>
-          <select
-            v-model="saveCollection"
-            class="h-9 w-full rounded border border-[var(--border)] bg-[var(--bg-secondary)] px-3 text-sm text-[var(--text-primary)] outline-none transition focus:border-[color-mix(in_srgb,var(--accent)_70%,white)]"
-          >
-            <option v-for="option in collectionOptions" :key="option.value || 'root'" :value="option.value">
-              {{ option.label }}
-            </option>
-          </select>
 
-          <input
-            v-model="saveName"
-            class="h-9 w-full rounded border border-[var(--border)] bg-[var(--bg-secondary)] px-3 text-sm text-[var(--text-primary)] outline-none transition focus:border-[color-mix(in_srgb,var(--accent)_70%,white)]"
-            type="text"
-            :placeholder="t('request.requestNameExample')"
-          />
-
-          <PendingRefillNotice :fields="pendingFields" />
+          <div class="mt-3">
+            <InlineError :message="saveError" />
+          </div>
         </div>
 
-        <div class="mt-3">
-          <InlineError :message="saveError" />
-        </div>
-
-        <div class="mt-5 flex justify-end gap-2">
+        <div data-testid="request-save-modal-footer" class="mt-5 flex shrink-0 justify-end gap-2">
           <button
             class="h-8 rounded border border-[var(--border)] px-3 text-sm text-[var(--text-secondary)] transition hover:text-[var(--text-primary)]"
             type="button"
@@ -603,25 +609,31 @@ onUnmounted(() => {
 
     <div
       v-if="showCurlImportDialog"
-      class="absolute inset-0 z-20 flex items-center justify-center bg-black/45 p-4"
+      data-testid="request-curl-modal"
+      class="fixed inset-0 z-30 flex items-center justify-center bg-black/45 p-4"
     >
-      <div class="w-full max-w-2xl rounded-lg border border-[var(--border)] bg-[var(--bg-primary)] p-4 shadow-lg">
+      <div
+        data-testid="request-curl-dialog"
+        class="flex max-h-full w-full max-w-2xl flex-col rounded-lg border border-[var(--border)] bg-[var(--bg-primary)] p-4 shadow-lg"
+      >
         <div class="mb-2 text-lg font-semibold text-[var(--text-primary)]">{{ t("request.importCurlTitle") }}</div>
-        <p class="mb-4 text-sm text-[var(--text-secondary)]">
-          {{ t("request.importCurlDescription") }}
-        </p>
+        <div data-testid="request-curl-modal-body" class="min-h-0 flex-1 overflow-auto">
+          <p class="mb-4 text-sm text-[var(--text-secondary)]">
+            {{ t("request.importCurlDescription") }}
+          </p>
 
-        <textarea
-          v-model="curlInput"
-          class="min-h-56 w-full rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)] p-4 font-mono text-sm text-[var(--text-primary)] outline-none transition focus:border-[color-mix(in_srgb,var(--accent)_70%,white)]"
-          placeholder="curl https://api.example.com/users -H 'Authorization: Bearer token' -d '{&quot;name&quot;:&quot;test&quot;}'"
-        />
+          <textarea
+            v-model="curlInput"
+            class="min-h-56 w-full rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)] p-4 font-mono text-sm text-[var(--text-primary)] outline-none transition focus:border-[color-mix(in_srgb,var(--accent)_70%,white)]"
+            placeholder="curl https://api.example.com/users -H 'Authorization: Bearer token' -d '{&quot;name&quot;:&quot;test&quot;}'"
+          />
 
-        <div v-if="curlError" class="mt-3 text-sm text-rose-300">
-          {{ curlError }}
+          <div v-if="curlError" class="mt-3 text-sm text-rose-300">
+            {{ curlError }}
+          </div>
         </div>
 
-        <div class="mt-5 flex justify-end gap-2">
+        <div data-testid="request-curl-modal-footer" class="mt-5 flex shrink-0 justify-end gap-2">
           <button
             class="h-8 rounded border border-[var(--border)] px-3 text-sm text-[var(--text-secondary)] transition hover:text-[var(--text-primary)]"
             type="button"
