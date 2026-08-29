@@ -607,26 +607,53 @@ describe("D18 boundary table", () => {
 // lets the second inherit the first's warmed-up scanner and reports a figure
 // two to three times better than the truth.
 //
+// PASS SIDE, this implementer's own cold-process readings:
+//
 //   PERF-1  worst of 20 cold processes  2.833 ms vs 1000 ms budget  = 353x
-//   PERF-2  worst of 48 cold processes  1.930 ms vs  200 ms budget  = 104x
-//                            (best 1.147 ms = 174x, at loadavg ~4.6)
+//   PERF-2  worst of 48 cold processes  1.930 ms vs  500 ms budget  = 259x
+//                            (best 1.147 ms = 436x, at loadavg ~4.6)
+//                            (worst ever seen 3.056 ms at loadavg ~8.9 = 163x)
+//   PERF-2  re-checked when the budget moved: 6 cold processes, worst median
+//                            1.328 ms at loadavg ~6 = 376x
 //
-// Failure sides, same protocol: 44,558 ms for the regex this replaced, 45x
-// over PERF-1's budget, and 9,261 ms for resuming the scan at keyStart + 1,
-// 46x over PERF-2's. Healthy and broken are three orders of magnitude apart,
-// so neither budget can be crossed by luck in either direction.
+// PERF-2's budget was 200 ms as first written here and is 500 ms by an owner
+// ruling of 2026-08-29 (TECH 4.3, recorded there as a controlled revision).
+// The reason belongs next to the constant because every margin below depends
+// on it: at 200 ms the worst reading this rung has ever produced -- 3.056 ms,
+// on a box at loadavg ~8.9 -- left 65x, i.e. this file's claim of "two orders
+// of magnitude" held only on a quiet machine. At 500 ms that same worst
+// reading leaves 163x, so the claim is now unconditional.
 //
-// PERF-2's margin is the load-sensitive one: on a box at loadavg ~8.9 its
-// worst cold median rose to 3.056 ms, i.e. 65x. Observed load amplification
-// was 1.7-2.7x, and a false red would need 65x more on top of the worst
-// reading, so the budget holds -- but PERF-2 is the rung to revisit first if
-// this ever flakes, and it is the one whose headroom is nearer 1.5 orders of
-// magnitude than 2.
+// FAIL SIDE, same protocol:
 //
-// The budgets themselves are defined in TECH 4.2/4.3; these constants quote
-// them rather than redefining them.
+//   PERF-1  the backtracking regex this replaced
+//             44,558 ms  = 45x over 1000 ms   (this implementer)
+//             31,388 ms  = 31x over 1000 ms   (implementation review, real
+//                                              module, median)
+//   PERF-2  resuming the scan at keyStart + 1 (K16)
+//              9,261 ms  = 18.5x over 500 ms  (this implementer)
+//              7,845.335 ms = 15.7x over 500 ms  (implementation review, real
+//                          module, raw [7828.614, 7845.335, 7882.600])
+//              8,314.590 ms = 16.6x over 500 ms  (re-run against this 500 ms
+//                          budget, real module, raw [8314.590, 8312.315,
+//                          8340.809], loadavg 4.86 -- the rung did go red, so
+//                          raising the budget did not spend the killer)
+//
+// MEASUREMENT: worst pass-side reading 3.056 ms, lowest fail-side reading
+// 7,845.335 ms -- a factor of ~2,570 between them, and the budget sits inside
+// that gap with 163x of room below it and 15.7x above it.
+// CONCLUSION: at 500 ms neither side can be crossed by load noise (observed
+// amplification on this machine is 1.7-2.7x). PERF-2 is still the rung to
+// revisit first if this ever flakes, and its 15.7x is the smallest number in
+// this block -- raising the budget again spends that, not spare headroom.
+//
+// SINGLE-COPY WARNING (D18 R1 finding I1): the number below also appears in
+// TECH 4.3, and nothing mechanically pins the two together -- specs/ is not in
+// this repository, so no committed test can read it. The constant here is the
+// one the gate actually runs; TECH 4.3 is the one that records why. Changing
+// either without the other is the drift that produced this finding.
 const PERF_1_BUDGET_MS = 1000
-const PERF_2_BUDGET_MS = 200
+const PERF_2_BUDGET_MS = 500
 
 // The value after the final separator in both rung inputs. The expected output
 // is the input truncated to the cut plus the sentinel, and the cut lands right
