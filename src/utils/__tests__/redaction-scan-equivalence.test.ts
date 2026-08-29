@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest"
+import { createHash } from "node:crypto"
 import { loadavg } from "node:os"
 
 import {
@@ -202,6 +203,40 @@ const DEFAULT_DEPTH = 4
 // the spec review).
 const MAX_DEPTH = 6
 
+// Frozen readings of each ordered exhaustive level. They are deliberately
+// literal rather than derived from the generator: the alphabet contains
+// multi-character symbols (`token` and `tok` + `en`), so string uniqueness is
+// not the invariant. The invariant is that every ordered prefix x symbol
+// expansion is present. These digests pin that ordered output without changing
+// the historical corpus counts.
+const EXHAUSTIVE_LEVEL_DIGESTS = [
+  "c41853296501718fa8119db60d0ae03749372c10d85d712a4803eaa2e886dda1",
+  "533f25bc19615481eab75dc385feb143e726979b8ed3918332bbc1f6dc6d2305",
+  "91faf1b60556a439cbf8ea75951bde83380e84d732fd37e472e423ce575a1911",
+  "f84935bbbba8c9162329cfb1e7758996696fb7b305bb61c1674f37558f3f9d4a",
+  "f9f3fc07f5a31b2bc2a6347df654c77edd2a0a17ec2a491b9a2331f777c5f547",
+  "6c6364bd2d9f3c262882a79f03afc270cf39d3e30c4a648fa773dc4f0aac5890",
+] as const
+
+// An independent fixed reading of all 200,000 seeded fuzz strings, in order.
+// It makes degenerations such as `length = 1` or `symbol = 0` observable even
+// when the differential oracle still agrees with the product on their smaller
+// corpus.
+const FUZZ_DIGEST = "7373f076868e1d65d43e1abcf69e264e822f09f060dfe2443ec78c460bc92506"
+
+function orderedStringsDigest(values: readonly string[]): string {
+  const hash = createHash("sha256")
+  for (const value of values) {
+    // Length-prefix each item so adjacent strings cannot be re-partitioned into
+    // the same byte stream and accidentally preserve the digest.
+    hash.update(String(value.length))
+    hash.update(":")
+    hash.update(value)
+    hash.update(";")
+  }
+  return hash.digest("hex")
+}
+
 /**
  * Depth 4 is the committed size (269,952 strings, well under a second). Depth 5
  * is 1,318,528 and is what a reviewer runs by hand:
@@ -248,9 +283,17 @@ const DEPTH = resolveDepth(process.env.D18_SCAN_DEPTH)
  * that cannot say which enumeration produced it is exactly the reading that
  * hid finding I2 for a whole implementation round.
  */
-function buildCorpus(depth: number): { corpus: string[]; levels: number[] } {
+function buildCorpus(depth: number): {
+  corpus: string[]
+  levels: number[]
+  levelDigests: string[]
+  prefixExtensionMismatches: number[]
+  fuzzDigest: string
+} {
   const corpus: string[] = [""]
   const levels: number[] = []
+  const levelDigests: string[] = []
+  const prefixExtensionMismatches: number[] = []
   let frontier: string[] = [""]
 
   for (let d = 1; d <= depth; d += 1) {
@@ -262,7 +305,17 @@ function buildCorpus(depth: number): { corpus: string[]; levels: number[] } {
         corpus.push(s)
       }
     }
+
+    let extensionMismatches = 0
+    for (let index = 0; index < next.length; index += 1) {
+      const prefix = frontier[Math.floor(index / ALPHABET.length)]
+      const symbol = ALPHABET[index % ALPHABET.length]
+      if (next[index] !== prefix + symbol) extensionMismatches += 1
+    }
+
     levels.push(next.length)
+    levelDigests.push(orderedStringsDigest(next))
+    prefixExtensionMismatches.push(extensionMismatches)
     frontier = next
   }
 
@@ -276,10 +329,22 @@ function buildCorpus(depth: number): { corpus: string[]; levels: number[] } {
     corpus.push(s)
   }
 
-  return { corpus, levels }
+  return {
+    corpus,
+    levels,
+    levelDigests,
+    prefixExtensionMismatches,
+    fuzzDigest: orderedStringsDigest(corpus.slice(corpus.length - FUZZ_COUNT)),
+  }
 }
 
-const { corpus: CORPUS, levels: CORPUS_LEVELS } = buildCorpus(DEPTH)
+const {
+  corpus: CORPUS,
+  levels: CORPUS_LEVELS,
+  levelDigests: CORPUS_LEVEL_DIGESTS,
+  prefixExtensionMismatches: CORPUS_PREFIX_EXTENSION_MISMATCHES,
+  fuzzDigest: CORPUS_FUZZ_DIGEST,
+} = buildCorpus(DEPTH)
 const EXHAUSTIVE_COUNT = 1 + CORPUS_LEVELS.reduce((sum, count) => sum + count, 0)
 
 // Make the reading carry its own provenance: whatever "mismatches = 0" means
@@ -506,6 +571,30 @@ const BOUNDARY: BoundaryCase[] = [
 ]
 
 describe("D18 scan equivalence", () => {
+  it.each([
+    [undefined, DEFAULT_DEPTH],
+    ["1", 1],
+    [" 2 ", 2],
+    ["5", 5],
+    [String(MAX_DEPTH), MAX_DEPTH],
+  ] as const)("resolveDepth accepts %j as depth %i", (raw, expected) => {
+    expect(resolveDepth(raw)).toBe(expected)
+  })
+
+  it.each(["", "   ", "not-a-depth", "4.5", "0", "-1", String(MAX_DEPTH + 1)])(
+    "resolveDepth rejects unusable value %j instead of falling back",
+    (raw) => {
+      expect(() => resolveDepth(raw)).toThrowError(
+        `D18_SCAN_DEPTH must be an integer from 1 to ${MAX_DEPTH}; got ${JSON.stringify(raw)}. ` +
+          "Refusing to run: an unusable depth skips the exhaustive corpus and still reports green.",
+      )
+    },
+  )
+
+  it("keeps an explicit depth-5 request at depth 5 instead of the default depth 4", () => {
+    expect(resolveDepth("5")).toBe(5)
+  })
+
   it("the fixtures still contain the code units they were written with", () => {
     // P6: assert the input before asserting the behaviour.
     expect(VT.charCodeAt(0)).toBe(11)
@@ -548,6 +637,38 @@ describe("D18 scan equivalence", () => {
     // add a fixture and this goes red until the quoted numbers are updated.
     if (DEPTH === 4) expect(CORPUS).toHaveLength(269952)
     if (DEPTH === 5) expect(CORPUS).toHaveLength(1318528)
+  })
+
+  it("proves every exhaustive level expands each ordered prefix with every symbol", () => {
+    expect(CORPUS_PREFIX_EXTENSION_MISMATCHES).toEqual(Array(DEPTH).fill(0))
+  })
+
+  it("pins every exhaustive level's ordered output with frozen digests", () => {
+    expect(CORPUS_LEVEL_DIGESTS).toEqual(EXHAUSTIVE_LEVEL_DIGESTS.slice(0, DEPTH))
+  })
+
+  it("pins the deterministic fuzz stream independently of the differential result", () => {
+    expect(CORPUS_FUZZ_DIGEST).toBe(FUZZ_DIGEST)
+  })
+
+  it("does not bypass the opening charCodeAt conversion at offset 34", () => {
+    const openingOffset34 = `${"@".repeat(34)}xtoken=v`
+
+    // A conversion-call bypass returns the index itself. At exactly 34 that
+    // number is the code unit for `"`, so the defect falsely consumes a quote.
+    expect(openingOffset34.indexOf("xtoken")).toBe(34)
+    expect(firstSensitiveCut(openingOffset34)).toEqual({ key: "xtoken", cut: 41 })
+  })
+
+  it("does not bypass the closing charCodeAt conversion at offset 34", () => {
+    const closingOffset34Key = `token${"a".repeat(29)}`
+    const closingOffset34 = `${closingOffset34Key}=v`
+
+    // The 34-code-unit key puts the closing-quote probe on the separator. A
+    // bypass returns 34 and falsely treats that index as a `"` code unit.
+    expect(closingOffset34Key).toHaveLength(34)
+    expect(closingOffset34.charCodeAt(34)).toBe(61)
+    expect(firstSensitiveCut(closingOffset34)).toEqual({ key: closingOffset34Key, cut: 35 })
   })
 
   it("EQ-0a oracle equals the shipped scanner, value for value", () => {
