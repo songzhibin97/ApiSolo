@@ -7,7 +7,8 @@ const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }))
 
 vi.mock("../../utils/invoke", () => ({ invoke: invokeMock }))
 
-const tMock = vi.fn((key: string, _params?: Record<string, unknown>) => key)
+const passthroughT = (key: string, _params?: Record<string, unknown>) => key
+const tMock = vi.fn(passthroughT)
 
 // Partial: the store chain pulls in src/i18n/index.ts, which needs the real
 // createI18n. Only the composable is replaced, so `t` is observable.
@@ -18,6 +19,7 @@ vi.mock("vue-i18n", async (importOriginal) => ({
 
 import HistoryPanel from "../sidebar/HistoryPanel.vue"
 import ConfirmDialog from "../ui/ConfirmDialog.vue"
+import en from "../../i18n/en"
 import { useHistoryStore } from "../../stores/history"
 import { useProjectsStore } from "../../stores/projects"
 import { useTabsStore } from "../../stores/tabs"
@@ -587,6 +589,45 @@ describe("D12 §10 every row still carries all four action entries", () => {
     const wrapper = await mountPanel(three)
 
     expect(rows(wrapper, "history-delete")).toHaveLength(3)
+  })
+})
+
+describe("D16 binary history rows do not expose the Rust body marker", () => {
+  const marker = "[ApiSolo] Binary response not shown as text: image/png"
+
+  it("uses the existing binary response message instead of the stored marker", async () => {
+    tMock.mockImplementation((key, params) =>
+      key === "response.binaryBody" ? en.response.binaryBody : passthroughT(key, params),
+    )
+
+    try {
+      const wrapper = await mountPanel([
+        entry({ responseBody: marker, responseBodyKind: "binary" }),
+      ])
+      const summary = wrapper.get('[data-testid="history-response-summary"]')
+
+      expect(summary.text()).not.toContain("[ApiSolo]")
+      expect(summary.text()).toBe(en.response.binaryBody)
+      expect(tMock).toHaveBeenCalledWith("response.binaryBody")
+    } finally {
+      tMock.mockImplementation(passthroughT)
+    }
+  })
+
+  it.each([
+    ["explicit text", "text"],
+    ["legacy entry", undefined],
+  ] as const)("keeps the existing 80-character summary for an %s", async (_name, bodyKind) => {
+    const wrapper = await mountPanel([
+      entry({
+        responseBody: `  alpha\nbeta ${"x".repeat(100)}`,
+        responseBodyKind: bodyKind,
+      }),
+    ])
+
+    expect(wrapper.get('[data-testid="history-response-summary"]').text()).toBe(
+      `alpha beta ${"x".repeat(69)}`,
+    )
   })
 })
 
