@@ -892,16 +892,6 @@ function expectedRungOutput(input: string): string {
   return input.slice(0, input.length - RUNG_TAIL.length) + REDACTION_SENTINEL
 }
 
-function reportOverBudget(rung: string, median: number, budget: number, raw: number[]): void {
-  throw new Error(
-    `${rung} median ${median.toFixed(3)} ms exceeded ${budget} ms; raw=[${raw
-      .map((n) => n.toFixed(3))
-      .join(", ")}] loadavg=${loadavg()
-      .map((n) => n.toFixed(2))
-      .join("/")}`,
-  )
-}
-
 describe("D18 performance rungs", () => {
   // Both rung inputs append a real sensitive hit to the pathological body on
   // purpose. Without it the correct return is \`null\` and the correct output
@@ -937,9 +927,14 @@ describe("D18 performance rungs", () => {
       expect(redactBodyText("text", tie)).toBe(oracleRedactText(tie))
       expect(expectedRungOutput(tie)).toBe(oracleRedactText(tie))
 
-      if (median >= PERF_1_BUDGET_MS) {
-        reportOverBudget("PERF-1", median, PERF_1_BUDGET_MS, raw)
-      }
+      console.info(
+        `[D18] PERF-1 median=${median.toFixed(3)} ms budget=${PERF_1_BUDGET_MS} ms raw=[${raw
+          .map((n) => n.toFixed(3))
+          .join(", ")}] loadavg=${loadavg()
+          .map((n) => n.toFixed(2))
+          .join("/")}`,
+      )
+      expect(median).toBeLessThan(PERF_1_BUDGET_MS)
     },
   )
 
@@ -961,9 +956,14 @@ describe("D18 performance rungs", () => {
       // affordable on the full input here and is run on it directly.
       expect(output).toBe(oracleRedactText(input))
 
-      if (median >= PERF_2_BUDGET_MS) {
-        reportOverBudget("PERF-2", median, PERF_2_BUDGET_MS, raw)
-      }
+      console.info(
+        `[D18] PERF-2 median=${median.toFixed(3)} ms budget=${PERF_2_BUDGET_MS} ms raw=[${raw
+          .map((n) => n.toFixed(3))
+          .join(", ")}] loadavg=${loadavg()
+          .map((n) => n.toFixed(2))
+          .join("/")}`,
+      )
+      expect(median).toBeLessThan(PERF_2_BUDGET_MS)
     },
   )
 })
