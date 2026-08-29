@@ -11,8 +11,8 @@ export interface KeyValuePair {
    * gate reads this *and* the current value, so a marked row holding a value is
    * inert — do not treat this on its own as "the row is pending".
    *
-   * Two rules for anything that touches it while a request is being edited.
-   * Both have been got wrong at least once:
+   * Three rules for anything that touches it while a request is being edited.
+   * All three have been got wrong at least once:
    *
    *   - It is **stripped** before a row is persisted or written to history. It
    *     is session state, not data.

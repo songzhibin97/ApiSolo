@@ -37,9 +37,8 @@ jobs:
       - name: Rust tests
         run: npm run test:rust
 
-  # Both audits are a known-red baseline (advisories reach us only transitively, via
-  # devDependencies and reqwest/quinn), so they sit in their own job instead of drowning
-  # out the test job's regression signal.
+  # Dependency audits run in their own job so new dependency advisories stay separate
+  # from test and build regression signals.
   audit:
     name: Dependency audit
     runs-on: macos-latest
