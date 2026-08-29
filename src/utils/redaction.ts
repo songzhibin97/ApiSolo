@@ -376,8 +376,14 @@ interface SensitiveCut {
  * The scan regex is built per call on purpose: a `g` regex whose `exec` loop
  * returns early keeps a non-zero `lastIndex`, which would leak scan state
  * between lines and between calls.
+ *
+ * Exported for tests only: the four consumers below each use a different part
+ * of the return value, so `key` is invisible from every export unless the rest
+ * of the line happens to equal the sentinel or the empty string. A differential
+ * test that watched only the exports would therefore compare `cut` and call it
+ * equivalence.
  */
-function firstSensitiveCut(line: string): SensitiveCut | null {
+export function firstSensitiveCut(line: string): SensitiveCut | null {
   const scan = /["']?([A-Za-z0-9_.\-]+)["']?[ \t]*[:=][ \t]*/g
   let match: RegExpExecArray | null
 
