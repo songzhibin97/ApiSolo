@@ -5,6 +5,7 @@ import { useTabsStore } from "../tabs"
 import { historyEntryToRequest } from "../../utils/history-to-request"
 import { identityTuple, pendingRefillFields } from "../../utils/pending-refill"
 import { REDACTION_SENTINEL, sanitizeHistoryEntry } from "../../utils/redaction"
+import { buildSavedRequest } from "../../utils/saved-request"
 import { buildUrlWithParams } from "../../utils/url-params"
 import type { HistoryEntry, KeyValuePair, SavedRequest, Tab } from "../../types"
 
@@ -1006,6 +1007,7 @@ describe("D17 openSavedRequest applies the import contract to every pair face", 
 
     store.openSavedRequest("Project", "legacy.request.json", request)
 
+    expect(store.activeTab.url).not.toContain(REDACTION_SENTINEL)
     expect(store.activeTab.params.map(({ key, value, redacted }) => [key, value, redacted])).toEqual([
       ["page", "1", undefined],
       ["apikey", "", true],
@@ -1028,5 +1030,8 @@ describe("D17 openSavedRequest applies the import contract to every pair face", 
       ["refill", "query", null, "apikey"],
       ["refill", "form", null, "token"],
     ])
+
+    const savedAgain = buildSavedRequest(store.activeTab, "Saved again")
+    expect(savedAgain.url).not.toContain(REDACTION_SENTINEL)
   })
 })

@@ -358,13 +358,16 @@ export const useTabsStore = defineStore("tabs", () => {
       return;
     }
 
+    const params = mergeHistoryQueryRows(createEditablePairs(request.params), request.url)
+    const url = clearUrlSentinels(request.url)
+
     const tab: Tab = {
       ...createSnapshotTab({
         label: request.name,
         method: request.method as HttpMethod,
-        url: request.url,
+        url,
       }),
-      params: mergeHistoryQueryRows(createEditablePairs(request.params), request.url),
+      params,
       headers: clearSentinelPairs(createEditablePairs(request.headers)),
       body: {
         type: request.body.type,

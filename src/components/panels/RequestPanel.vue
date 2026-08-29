@@ -295,10 +295,10 @@ function applyCurlImport() {
 
   try {
     const parsed = parseCurl(curlInput.value);
-    const { params } = syncParamsFromUrl(parsed.url, []);
+    const { url, params } = syncParamsFromUrl(parsed.url, []);
     tabsStore.updateTab(activeTab.value.id, {
       method: parsed.method,
-      url: parsed.url,
+      url,
       params: clearSentinelPairs(params),
       headers: clearSentinelPairs(parsed.headers),
       body: {
@@ -317,10 +317,10 @@ function applyCurlImport() {
 function applyPastedCurl(curlText: string) {
   try {
     const parsed = parseCurl(curlText);
-    const { params } = syncParamsFromUrl(parsed.url, []);
+    const { url, params } = syncParamsFromUrl(parsed.url, []);
     tabsStore.updateTab(activeTab.value.id, {
       method: parsed.method,
-      url: parsed.url,
+      url,
       params: clearSentinelPairs(params),
       headers: clearSentinelPairs(parsed.headers),
       body: {
