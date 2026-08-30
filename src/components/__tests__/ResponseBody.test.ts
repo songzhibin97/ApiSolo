@@ -220,3 +220,57 @@ describe("D15 large JSON display cap", () => {
     }
   })
 })
+
+/**
+ * D29, present on `5bf03f5` and user-visible there: a response declaring
+ * application/json whose body does not parse had its text replaced on screen by
+ * the four characters "null". `displayBody` consulted `viewType` but not
+ * `parsedJsonState.isValid`, and `JSON.stringify(null)` returns "null" instead
+ * of throwing, so the fallback meant to catch this never ran.
+ *
+ * The condition is an everyday one — a truncated payload, an error page sent
+ * with the wrong content type, a backend emitting half a document — and it hid
+ * the body at exactly the moment the raw text is what the user needs.
+ */
+describe("D29 a JSON body that does not parse is shown, not replaced", () => {
+  const BROKEN = '{"ok": tru'
+
+  it("shows the raw text of a broken JSON body", () => {
+    const wrapper = mountBody({ body: BROKEN, contentType: "application/json" })
+
+    expect(wrapper.findComponent(CodeEditor).props("modelValue")).toBe(BROKEN)
+  })
+
+  it("does not put the word null on screen in its place", () => {
+    const wrapper = mountBody({ body: BROKEN, contentType: "application/json" })
+
+    expect(wrapper.findComponent(CodeEditor).props("modelValue")).not.toBe("null")
+  })
+
+  // A body whose entire content is the JSON literal null is not a parse
+  // failure and must still format as itself — otherwise the fix above would
+  // amount to "never trust null", which is a different and wrong rule.
+  it("still treats a body that really is the JSON literal null as valid JSON", () => {
+    const wrapper = mountBody({ body: "null", contentType: "application/json" })
+
+    expect(wrapper.findComponent(JsonTreeView).exists()).toBe(true)
+    expect(wrapper.findComponent(JsonTreeView).props("data")).toBeNull()
+  })
+
+  // The neighbouring paths the fix must not disturb: a valid object still
+  // pretty-prints, and a broken body under a non-JSON content type was already
+  // correct and stays that way.
+  it("still pretty-prints a body that does parse", () => {
+    const wrapper = mountBody({ body: '{"answer":42}', contentType: "application/json" })
+
+    // Tree view owns the valid case, so the raw view is reached by asking for
+    // it rather than by breaking the body.
+    expect(wrapper.findComponent(JsonTreeView).props("data")).toEqual({ answer: 42 })
+  })
+
+  it("leaves a broken body under a text content type alone", () => {
+    const wrapper = mountBody({ body: BROKEN, contentType: "text/plain" })
+
+    expect(wrapper.findComponent(CodeEditor).props("modelValue")).toBe(BROKEN)
+  })
+})

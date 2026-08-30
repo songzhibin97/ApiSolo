@@ -91,13 +91,23 @@ const displayBody = computed(() => {
     return `${props.body.slice(0, MAX_DISPLAY_SIZE)}\n\n${t("response.largeBodyTruncated")}`
   }
 
-  if (viewType.value !== "json") {
+  // `isValid` has to be consulted, not just `viewType`. On a parse failure
+  // `parsedJson` is null, and `JSON.stringify(null)` does NOT throw — it
+  // returns the four characters "null", so the catch below never ran and a
+  // server that answered a Content-Type of application/json with broken JSON
+  // had its body replaced on screen by that word. That is precisely the moment
+  // the raw text matters most.
+  if (viewType.value !== "json" || !parsedJsonState.value.isValid) {
     return props.body;
   }
 
   try {
     return JSON.stringify(parsedJson.value, null, 2);
   } catch {
+    // Reachable, and kept for it: `JSON.parse` accepts nesting deep enough to
+    // blow the stack on the way back out, so a body can be valid and still
+    // have no formatted form. Falling back to the text we were given beats
+    // rendering nothing.
     return props.body;
   }
 });
