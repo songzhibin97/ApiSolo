@@ -4,6 +4,7 @@ import {
   countCodePoints,
   responseFileExtension,
   responseFileName,
+  responseMediaType,
 } from "../response/body-actions"
 
 describe("countCodePoints", () => {
@@ -102,6 +103,37 @@ describe("responseFileExtension", () => {
 
   it("reads the content type without regard to case", () => {
     expect(responseFileExtension("APPLICATION/JSON")).toBe("json")
+  })
+
+  /**
+   * A parameter is not the type. `charset=json` and `profile=json` say nothing
+   * about what the body is, and the file name is a claim about what the file
+   * contains — naming a plain text response `.json` because of a parameter is
+   * the interface stating something the server never said.
+   *
+   * The pair matters more than either row: the same token has to be honoured
+   * where the server put it and ignored where it did not, or the fix is just
+   * "stop recognising json".
+   */
+  it.each([
+    ["text/plain; charset=json", "txt"],
+    ["text/html; profile=json", "html"],
+    ["application/octet-stream; name=report.csv", "txt"],
+    ["text/plain;charset=utf-8", "txt"],
+    ["  application/json  ; charset=utf-8", "json"],
+  ])("takes %s as .%s, reading the media type and not its parameters", (contentType, expected) => {
+    expect(responseFileExtension(contentType)).toBe(expected)
+  })
+})
+
+describe("responseMediaType", () => {
+  it.each([
+    ["application/json", "application/json"],
+    ["application/json; charset=utf-8", "application/json"],
+    ["TEXT/HTML ;profile=json", "text/html"],
+    ["", ""],
+  ])("reads %o as %o", (contentType, expected) => {
+    expect(responseMediaType(contentType)).toBe(expected)
   })
 })
 

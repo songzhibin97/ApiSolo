@@ -187,6 +187,41 @@ describe("D09 §12-§15 the network truncation notice", () => {
   })
 })
 
+/**
+ * The same reading mistake the download extension made, in the other place
+ * that classifies a response: a `Content-Type` parameter is not the type. The
+ * view is chosen from the media type alone, so a parameter that happens to
+ * spell `application/json` cannot get a plain text body parsed, pretty-printed
+ * and offered as a tree on the strength of a word the server put somewhere
+ * else.
+ */
+describe("D32 the view is chosen by the media type, not by the parameters", () => {
+  const OBJECT = "{\"a\":1}"
+
+  it("leaves a text body alone when a parameter spells a json media type", () => {
+    const wrapper = mountBody({
+      body: OBJECT,
+      contentType: "text/plain; profile=application/json",
+    })
+
+    expect(wrapper.findComponent(JsonTreeView).exists()).toBe(false)
+    expect(wrapper.findComponent(CodeEditor).props("modelValue")).toBe(OBJECT)
+    expect(wrapper.findComponent(CodeEditor).props("language")).toBe("text")
+  })
+
+  // The other half, and the one that stops the fix from being "stop
+  // recognising json": the same token, where the server actually put it, still
+  // decides the view.
+  it("still reads the media type through its own charset parameter", () => {
+    const wrapper = mountBody({
+      body: OBJECT,
+      contentType: "application/json; charset=utf-8",
+    })
+
+    expect(wrapper.findComponent(JsonTreeView).exists()).toBe(true)
+  })
+})
+
 describe("D15 large JSON display cap", () => {
   it("does not parse a complete JSON body once the display cap applies", () => {
     const body = JSON.stringify({ payload: "x".repeat(500_000) })

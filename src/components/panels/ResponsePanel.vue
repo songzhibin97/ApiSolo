@@ -34,6 +34,47 @@ watch(
   },
 );
 
+/**
+ * Names the response on screen so `:key` can hold it. The name is derived from
+ * the response object itself and from nothing inside it.
+ *
+ * That distinction is the whole point. The body view carries state that is
+ * about one particular response — which copy attempt is in flight, what the
+ * copy button is currently saying, which of tree or raw the user picked — and
+ * all of it has to be gone the moment a different response is shown. Judging
+ * "different" by comparing bodies and content types answers a different
+ * question: two tabs can hold byte-identical responses, and a comparison of
+ * their contents says "same" while the fact is "another one". A copy that
+ * failed on the first tab then wrote "Copy failed" onto the second, over a
+ * response nobody had tried to copy.
+ *
+ * The store never edits a response in place — `tab.response` is replaced whole
+ * on every send and on every history restore — so the object reference is the
+ * identity, and this map only gives that reference a stable name. Nothing here
+ * has to be kept in sync with anything, because nothing is being tracked.
+ */
+const responseNames = new WeakMap<object, number>();
+let lastResponseName = 0;
+
+const responseKey = computed(() => {
+  const current = response.value;
+
+  if (!current) {
+    return 0;
+  }
+
+  const known = responseNames.get(current);
+
+  if (known !== undefined) {
+    return known;
+  }
+
+  lastResponseName += 1;
+  responseNames.set(current, lastResponseName);
+
+  return lastResponseName;
+});
+
 const statusClass = computed(() => {
   const code = response.value?.status ?? 0;
 
@@ -151,7 +192,17 @@ function formatBytes(size: number) {
         </div>
       </div>
 
-      <div class="min-h-0 flex-1 overflow-hidden bg-[var(--bg-primary)] p-4">
+      <!--
+        Keyed on which response this is, so Vue builds these views afresh for a
+        new response instead of handing the existing ones different props.
+        Every piece of per-response state inside them then starts from nothing
+        without anyone having to remember to clear it: the body view's copy
+        state and view choice, the header view's filter keyword, and whatever a
+        later view keeps. The key sits on the container rather than on each
+        child on purpose — a list of which children need it is a list someone
+        has to remember to add to.
+      -->
+      <div :key="responseKey" class="min-h-0 flex-1 overflow-hidden bg-[var(--bg-primary)] p-4">
         <ResponseBody
           v-if="activeSection === 'body'"
           :body="response.body"

@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref, watch } from "vue";
+import { computed, onUnmounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 
 import CodeEditor from "../editor/CodeEditor.vue";
 import JsonTreeView from "./JsonTreeView.vue";
-import { countCodePoints, responseFileName } from "./body-actions";
+import { countCodePoints, responseFileName, responseMediaType } from "./body-actions";
 import { MAX_RESPONSE_WIRE_BYTES, formatBytesAsMib } from "../../utils/limits";
 import type { ResponseBodyKind, ResponseBodySource } from "../../types";
 
@@ -29,7 +29,6 @@ const props = defineProps<{
 const networkCapLabel = formatBytesAsMib(MAX_RESPONSE_WIRE_BYTES);
 
 const { t } = useI18n();
-const activeMode = ref<"tree" | "raw">("raw");
 const copyState = ref<"idle" | "copied" | "failed">("idle");
 const MAX_DISPLAY_SIZE = 500_000
 
@@ -50,7 +49,10 @@ const isBinary = computed(() => props.bodyKind === "binary");
  */
 const isNetworkTruncated = computed(() => props.bodyTruncated === true);
 
-const normalizedContentType = computed(() => props.contentType.toLowerCase());
+// Media type only. Deciding the view from the whole header would let
+// `text/plain; profile=application/json` be rendered as JSON on the strength
+// of a parameter, which is the same mistake the download extension made.
+const normalizedContentType = computed(() => responseMediaType(props.contentType));
 const isTruncated = computed(() => props.body.length > MAX_DISPLAY_SIZE)
 const hasBody = computed(() => props.body.length > 0);
 
@@ -97,6 +99,14 @@ const parsedJson = computed(() => parsedJsonState.value.value);
 const canUseTreeView = computed(
   () => parsedJsonState.value.isValid && !isTruncated.value && !isBinary.value,
 );
+
+/**
+ * Chosen once, when this instance is created, and after that it belongs to the
+ * user. There is no watcher putting it back, because there is nothing for one
+ * to catch: the panel keys this component on the response's identity, so a
+ * different response is a different instance that runs this line again.
+ */
+const activeMode = ref<"tree" | "raw">(canUseTreeView.value ? "tree" : "raw");
 
 const displayBody = computed(() => {
   if (isTruncated.value) {
@@ -273,17 +283,13 @@ function downloadBody() {
   URL.revokeObjectURL(url);
 }
 
-watch(
-  () => [canUseTreeView.value, props.body, props.contentType],
-  ([value]) => {
-    activeMode.value = value ? "tree" : "raw";
-    // "Copied" is a statement about the body that was copied, and the
-    // clipboard still holds that one.
-    clearCopyState();
-  },
-  { immediate: true },
-);
-
+/**
+ * The other half of "only the newest attempt may speak", and the reason this
+ * component keeps no reset watcher: when the panel swaps in a different
+ * response this instance is destroyed, and advancing the counter on the way
+ * out is what stops a write still in flight from reporting on a body nobody is
+ * looking at any more. It also drops the pending timeout.
+ */
 onUnmounted(() => {
   clearCopyState();
 });

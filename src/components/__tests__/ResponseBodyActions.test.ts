@@ -188,71 +188,22 @@ describe("D32 the response body action bar", () => {
 
   /**
    * The copy state says something about one particular attempt, so only the
-   * newest attempt may write it. The four ways a stale write can arrive are
-   * separated below because they are four distinct orderings, and the earlier
-   * shape of this code — a counter advanced per response — covered only the
-   * first three: two copies of the same body shared one value, so the first
-   * attempt's late answer was still accepted as current.
+   * newest attempt may write it. Two of the ways a stale write can arrive live
+   * here; the other three are about a *different response* arriving, and those
+   * are in `ResponseBodyIdentity.test.ts` because that is a thing the panel
+   * does, not a thing that happens to a mounted body view. Driving them with
+   * `setProps` here would have been asserting against an arrangement
+   * production does not have — and it hid the failure that produced this file:
+   * two tabs whose bodies were identical never changed any prop, so nothing
+   * was reset and the first tab's "Copy failed" appeared on the second.
+   *
+   * What remains below needs no response change at all, and is what the
+   * earlier shape of this code — a counter advanced per response — could not
+   * cover: two copies of one body shared one value, so the first attempt's
+   * late answer was still accepted as current.
    */
   describe("only the newest copy attempt may speak", () => {
-    // Path 1: the response is replaced while "Copied" is on screen. The word
-    // is about a body the panel is no longer showing.
-    it("stops saying Copied once a different response arrives", async () => {
-      const wrapper = mountBody({ body: "first body", contentType: "text/plain" })
-
-      await wrapper.find(COPY).trigger("click")
-      await settle(wrapper)
-      expect(wrapper.find(COPY).text()).toBe(en.response.copied)
-
-      await wrapper.setProps({ body: "second body" })
-
-      expect(wrapper.find(COPY).text()).toBe(en.response.copyBody)
-    })
-
-    // Path 2: clearing the state on change does not cover this on its own — a
-    // write already in flight resolves afterwards and would put the word back
-    // over the new response.
-    it("does not say Copied when the write lands after the response changed", async () => {
-      let release: () => void = () => {}
-      const pending = new Promise<void>((resolve) => {
-        release = resolve
-      })
-      installClipboardSequence([() => pending])
-
-      const wrapper = mountBody({ body: "first body", contentType: "text/plain" })
-
-      await wrapper.find(COPY).trigger("click")
-      await wrapper.setProps({ body: "second body" })
-
-      release()
-      await pending
-      await settle(wrapper)
-
-      expect(wrapper.find(COPY).text()).toBe(en.response.copyBody)
-    })
-
-    // Path 3: same ordering, other branch. A rejection landing late must not
-    // stamp "Copy failed" onto a response whose copy was never attempted.
-    it("does not say Copy failed when the rejection lands after the change", async () => {
-      let reject: () => void = () => {}
-      const pending = new Promise<void>((_resolve, rejectFn) => {
-        reject = () => rejectFn(new Error("denied"))
-      })
-      installClipboardSequence([() => pending])
-
-      const wrapper = mountBody({ body: "first body", contentType: "text/plain" })
-
-      await wrapper.find(COPY).trigger("click")
-      await wrapper.setProps({ body: "second body" })
-
-      reject()
-      await pending.catch(() => {})
-      await settle(wrapper)
-
-      expect(wrapper.find(COPY).text()).toBe(en.response.copyBody)
-    })
-
-    // Path 4: no response change at all — two copies of the same body. The
+    // No response change at all — two copies of the same body. The
     // clipboard holds that body, so reporting a failure here would tell the
     // user to try again over a clipboard that already has what they wanted.
     it("keeps the newest attempt's success when an earlier one is rejected late", async () => {
@@ -297,6 +248,102 @@ describe("D32 the response body action bar", () => {
       await settle(wrapper)
 
       expect(wrapper.find(COPY).text()).toBe(en.response.copyFailed)
+    })
+  })
+
+  /**
+   * How long the word stays up, which is a separate question from which
+   * attempt is allowed to write it. The attempt counter decides *who* speaks;
+   * the timeout decides *until when*, and it has its own way of belonging to
+   * the wrong attempt: the countdown started by an earlier flash is still
+   * running, and if it is not cancelled it clears the newest word early — at
+   * the moment the old attempt's window closes, not the new one's.
+   *
+   * The tests above never reach this. They check the order the answers arrive
+   * in and finish while the word is still up; nothing in them advances the
+   * clock at all, so the cancellation could be deleted and every one of them
+   * would stay green.
+   */
+  describe("the countdown belongs to the word on screen", () => {
+    beforeEach(() => {
+      vi.useFakeTimers()
+    })
+
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    /**
+     * Fixture self-check before the behaviour (P6): the whole test rests on
+     * 1600ms being the point at which a single flash clears itself. If the
+     * duration ever changes, this row fails first and says so, instead of the
+     * assertions below quietly measuring the wrong instant.
+     */
+    it("clears a single flash after 1600ms and not before", async () => {
+      const wrapper = mountBody({ body: "hello", contentType: "text/plain" })
+
+      await wrapper.find(COPY).trigger("click")
+      await settle(wrapper)
+      expect(wrapper.find(COPY).text()).toBe(en.response.copied)
+
+      await vi.advanceTimersByTimeAsync(1599)
+      expect(wrapper.find(COPY).text()).toBe(en.response.copied)
+
+      await vi.advanceTimersByTimeAsync(1)
+      await wrapper.vm.$nextTick()
+      expect(wrapper.find(COPY).text()).toBe(en.response.copyBody)
+    })
+
+    // The failure this guards against, in the order it happens: copy, wait
+    // most of the way through the countdown, copy again and have it fail. The
+    // user is now reading "Copy failed" — and 600ms later the first copy's
+    // countdown comes due. If it is allowed to fire, the message about the
+    // attempt they are waiting on disappears while it is still true.
+    it("does not let an earlier flash's countdown clear a newer word", async () => {
+      installClipboardSequence([
+        () => Promise.resolve(),
+        () => Promise.reject(new Error("denied")),
+      ])
+      const wrapper = mountBody({ body: "hello", contentType: "text/plain" })
+
+      await wrapper.find(COPY).trigger("click")
+      await settle(wrapper)
+      expect(wrapper.find(COPY).text()).toBe(en.response.copied)
+
+      await vi.advanceTimersByTimeAsync(1000)
+      await wrapper.find(COPY).trigger("click")
+      await settle(wrapper)
+      expect(wrapper.find(COPY).text()).toBe(en.response.copyFailed)
+
+      // 1600ms after the first flash, 600ms into the second.
+      await vi.advanceTimersByTimeAsync(600)
+      await wrapper.vm.$nextTick()
+
+      expect(wrapper.find(COPY).text()).toBe(en.response.copyFailed)
+    })
+
+    // And the newer word does go away on its own schedule — otherwise the row
+    // above would also pass on an implementation that simply never clears.
+    it("clears the newer word 1600ms after the newer word appeared", async () => {
+      installClipboardSequence([
+        () => Promise.resolve(),
+        () => Promise.reject(new Error("denied")),
+      ])
+      const wrapper = mountBody({ body: "hello", contentType: "text/plain" })
+
+      await wrapper.find(COPY).trigger("click")
+      await settle(wrapper)
+
+      await vi.advanceTimersByTimeAsync(1000)
+      await wrapper.find(COPY).trigger("click")
+      await settle(wrapper)
+
+      await vi.advanceTimersByTimeAsync(1599)
+      expect(wrapper.find(COPY).text()).toBe(en.response.copyFailed)
+
+      await vi.advanceTimersByTimeAsync(1)
+      await wrapper.vm.$nextTick()
+      expect(wrapper.find(COPY).text()).toBe(en.response.copyBody)
     })
   })
 

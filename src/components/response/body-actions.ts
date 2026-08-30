@@ -8,9 +8,26 @@
  */
 
 /**
+ * The media type alone: everything before the first `;`, trimmed and
+ * lowercased.
+ *
+ * Every decision about *what kind of thing* a response is has to read this
+ * rather than the header. A `Content-Type` carries parameters, and a parameter
+ * is free to spell a type name it has nothing to do with —
+ * `text/plain; charset=json` and `text/html; profile=json` are a text and an
+ * HTML body. Matching against the whole header lets that parameter outrank
+ * what the server actually said, so the file is named `.json` and the view is
+ * chosen for a type nobody claimed.
+ */
+export function responseMediaType(contentType: string) {
+  return contentType.split(";")[0].trim().toLowerCase()
+}
+
+/**
  * Ordered, so `application/xhtml+xml` lands on `html` rather than `xml`, and
  * `application/vnd.api+json` on `json`. Matched as substrings because real
- * content types arrive with suffixes and charsets attached.
+ * media types arrive with vendor trees and `+suffix` forms attached — but only
+ * ever against the media type, never against the parameters after it.
  */
 const EXTENSIONS: ReadonlyArray<readonly [string, string]> = [
   ["json", "json"],
@@ -21,7 +38,7 @@ const EXTENSIONS: ReadonlyArray<readonly [string, string]> = [
 ]
 
 export function responseFileExtension(contentType: string) {
-  const type = contentType.toLowerCase()
+  const type = responseMediaType(contentType)
 
   return EXTENSIONS.find(([token]) => type.includes(token))?.[1] ?? "txt"
 }
