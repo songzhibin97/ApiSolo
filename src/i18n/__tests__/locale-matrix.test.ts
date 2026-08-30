@@ -137,6 +137,38 @@ const MATRIX: Record<string, { "zh-CN": string; en: string }> = {
     "zh-CN": "「{name}」有 {size}，超过单个文件上限 {limit}，没有添加。",
     en: "\"{name}\" is {size}, over the {limit} per-file limit. It was not added.",
   },
+  "response.copyBody": {
+    "zh-CN": "复制",
+    en: "Copy",
+  },
+  "response.copyFailed": {
+    "zh-CN": "复制失败",
+    en: "Copy failed",
+  },
+  "response.downloadBody": {
+    "zh-CN": "下载",
+    en: "Download",
+  },
+  "response.bodyScopeFull": {
+    "zh-CN": "复制与下载给出完整正文（{count} 个字符）；上面的视图可能已格式化或已截断。",
+    en: "Copy and download give the complete body ({count} characters); the view above may be formatted or cut short.",
+  },
+  "response.bodyScopeReceived": {
+    "zh-CN": "复制与下载给出已接收的正文（{count} 个字符）；其余部分从未从网络读到。",
+    en: "Copy and download give the part of the body that was received ({count} characters); the rest was never read from the network.",
+  },
+  "response.bodyScopeStored": {
+    "zh-CN": "复制与下载给出 ApiSolo 手里的这份正文（{count} 个字符）。ApiSolo 无法确认它就是完整响应：只有直接从网络读到的正文才能被担保，而历史在保存时会把过长的正文截短。",
+    en: "Copy and download give this body as ApiSolo holds it ({count} characters). ApiSolo cannot confirm it is the whole response: only a body read straight off the network can be vouched for, and history shortens long bodies when it saves them.",
+  },
+  "response.bodyScopeEmpty": {
+    "zh-CN": "响应体为空，没有可复制或下载的内容。",
+    en: "The response body is empty — there is nothing to copy or download.",
+  },
+  "response.binaryNoActions": {
+    "zh-CN": "字节在到达界面之前已被这条说明替换，因此这里没有可复制或下载的内容。",
+    en: "The bytes were replaced with this note before they reached the interface, so there is nothing here to copy or download.",
+  },
 }
 
 const i18n = createI18n({

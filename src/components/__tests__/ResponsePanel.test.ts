@@ -11,11 +11,11 @@ vi.mock("vue-i18n", async (importOriginal) => ({
 import ResponsePanel from "../panels/ResponsePanel.vue"
 import ResponseBody from "../response/ResponseBody.vue"
 import { useTabsStore } from "../../stores/tabs"
-import type { HistoryEntry, HttpResponse } from "../../types"
+import type { HistoryEntry, TabResponse } from "../../types"
 
 let pinia: ReturnType<typeof createPinia>
 
-function buildResponse(overrides: Partial<HttpResponse> = {}): HttpResponse {
+function buildResponse(overrides: Partial<TabResponse> = {}): TabResponse {
   return {
     status: 200,
     statusText: "OK",
@@ -27,6 +27,7 @@ function buildResponse(overrides: Partial<HttpResponse> = {}): HttpResponse {
     contentType: "application/json",
     bodyKind: "text",
     bodyTruncated: false,
+    bodySource: "network",
     ...overrides,
   }
 }
@@ -88,5 +89,35 @@ describe("the response panel hands the body view what it needs", () => {
 
     expect(tabs.activeTab.response?.bodyKind).toBe("binary")
     expect(mountPanel().findComponent(ResponseBody).props("bodyKind")).toBe("binary")
+  })
+
+  // The panel may only call a body complete when it knows the body came
+  // straight off the wire. That fact exists nowhere in the response itself --
+  // history's own storage cut leaves no flag -- so it has to be read off the
+  // boundary and carried down, or the claim is made on a body nobody vouched
+  // for.
+  it("tells the body view a live response came off the network", () => {
+    const tabs = useTabsStore()
+    tabs.updateTab(tabs.activeTab.id, { response: buildResponse() })
+
+    expect(mountPanel().findComponent(ResponseBody).props("bodySource")).toBe("network")
+  })
+
+  it("tells the body view a replayed response came out of history", () => {
+    const tabs = useTabsStore()
+    tabs.openHistoryEntry({
+      id: "h-2",
+      method: "GET",
+      url: "https://api.example.com/users",
+      status: 200,
+      time: 12,
+      size: 30,
+      timestamp: "2026-03-27T10:00:00Z",
+      contentType: "application/json",
+      responseBody: "{\"ok\":true}",
+    } as HistoryEntry)
+
+    expect(tabs.activeTab.response?.bodySource).toBe("history")
+    expect(mountPanel().findComponent(ResponseBody).props("bodySource")).toBe("history")
   })
 })
