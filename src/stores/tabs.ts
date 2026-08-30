@@ -457,6 +457,13 @@ export const useTabsStore = defineStore("tabs", () => {
         // Same reasoning: rows from before the network cap were read in full.
         // Carried from the stored flag, never inferred from the body length.
         bodyTruncated: entry.responseBodyTruncated ?? false,
+        // The fact the panel needs and could not otherwise recover: this body
+        // is a stored snapshot. `buildHistoryEntry` cuts long bodies on the way
+        // to disk, and that cut leaves no flag of its own — it is not
+        // `bodyTruncated`, which only ever means the bytes never arrived. Read
+        // off the boundary rather than sniffed out of the text later, for the
+        // same reason `bodyKind` is: the marker is not evidence.
+        bodySource: "history",
       }
     }
 

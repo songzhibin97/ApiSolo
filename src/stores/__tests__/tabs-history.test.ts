@@ -124,6 +124,11 @@ describe("useTabsStore.openHistoryEntry", () => {
       },
       bodyKind: "text",
       bodyTruncated: false,
+      // Read off this boundary and nowhere else. `buildHistoryEntry` shortens
+      // long bodies on the way to disk without recording that it did, so the
+      // fact that a body came out of history is the only thing standing
+      // between the panel and a completeness claim it cannot support.
+      bodySource: "history",
     })
   })
 

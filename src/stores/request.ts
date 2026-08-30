@@ -166,7 +166,10 @@ export const useRequestStore = defineStore("request", () => {
       }
 
       tabsStore.updateTab(requestSnapshot.id, {
-        response: result,
+        // This one came straight off the wire, so it is the only path allowed
+        // to claim completeness. The storage cut below applies to what history
+        // keeps, never to what this tab is holding right now.
+        response: { ...result, bodySource: "network" },
         responseError: null,
         scriptResult: testResult,
         isLoading: false,

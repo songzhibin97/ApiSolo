@@ -143,7 +143,7 @@ export interface Tab {
   testScript: string
   projectName: string | null
   savedRequestPath: string | null
-  response?: HttpResponse | null
+  response?: TabResponse | null
   responseError?: string | null
   scriptResult?: ScriptResult | null
   isLoading?: boolean
@@ -210,6 +210,28 @@ export interface HttpResponse {
    * and an optional here would invite the `!== undefined` bug again.
    */
   bodyTruncated: boolean
+}
+
+/**
+ * Where the body a tab is showing came from. Deliberately NOT part of
+ * `HttpResponse`: Rust never sends it, and a wire type that describes
+ * something the wire does not carry is how the `fileContent` bug happened.
+ *
+ * `"history"` does not mean "old". It means ApiSolo cannot vouch for the
+ * body's completeness, because `buildHistoryEntry` shortens long bodies on
+ * the way to disk — a cut that is a separate fact from `bodyTruncated`, which
+ * only ever says the bytes never arrived off the network.
+ */
+export type ResponseBodySource = "network" | "history"
+
+/**
+ * What a tab holds: the wire response plus what the frontend knows about its
+ * origin. `bodySource` is required rather than optional so a future producer
+ * that forgets to say where a body came from fails to compile, instead of
+ * silently inheriting the strongest claim the panel can make about it.
+ */
+export interface TabResponse extends HttpResponse {
+  bodySource: ResponseBodySource
 }
 
 export interface HistoryEntry {

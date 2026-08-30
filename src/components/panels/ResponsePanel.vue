@@ -158,6 +158,7 @@ function formatBytes(size: number) {
           :content-type="response.contentType"
           :body-kind="response.bodyKind"
           :body-truncated="response.bodyTruncated"
+          :body-source="response.bodySource"
         />
         <ResponseHeaders v-else-if="activeSection === 'headers'" :headers="response.headers" />
         <ResponseCookies v-else-if="activeSection === 'cookies'" :headers="response.headers" />

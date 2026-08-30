@@ -247,6 +247,36 @@ describe("useRequestStore", () => {
     expect(tabsStore.activeTab.isLoading).toBe(false)
   })
 
+  // The one path allowed to say a body is complete. The panel refuses that
+  // claim for anything not labelled here, so mislabelling this send would
+  // silently demote every live response to "cannot confirm" -- visible on
+  // every request, and caught by nothing until this test existed.
+  it("labels a response that came straight off the wire as network-sourced", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "send_request") {
+        return buildResponse({ body: "{\"ok\":true}" })
+      }
+
+      if (command === "append_history" || command === "list_environments") {
+        return command === "list_environments" ? [] : null
+      }
+
+      throw new Error(`Unexpected invoke: ${command}`)
+    })
+
+    const tabsStore = useTabsStore()
+    const requestStore = useRequestStore()
+
+    tabsStore.updateTab(tabsStore.activeTab.id, {
+      method: "GET",
+      url: "https://api.example.com/users",
+    })
+
+    await requestStore.sendRequest(tabsStore.activeTab)
+
+    expect(tabsStore.activeTab.response?.bodySource).toBe("network")
+  })
+
   it("shows request errors when JSON formatting changes while the request is in flight", async () => {
     const deferred = createDeferred<HttpResponse>()
 
