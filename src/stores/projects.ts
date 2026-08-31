@@ -19,6 +19,11 @@ export const useProjectsStore = defineStore("projects", () => {
   // makes by assigning the ref. A `persist()` call next to each assignment
   // would be a list to keep in sync, and the next writer is the one that
   // forgets; watching the ref means there is nothing to remember.
+  //
+  // Deriving the write from the ref also splices its failures into whatever
+  // performed the assignment — with `flush: "sync"` this callback runs *inside*
+  // `activeProject.value = x`. That is why `persistActiveProject` may not
+  // throw: see the note on it.
   watch(activeProject, persistActiveProject, { flush: "sync" })
 
   async function loadProjects() {
@@ -301,23 +306,55 @@ function activeProjectStorage(): Storage | null {
   return window.localStorage ?? null
 }
 
+// Both sides are best-effort, and the `try` covers the accessor too: reaching
+// for `window.localStorage` is itself a throwing operation under a restrictive
+// storage policy, as are `getItem` and `setItem` once a quota is reached.
+//
+// Neither one may throw, because neither one runs on its own behalf. The write
+// runs inside `activeProject.value = x` (sync watcher), so an escaping error
+// aborts the assigning caller — in `setActiveProject` that is the line before
+// `await loadCollectionTree()`, leaving the ref naming the new project while
+// the tree below it still belongs to the old one. Every later command reads the
+// project from one and the path from the other: deleting a collection the user
+// points at in the stale tree deletes the same path in the *new* project. The
+// read runs inside `loadProjects`, which is the app's startup path.
+//
+// So the cost of storage failing is the stored selection and nothing else. It
+// is not swallowed: the console panel is where this app's own failures are
+// reported, and this is one.
 function readPersistedActiveProject(): string | null {
-  const stored = activeProjectStorage()?.getItem(ACTIVE_PROJECT_KEY)
-  return stored || null
+  try {
+    return activeProjectStorage()?.getItem(ACTIVE_PROJECT_KEY) || null
+  } catch (error) {
+    reportActiveProjectStorageFailure("read the last selected project", error)
+    return null
+  }
 }
 
 function persistActiveProject(projectName: string | null) {
-  const storage = activeProjectStorage()
-  if (!storage) {
-    return
-  }
+  try {
+    const storage = activeProjectStorage()
+    if (!storage) {
+      return
+    }
 
-  if (projectName) {
-    storage.setItem(ACTIVE_PROJECT_KEY, projectName)
-    return
-  }
+    if (projectName) {
+      storage.setItem(ACTIVE_PROJECT_KEY, projectName)
+      return
+    }
 
-  storage.removeItem(ACTIVE_PROJECT_KEY)
+    storage.removeItem(ACTIVE_PROJECT_KEY)
+  } catch (error) {
+    reportActiveProjectStorageFailure("remember the selected project", error)
+  }
+}
+
+function reportActiveProjectStorageFailure(action: string, error: unknown) {
+  recordConsoleEntry(
+    "error",
+    `[app] Could not ${action}: ${error instanceof Error ? error.message : String(error)}`,
+    "app",
+  )
 }
 
 function normalizeSavedRequest(request: SavedRequest): SavedRequest {

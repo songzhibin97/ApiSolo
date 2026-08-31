@@ -5,6 +5,7 @@ import { shouldIgnoreEvent, useKeyboard } from "../useKeyboard"
 import { useProjectsStore } from "../../stores/projects"
 import { useRequestStore } from "../../stores/request"
 import { useTabsStore } from "../../stores/tabs"
+import { useUIStore } from "../../stores/ui"
 
 function makeTarget(overrides: Partial<{
   tagName: string
@@ -187,10 +188,64 @@ describe("Cmd/Ctrl+S routing", () => {
     expect(dispatched).toContain("apisolo:save-request")
   })
 
-  it("still ignores Cmd+S typed into a field", async () => {
+  // The editable guard used to run first, so a caret inside any text field
+  // swallowed this shortcut. That is not an edge case here: the repository's
+  // stated primary path is "paste a curl command and send it", which leaves the
+  // caret in the URL field — the exact position a user is in when they reach
+  // for Cmd+S. A shortcut that works everywhere except where the user is
+  // standing is a shortcut that does not work.
+  it.each([
+    ["an input", makeTarget({ tagName: "INPUT" })],
+    ["a textarea", makeTarget({ tagName: "TEXTAREA" })],
+    ["a contenteditable region", makeTarget({ isContentEditable: true })],
+    [
+      "the CodeMirror body editor",
+      makeTarget({ closest: (selector: string) => (selector === ".cm-editor" ? {} : null) }),
+    ],
+  ])("reaches the panel from %s", async (_label, target) => {
     const { handleKeydown } = useKeyboard()
-    await handleKeydown(saveEvent(makeTarget({ tagName: "INPUT" })))
+    await handleKeydown(saveEvent(target))
 
-    expect(dispatched).not.toContain("apisolo:save-request")
+    expect(dispatched).toContain("apisolo:save-request")
+  })
+
+  it("takes the keystroke away from the field it was typed in", async () => {
+    // Without this the browser's own save dialog answers instead. It is a
+    // separate fact from the dispatch above: letting the event through and
+    // preventing its default are two different things.
+    const { handleKeydown } = useKeyboard()
+    const event = saveEvent(makeTarget({ tagName: "INPUT" }))
+
+    await handleKeydown(event)
+
+    expect(event.preventDefault).toHaveBeenCalled()
+  })
+
+  it("does not let the other shortcuts through a field", async () => {
+    // The boundary, and the reason the exemption above is written per key
+    // rather than as "shortcuts ignore focus". Cmd+S is exempt because it has
+    // no native meaning inside a text field; Cmd+A and Cmd+C do, and this
+    // layer must not start competing with them. Every key with a branch of its
+    // own is driven here, so widening the exemption cannot stay quiet.
+    const tabsStore = useTabsStore()
+    const uiStore = useUIStore()
+    uiStore.setSidebarItem("environments")
+    const tabCount = tabsStore.tabs.length
+
+    const { handleKeydown } = useKeyboard()
+    for (const key of ["Enter", "n", "t", "w", "k", ",", "1"]) {
+      await handleKeydown({
+        key,
+        metaKey: true,
+        ctrlKey: false,
+        target: makeTarget({ tagName: "INPUT" }),
+        preventDefault: vi.fn(),
+      } as unknown as KeyboardEvent)
+    }
+
+    expect(dispatched).toEqual([])
+    expect(tabsStore.tabs.length).toBe(tabCount)
+    expect(uiStore.isSettingsOpen).toBe(false)
+    expect(uiStore.sidebarActiveItem).toBe("environments")
   })
 })

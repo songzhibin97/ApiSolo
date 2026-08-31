@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { createPinia, setActivePinia } from "pinia"
 
 const { invokeMock, projectList } = vi.hoisted(() => {
@@ -29,6 +29,8 @@ vi.mock("../../utils/invoke", () => ({
   invoke: invokeMock,
 }))
 
+import pinia from ".."
+import { useConsoleStore } from "../console"
 import { useProjectsStore } from "../projects"
 
 const KEY = "apisolo:active-project"
@@ -118,5 +120,113 @@ describe("the selected project survives a restart", () => {
     await store.setActiveProject(null)
 
     expect(window.localStorage.getItem(KEY)).toBeNull()
+  })
+})
+
+/**
+ * Persisting is derived from the ref, and a sync watcher runs inside the
+ * assignment that triggered it. So a throwing `localStorage` does not fail the
+ * *write* — it fails whoever assigned, and in `setActiveProject` that is the
+ * statement before the collection tree is reloaded.
+ *
+ * What the user then has is worse than a lost preference: the header names the
+ * project they just switched to, the tree under it still lists the previous
+ * project's collections, and the next command combines the two. Deleting a
+ * collection picked out of that stale tree sends the *new* project's name with
+ * the *old* project's path, and the backend deletes exactly what it was asked
+ * to. Nothing about it looks like a failure.
+ *
+ * Storage may cost the app its memory of the last project. It may not cost the
+ * app the thing the user was doing.
+ */
+describe("storage that refuses to cooperate costs the selection and nothing else", () => {
+  // Restored by hand rather than by `vi.restoreAllMocks()`: a spy that outlives
+  // its case makes the *next* case fail for the previous case's reason, which
+  // is exactly the kind of red that gets read as flakiness.
+  let installed: { mockRestore: () => void }[] = []
+
+  function breakStorage(method: "setItem" | "getItem", message: string) {
+    const spy = vi.spyOn(window.localStorage, method).mockImplementation(() => {
+      throw new Error(message)
+    })
+    installed.push(spy)
+    return spy
+  }
+
+  beforeEach(() => {
+    // Before `setActivePinia`, not after: `useConsoleStore(pinia)` makes that
+    // pinia the active one, and the store under test would then be shared
+    // across cases instead of rebuilt per case.
+    useConsoleStore(pinia).clear()
+    setActivePinia(createPinia())
+    invokeMock.mockClear()
+    window.localStorage.clear()
+    setProjects("Alpha", "Beta")
+  })
+
+  afterEach(() => {
+    installed.forEach((spy) => spy.mockRestore())
+    installed = []
+  })
+
+  it("lets the switch complete when the write fails", async () => {
+    const store = useProjectsStore()
+    breakStorage("setItem", "QuotaExceededError")
+
+    await expect(store.setActiveProject("Beta")).resolves.toBeUndefined()
+  })
+
+  it("still reloads the tree for the project it switched to", async () => {
+    // The assertion that names the actual damage: `setActiveProject` assigns
+    // and *then* reloads, so an error thrown by the assignment leaves the tree
+    // describing a different project than the one now selected.
+    const store = useProjectsStore()
+    await store.setActiveProject("Alpha")
+    breakStorage("setItem", "QuotaExceededError")
+    invokeMock.mockClear()
+
+    await store.setActiveProject("Beta").catch(() => undefined)
+
+    expect(store.activeProject).toBe("Beta")
+    expect(invokeMock).toHaveBeenCalledWith("get_collection_tree", { project: "Beta" })
+  })
+
+  it("reports the failed write instead of hiding it", async () => {
+    // Best-effort is not the same as unnoticed. This app already reports its
+    // own failures to the console panel, and a selection that will not survive
+    // a restart is one of them.
+    const store = useProjectsStore()
+    breakStorage("setItem", "QuotaExceededError")
+
+    await store.setActiveProject("Beta").catch(() => undefined)
+
+    const errors = useConsoleStore(pinia)
+      .entries.filter((entry) => entry.level === "error")
+      .map((entry) => entry.message)
+    expect(errors.join("\n")).toContain("QuotaExceededError")
+  })
+
+  it("still starts up when the read fails", async () => {
+    // `readPersistedActiveProject` runs inside `loadProjects`, which is the
+    // startup path: throwing there is a store with no projects at all.
+    const store = useProjectsStore()
+    breakStorage("getItem", "SecurityError")
+
+    await expect(store.loadProjects()).resolves.toBeUndefined()
+
+    expect(store.projects.map((project) => project.name)).toEqual(["Alpha", "Beta"])
+    expect(store.activeProject).toBe("Alpha")
+  })
+
+  it("reports the failed read instead of hiding it", async () => {
+    const store = useProjectsStore()
+    breakStorage("getItem", "SecurityError")
+
+    await store.loadProjects().catch(() => undefined)
+
+    const errors = useConsoleStore(pinia)
+      .entries.filter((entry) => entry.level === "error")
+      .map((entry) => entry.message)
+    expect(errors.join("\n")).toContain("SecurityError")
   })
 })
