@@ -1,7 +1,6 @@
 import { getCurrentInstance, onMounted, onUnmounted } from "vue";
 
 import i18n from "../i18n";
-import { useProjectsStore } from "../stores/projects";
 import { useRequestStore } from "../stores/request";
 import { useTabsStore } from "../stores/tabs";
 import { useUIStore } from "../stores/ui";
@@ -11,7 +10,6 @@ const SIDEBAR_ITEMS = ["collections", "history", "environments"] as const;
 export function useKeyboard() {
   const tabsStore = useTabsStore();
   const requestStore = useRequestStore();
-  const projectsStore = useProjectsStore();
   const uiStore = useUIStore();
 
   async function handleKeydown(event: KeyboardEvent) {
@@ -63,9 +61,11 @@ export function useKeyboard() {
 
     if (key === "s") {
       event.preventDefault();
-      if (projectsStore.activeProject) {
-        window.dispatchEvent(new CustomEvent("apisolo:save-request"));
-      }
+      // No project check here. This layer used to hold a second copy of the
+      // save button's condition, and a copy that swallows the keystroke is
+      // worse than no shortcut: the panel now owns the decision, so the
+      // shortcut and the button cannot answer differently.
+      window.dispatchEvent(new CustomEvent("apisolo:save-request"));
       return;
     }
 

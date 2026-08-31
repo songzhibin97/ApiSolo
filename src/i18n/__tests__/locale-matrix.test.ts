@@ -169,6 +169,26 @@ const MATRIX: Record<string, { "zh-CN": string; en: string }> = {
     "zh-CN": "字节在到达界面之前已被这条说明替换，因此这里没有可复制或下载的内容。",
     en: "The bytes were replaced with this note before they reached the interface, so there is nothing here to copy or download.",
   },
+  "sidebar.editProject": {
+    "zh-CN": "编辑项目",
+    en: "Edit project",
+  },
+  "sidebar.editProjectDescription": {
+    "zh-CN": "项目描述",
+    en: "Project description",
+  },
+  "sidebar.noProjectDescription": {
+    "zh-CN": "还没有描述",
+    en: "No description yet",
+  },
+  "request.saveNeedsProject": {
+    "zh-CN": "还没有项目。保存下来的请求存放在项目里，先到「集合」面板新建一个项目，再保存这条请求。",
+    en: "There is no project yet. A saved request lives inside a project, so create one first in the Collections panel — then save this request.",
+  },
+  "request.saveNeedsProjectAction": {
+    "zh-CN": "打开集合面板",
+    en: "Open the Collections panel",
+  },
 }
 
 const i18n = createI18n({

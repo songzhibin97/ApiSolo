@@ -8,6 +8,7 @@ import { useProjectsStore } from "../../stores/projects";
 import { useRequestStore } from "../../stores/request";
 import { useSaveGateStore } from "../../stores/save-gate";
 import { isUntitledTabLabel, useTabsStore } from "../../stores/tabs";
+import { useUIStore } from "../../stores/ui";
 import { flattenCollectionFolders } from "../../utils/collection-options";
 import { exportCurl } from "../../utils/curl-export";
 import { parseCurl } from "../../utils/curl-parser";
@@ -41,6 +42,7 @@ const tabsStore = useTabsStore();
 const projectsStore = useProjectsStore();
 const requestStore = useRequestStore();
 const saveGate = useSaveGateStore();
+const uiStore = useUIStore();
 const { activeTab } = storeToRefs(tabsStore);
 const { activeProject, collectionTree } = storeToRefs(projectsStore);
 const { t } = useI18n();
@@ -59,6 +61,14 @@ const curlError = ref("");
 const curlCopied = ref(false);
 const requestActionsOpen = ref(false);
 const requestActionsRef = ref<HTMLElement | null>(null);
+const saveAttemptedWithoutProject = ref(false);
+
+// Raised by a save attempt, and lowered by a project existing rather than by
+// anyone remembering to clear the flag: the notice explains a condition, so it
+// must stop being shown the moment the condition stops holding.
+const showNoProjectNotice = computed(
+  () => saveAttemptedWithoutProject.value && !activeProject.value,
+);
 
 const sections = computed(() => {
   const tab = activeTab.value;
@@ -240,11 +250,30 @@ async function cancelRequest() {
 }
 
 function openSaveDialog() {
+  // The one place that decides what "save with no project" does. The button
+  // used to disappear and the shortcut used to return in silence — two
+  // independent copies of the same condition, in two files, and only one of
+  // them could ever tell the user anything.
+  if (!activeProject.value) {
+    saveAttemptedWithoutProject.value = true;
+    requestActionsOpen.value = false;
+    return;
+  }
+
   saveError.value = "";
   saveName.value = isUntitledTabLabel(activeTab.value.label) ? "" : activeTab.value.label;
   saveCollection.value = deriveCollectionPath(activeTab.value.savedRequestPath);
   showSaveDialog.value = true;
   requestActionsOpen.value = false;
+}
+
+function revealProjects() {
+  // The notice names the Collections panel, so this has to actually put it on
+  // screen — the sidebar can be collapsed, in which case switching the selected
+  // item alone would leave the user looking at nothing.
+  uiStore.sidebarCollapsed = false;
+  uiStore.setSidebarItem("collections");
+  saveAttemptedWithoutProject.value = false;
 }
 
 async function submitSave() {
@@ -354,9 +383,7 @@ function deriveCollectionPath(path: string | null) {
 }
 
 function onSaveShortcut() {
-  if (activeProject.value) {
-    openSaveDialog();
-  }
+  openSaveDialog();
 }
 
 function toggleRequestActions() {
@@ -428,6 +455,22 @@ onUnmounted(() => {
     </div>
 
     <div
+      v-if="showNoProjectNotice"
+      data-testid="request-save-needs-project"
+      class="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-[var(--border)] bg-[color-mix(in_srgb,var(--bg-primary)_76%,black)] px-4 py-2 text-sm leading-5 text-[var(--text-secondary)]"
+    >
+      <span class="min-w-0 flex-1">{{ t("request.saveNeedsProject") }}</span>
+      <button
+        class="h-7 shrink-0 rounded border border-[var(--border)] px-2.5 text-sm font-medium text-[var(--text-primary)] transition hover:border-[color-mix(in_srgb,var(--accent)_60%,white)]"
+        data-testid="request-save-needs-project-action"
+        type="button"
+        @click="revealProjects"
+      >
+        {{ t("request.saveNeedsProjectAction") }}
+      </button>
+    </div>
+
+    <div
       class="flex flex-nowrap items-center gap-3 border-b border-[var(--border)] bg-[color-mix(in_srgb,var(--bg-primary)_92%,black)] px-4 py-2.5"
     >
       <div class="min-w-0 flex-1 overflow-x-auto overflow-y-hidden">
@@ -468,9 +511,14 @@ onUnmounted(() => {
           <span>{{ t("request.curlCopied") }}</span>
         </div>
 
+        <!--
+          Rendered with or without a project. Removing it was the app's way of
+          saying "not now", and it said it to nobody: the button was simply not
+          there, and the shortcut for it did nothing at all.
+        -->
         <button
-          v-if="activeProject"
           class="inline-flex h-8 items-center gap-2 rounded border border-[var(--border)] bg-[var(--bg-secondary)] px-2.5 text-sm font-medium text-[var(--text-primary)] transition hover:border-[color-mix(in_srgb,var(--accent)_60%,white)]"
+          data-testid="request-save"
           type="button"
           :title="t('request.save')"
           @click="openSaveDialog"

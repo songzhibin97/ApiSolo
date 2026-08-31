@@ -2939,6 +2939,20 @@ fn create_project(name: String, description: String) -> Result<ProjectMeta, Stri
     Ok(meta)
 }
 
+/// Rewrites only the description. The name is what resolves the project on
+/// disk, so it is read out of the stored metadata and written back untouched:
+/// this command cannot rename a project even if a caller passes a different
+/// one, which is the whole reason renaming is a separate piece of work.
+#[tauri::command]
+fn update_project_description(project: String, description: String) -> Result<ProjectMeta, String> {
+    let resolved = resolve_project(&project)?;
+    let mut meta = read_project_meta(&resolved.dir)?;
+    meta.description = description.trim().to_string();
+    meta.updated_at = now_iso();
+    write_project_meta(&resolved.dir, &meta)?;
+    Ok(meta)
+}
+
 #[tauri::command]
 fn get_collection_tree(project: String) -> Result<Vec<CollectionNode>, String> {
     let resolved = resolve_project(&project)?;
@@ -5128,6 +5142,12 @@ struct CreateProjectArgs {
 }
 
 #[derive(Deserialize)]
+struct UpdateProjectDescriptionArgs {
+    project: String,
+    description: String,
+}
+
+#[derive(Deserialize)]
 struct ProjectArgs {
     project: String,
 }
@@ -5327,6 +5347,12 @@ async fn api_create_project(Json(args): Json<CreateProjectArgs>) -> impl IntoRes
     api_response(create_project(args.name, args.description))
 }
 
+async fn api_update_project_description(
+    Json(args): Json<UpdateProjectDescriptionArgs>,
+) -> impl IntoResponse {
+    api_response(update_project_description(args.project, args.description))
+}
+
 async fn api_get_collection_tree(Json(args): Json<ProjectArgs>) -> impl IntoResponse {
     api_response(get_collection_tree(args.project))
 }
@@ -5486,6 +5512,10 @@ fn dev_bridge_router() -> Router {
         )
         .route("/api/list_projects", post(api_list_projects))
         .route("/api/create_project", post(api_create_project))
+        .route(
+            "/api/update_project_description",
+            post(api_update_project_description),
+        )
         .route("/api/get_collection_tree", post(api_get_collection_tree))
         .route("/api/save_request", post(api_save_request))
         .route("/api/load_request", post(api_load_request))
@@ -5602,6 +5632,7 @@ pub fn run() {
             unlock_secret_storage,
             list_projects,
             create_project,
+            update_project_description,
             get_collection_tree,
             save_request,
             load_request,
@@ -6674,6 +6705,49 @@ mod tests {
         assert!(project_dir.join("apisolo.project.json").exists());
         assert!(project_dir.join("collections").is_dir());
         assert!(project_dir.join("environments").is_dir());
+    }
+
+    #[test]
+    fn test_update_project_description() {
+        let _guard = lock_env();
+        let temp_home = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp_home.path());
+
+        let created =
+            create_project("Test API".to_string(), "first wording".to_string()).unwrap();
+
+        let updated = update_project_description(
+            "Test API".to_string(),
+            "  second wording  ".to_string(),
+        )
+        .unwrap();
+
+        // Trimmed like create_project trims it, and the name is untouched --
+        // this command must not be a rename in disguise.
+        assert_eq!(updated.description, "second wording");
+        assert_eq!(updated.name, "Test API");
+        assert_eq!(updated.created_at, created.created_at);
+
+        // Read back through the listing the UI actually calls, not through the
+        // return value: a command that returns the new text without writing it
+        // would satisfy the assertions above on their own.
+        let listed = list_projects().unwrap();
+        let stored = listed.iter().find(|item| item.name == "Test API").unwrap();
+        assert_eq!(stored.description, "second wording");
+
+        // An empty description is a real value, not "leave it alone".
+        update_project_description("Test API".to_string(), String::new()).unwrap();
+        let cleared = list_projects().unwrap();
+        assert_eq!(
+            cleared
+                .iter()
+                .find(|item| item.name == "Test API")
+                .unwrap()
+                .description,
+            ""
+        );
+
+        assert!(update_project_description("Missing".to_string(), "x".to_string()).is_err());
     }
 
     #[test]

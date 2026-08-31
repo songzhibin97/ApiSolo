@@ -1,5 +1,5 @@
 import { defineStore } from "pinia"
-import { ref } from "vue"
+import { ref, watch } from "vue"
 
 import i18n from "../i18n"
 import { recordConsoleEntry } from "./console"
@@ -7,13 +7,32 @@ import { invoke } from "../utils/invoke"
 import { useTabsStore } from "./tabs"
 import type { CollectionNode, ProjectMeta, SavedRequest, Tab } from "../types"
 
+const ACTIVE_PROJECT_KEY = "apisolo:active-project"
+
 export const useProjectsStore = defineStore("projects", () => {
   const projects = ref<ProjectMeta[]>([])
   const activeProject = ref<string | null>(null)
   const collectionTree = ref<CollectionNode[]>([])
 
+  // Every write to the selection goes to disk, including the ones this store
+  // makes to itself (the fallback below, `createProject`) and the ones a caller
+  // makes by assigning the ref. A `persist()` call next to each assignment
+  // would be a list to keep in sync, and the next writer is the one that
+  // forgets; watching the ref means there is nothing to remember.
+  watch(activeProject, persistActiveProject, { flush: "sync" })
+
   async function loadProjects() {
     projects.value = await invoke<ProjectMeta[]>("list_projects")
+
+    // The stored name is a *proxy* for "the project you were last in", and the
+    // project it names may have been deleted since. It is seeded here, ahead of
+    // the two checks below, precisely so it has to survive the same "is this
+    // still a real project" check any other selection does — a restore path
+    // with its own validation would be a second copy of that rule, free to
+    // drift from this one.
+    if (!activeProject.value) {
+      activeProject.value = readPersistedActiveProject()
+    }
 
     if (!activeProject.value && projects.value.length > 0) {
       activeProject.value = projects.value[0].name
@@ -39,6 +58,25 @@ export const useProjectsStore = defineStore("projects", () => {
       recordConsoleEntry(
         "error",
         `[app] Failed to create project ${name}: ${error instanceof Error ? error.message : String(error)}`,
+        "app",
+      )
+      throw error
+    }
+  }
+
+  async function updateProjectDescription(projectName: string, description: string) {
+    try {
+      const project = await invoke<ProjectMeta>("update_project_description", {
+        project: projectName,
+        description,
+      })
+      await loadProjects()
+      recordConsoleEntry("info", `[app] Project description updated: ${project.name}`, "app")
+      return project
+    } catch (error) {
+      recordConsoleEntry(
+        "error",
+        `[app] Failed to update description for ${projectName}: ${error instanceof Error ? error.message : String(error)}`,
         "app",
       )
       throw error
@@ -236,6 +274,7 @@ export const useProjectsStore = defineStore("projects", () => {
     collectionTree,
     loadProjects,
     createProject,
+    updateProjectDescription,
     setActiveProject,
     loadCollectionTree,
     saveRequest,
@@ -249,6 +288,37 @@ export const useProjectsStore = defineStore("projects", () => {
     openRequest,
   }
 })
+
+// Same shape settings.ts uses: one localStorage key, guarded so the store can
+// still be built where there is no window (tests, and any non-browser host).
+// The `localStorage` check is not belt-and-braces — a stubbed window without it
+// is a real thing in this repo's test suite.
+function activeProjectStorage(): Storage | null {
+  if (typeof window === "undefined") {
+    return null
+  }
+
+  return window.localStorage ?? null
+}
+
+function readPersistedActiveProject(): string | null {
+  const stored = activeProjectStorage()?.getItem(ACTIVE_PROJECT_KEY)
+  return stored || null
+}
+
+function persistActiveProject(projectName: string | null) {
+  const storage = activeProjectStorage()
+  if (!storage) {
+    return
+  }
+
+  if (projectName) {
+    storage.setItem(ACTIVE_PROJECT_KEY, projectName)
+    return
+  }
+
+  storage.removeItem(ACTIVE_PROJECT_KEY)
+}
 
 function normalizeSavedRequest(request: SavedRequest): SavedRequest {
   return {

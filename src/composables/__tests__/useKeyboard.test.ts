@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 import { createPinia, setActivePinia } from "pinia"
 
 import { shouldIgnoreEvent, useKeyboard } from "../useKeyboard"
+import { useProjectsStore } from "../../stores/projects"
 import { useRequestStore } from "../../stores/request"
 import { useTabsStore } from "../../stores/tabs"
 
@@ -130,5 +131,66 @@ describe("Cmd/Ctrl+Enter routing", () => {
 
     expect(sendRequest).not.toHaveBeenCalled()
     expect(dispatched).not.toContain("apisolo:ws-send")
+  })
+})
+
+describe("Cmd/Ctrl+S routing", () => {
+  let dispatched: string[]
+
+  function saveEvent(target = makeTarget()) {
+    return {
+      key: "s",
+      metaKey: true,
+      ctrlKey: false,
+      target,
+      preventDefault: vi.fn(),
+    } as unknown as KeyboardEvent
+  }
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    dispatched = []
+    vi.stubGlobal("window", {
+      dispatchEvent: (event: { type: string }) => {
+        dispatched.push(event.type)
+        return true
+      },
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    vi.stubGlobal(
+      "CustomEvent",
+      class CustomEventMock {
+        constructor(public type: string) {}
+      },
+    )
+  })
+
+  it("hands the shortcut to the panel even with no project selected", async () => {
+    // This layer used to check `activeProject` itself and drop the keystroke.
+    // Nothing here can render a reason to the user, so a decision taken here is
+    // a decision the user cannot be told about; the panel owns it now.
+    expect(useProjectsStore().activeProject).toBeNull()
+
+    const { handleKeydown } = useKeyboard()
+    await handleKeydown(saveEvent())
+
+    expect(dispatched).toContain("apisolo:save-request")
+  })
+
+  it("hands the shortcut to the panel when a project is selected", async () => {
+    useProjectsStore().activeProject = "My API"
+
+    const { handleKeydown } = useKeyboard()
+    await handleKeydown(saveEvent())
+
+    expect(dispatched).toContain("apisolo:save-request")
+  })
+
+  it("still ignores Cmd+S typed into a field", async () => {
+    const { handleKeydown } = useKeyboard()
+    await handleKeydown(saveEvent(makeTarget({ tagName: "INPUT" })))
+
+    expect(dispatched).not.toContain("apisolo:save-request")
   })
 })
