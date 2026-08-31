@@ -17,7 +17,9 @@ const { invokeMock, projectList } = vi.hoisted(() => {
       }
 
       if (command === "get_collection_tree") {
-        return []
+        // One node rather than an empty list, so "the tree was reloaded" and
+        // "the tree was left alone" are different observations.
+        return [{ name: "shared", path: "shared", nodeType: "folder", children: [] }]
       }
 
       return null
@@ -127,30 +129,57 @@ describe("the selected project survives a restart", () => {
  * Persisting is derived from the ref, and a sync watcher runs inside the
  * assignment that triggered it. So a throwing `localStorage` does not fail the
  * *write* — it fails whoever assigned, and in `setActiveProject` that is the
- * statement before the collection tree is reloaded.
+ * statement before the collection tree is reloaded. An error escaping from
+ * there means the reload never runs at all.
  *
- * What the user then has is worse than a lost preference: the header names the
- * project they just switched to, the tree under it still lists the previous
- * project's collections, and the next command combines the two. Deleting a
- * collection picked out of that stale tree sends the *new* project's name with
- * the *old* project's path, and the backend deletes exactly what it was asked
- * to. Nothing about it looks like a failure.
+ * Storage may cost the app its memory of the last project. It may not stop the
+ * work the user is in the middle of.
  *
- * Storage may cost the app its memory of the last project. It may not cost the
- * app the thing the user was doing.
+ * **Said no wider than it is.** This is a claim about `localStorage`, not about
+ * the selected project and the collection tree agreeing. `setActiveProject`
+ * commits the name and only then awaits the tree, so a tree load that fails or
+ * arrives out of order still leaves them disagreeing — that ordering is
+ * unchanged here and is filed as D38. What these cases pin down is that storage
+ * is not one of the ways they come apart.
+ *
+ * Four ways storage can refuse, and every one of them is a real browser: the
+ * accessor itself throws under a restrictive storage policy, and `getItem`,
+ * `setItem` and `removeItem` throw on quota or policy. A `try` that covers
+ * three of the four is a `try` that looks right.
  */
-describe("storage that refuses to cooperate costs the selection and nothing else", () => {
+describe("storage that refuses to cooperate costs the selection, not the session", () => {
   // Restored by hand rather than by `vi.restoreAllMocks()`: a spy that outlives
   // its case makes the *next* case fail for the previous case's reason, which
   // is exactly the kind of red that gets read as flakiness.
-  let installed: { mockRestore: () => void }[] = []
+  let restorers: (() => void)[] = []
 
-  function breakStorage(method: "setItem" | "getItem", message: string) {
+  function breakStorage(method: "getItem" | "setItem" | "removeItem", message: string) {
     const spy = vi.spyOn(window.localStorage, method).mockImplementation(() => {
       throw new Error(message)
     })
-    installed.push(spy)
+    restorers.push(() => spy.mockRestore())
     return spy
+  }
+
+  // The fourth path, and the one a spy cannot reach: `window.localStorage` is
+  // itself a getter, and reaching for it throws before there is any method to
+  // stub. Hoisting that call out of the `try` is a change no `getItem` or
+  // `setItem` case can see.
+  function breakStorageAccessor(message: string) {
+    const original = Object.getOwnPropertyDescriptor(window, "localStorage")
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      get() {
+        throw new Error(message)
+      },
+    })
+    restorers.push(() => {
+      if (original) {
+        Object.defineProperty(window, "localStorage", original)
+      } else {
+        delete (window as unknown as Record<string, unknown>).localStorage
+      }
+    })
   }
 
   beforeEach(() => {
@@ -165,9 +194,16 @@ describe("storage that refuses to cooperate costs the selection and nothing else
   })
 
   afterEach(() => {
-    installed.forEach((spy) => spy.mockRestore())
-    installed = []
+    restorers.forEach((restore) => restore())
+    restorers = []
   })
+
+  function reportedErrors() {
+    return useConsoleStore(pinia)
+      .entries.filter((entry) => entry.level === "error")
+      .map((entry) => entry.message)
+      .join("\n")
+  }
 
   it("lets the switch complete when the write fails", async () => {
     const store = useProjectsStore()
@@ -200,10 +236,7 @@ describe("storage that refuses to cooperate costs the selection and nothing else
 
     await store.setActiveProject("Beta").catch(() => undefined)
 
-    const errors = useConsoleStore(pinia)
-      .entries.filter((entry) => entry.level === "error")
-      .map((entry) => entry.message)
-    expect(errors.join("\n")).toContain("QuotaExceededError")
+    expect(reportedErrors()).toContain("QuotaExceededError")
   })
 
   it("still starts up when the read fails", async () => {
@@ -224,9 +257,63 @@ describe("storage that refuses to cooperate costs the selection and nothing else
 
     await store.loadProjects().catch(() => undefined)
 
-    const errors = useConsoleStore(pinia)
-      .entries.filter((entry) => entry.level === "error")
-      .map((entry) => entry.message)
-    expect(errors.join("\n")).toContain("SecurityError")
+    expect(reportedErrors()).toContain("SecurityError")
+  })
+
+  it("still clears the tree when the removal fails", async () => {
+    // Clearing the selection takes the third branch, `removeItem`, and it is
+    // the one that reads as an afterthought. The tree is the assertion that
+    // bites: with the error escaping, `collectionTree` keeps describing Beta
+    // while nothing is selected.
+    const store = useProjectsStore()
+    await store.setActiveProject("Beta")
+    expect(store.collectionTree).toHaveLength(1)
+    breakStorage("removeItem", "NS_ERROR_FILE_CORRUPTED")
+
+    await expect(store.setActiveProject(null)).resolves.toBeUndefined()
+
+    expect(store.activeProject).toBeNull()
+    expect(store.collectionTree).toEqual([])
+  })
+
+  it("reports the failed removal instead of hiding it", async () => {
+    const store = useProjectsStore()
+    await store.setActiveProject("Beta")
+    breakStorage("removeItem", "NS_ERROR_FILE_CORRUPTED")
+
+    await store.setActiveProject(null).catch(() => undefined)
+
+    expect(reportedErrors()).toContain("NS_ERROR_FILE_CORRUPTED")
+  })
+
+  it("still reloads the tree when reaching for storage throws", async () => {
+    const store = useProjectsStore()
+    await store.setActiveProject("Alpha")
+    breakStorageAccessor("The operation is insecure.")
+    invokeMock.mockClear()
+
+    await expect(store.setActiveProject("Beta")).resolves.toBeUndefined()
+
+    expect(store.activeProject).toBe("Beta")
+    expect(invokeMock).toHaveBeenCalledWith("get_collection_tree", { project: "Beta" })
+  })
+
+  it("still starts up when reaching for storage throws", async () => {
+    const store = useProjectsStore()
+    breakStorageAccessor("The operation is insecure.")
+
+    await expect(store.loadProjects()).resolves.toBeUndefined()
+
+    expect(store.projects.map((project) => project.name)).toEqual(["Alpha", "Beta"])
+    expect(store.activeProject).toBe("Alpha")
+  })
+
+  it("reports a storage accessor that throws instead of hiding it", async () => {
+    const store = useProjectsStore()
+    breakStorageAccessor("The operation is insecure.")
+
+    await store.loadProjects().catch(() => undefined)
+
+    expect(reportedErrors()).toContain("The operation is insecure.")
   })
 })

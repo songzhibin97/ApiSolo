@@ -135,6 +135,10 @@ describe("Cmd/Ctrl+Enter routing", () => {
   })
 })
 
+// Branch coverage only: these call `handleKeydown` directly, so not one of them
+// can tell whether anything installs it as a listener. That half lives in
+// useKeyboardListener.test.ts, which dispatches real keyboard events at the
+// mounted app and never touches `handleKeydown`.
 describe("Cmd/Ctrl+S routing", () => {
   let dispatched: string[]
 

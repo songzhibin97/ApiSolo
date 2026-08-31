@@ -192,8 +192,6 @@ export default {
     createProject: "创建项目",
     projectName: "项目名称",
     description: "描述",
-    editProject: "编辑项目",
-    editProjectDescription: "项目描述",
     noProjectDescription: "还没有描述",
     newCollection: "新建集合",
     createCollection: "创建集合",

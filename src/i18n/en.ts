@@ -194,8 +194,6 @@ export default {
     createProject: "Create project",
     projectName: "Project name",
     description: "Description",
-    editProject: "Edit project",
-    editProjectDescription: "Project description",
     noProjectDescription: "No description yet",
     newCollection: "New Collection",
     createCollection: "Create collection",

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue"
 import { storeToRefs } from "pinia"
-import { Download, FolderPlus, Pencil, Plus, Upload } from "lucide-vue-next"
+import { Download, FolderPlus, Plus, Upload } from "lucide-vue-next"
 import { useI18n } from "vue-i18n"
 
 import CollectionTreeNode from "./CollectionTreeNode.vue"
@@ -23,12 +23,9 @@ const { projects, activeProject, collectionTree } = storeToRefs(projectsStore)
 const { t } = useI18n()
 
 const showProjectModal = ref(false)
-const showProjectEditor = ref(false)
 const showCollectionCreator = ref(false)
 const projectName = ref("")
 const projectDescription = ref("")
-const editedDescription = ref("")
-const editError = ref("")
 const collectionName = ref("")
 const collectionParent = ref("")
 const errorMessage = ref("")
@@ -89,36 +86,6 @@ async function submitProject() {
     projectDescription.value = ""
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
-  }
-}
-
-function openProjectEditor() {
-  if (!activeProjectMeta.value) {
-    return
-  }
-
-  editError.value = ""
-  editedDescription.value = activeProjectMeta.value.description
-  showProjectEditor.value = true
-}
-
-function closeProjectEditor() {
-  showProjectEditor.value = false
-  editError.value = ""
-}
-
-async function submitProjectEdit() {
-  if (!activeProject.value) {
-    return
-  }
-
-  editError.value = ""
-
-  try {
-    await projectsStore.updateProjectDescription(activeProject.value, editedDescription.value)
-    showProjectEditor.value = false
-  } catch (error) {
-    editError.value = error instanceof Error ? error.message : String(error)
   }
 }
 
@@ -470,32 +437,27 @@ function slugify(value: string) {
         </button>
       </div>
       <!--
-        A native <option> renders one flat string, so the description cannot be
-        secondary text inside the dropdown itself. It sits under the selector
-        instead, where it can be styled as secondary and can wrap.
+        Read-only. A native <option> renders one flat string, so the description
+        cannot be secondary text inside the dropdown itself; it sits under the
+        selector instead, where it can be styled as secondary and can wrap.
+
+        There is no edit control here on purpose: the project metadata file is
+        written by an unlocked read-modify-write, so an edit made through the UI
+        can be silently rolled back by a concurrent writer. Offering the field
+        for editing before that is fixed would be offering an edit that may not
+        stick. Filed as D39, together with the editing entry point.
       -->
-      <div v-if="activeProjectMeta" class="mt-2 flex items-start gap-2">
-        <div
-          class="min-w-0 flex-1 text-xs leading-5"
-          :class="
-            activeProjectMeta.description
-              ? 'text-[var(--text-secondary)]'
-              : 'italic text-[color-mix(in_srgb,var(--text-secondary)_70%,transparent)]'
-          "
-          data-testid="active-project-description"
-        >
-          {{ activeProjectMeta.description || t("sidebar.noProjectDescription") }}
-        </div>
-        <button
-          class="mt-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-[var(--text-secondary)] transition hover:text-[var(--text-primary)]"
-          type="button"
-          data-testid="edit-project"
-          :title="t('sidebar.editProject')"
-          :aria-label="t('sidebar.editProject')"
-          @click="openProjectEditor"
-        >
-          <Pencil :size="12" />
-        </button>
+      <div
+        v-if="activeProjectMeta"
+        class="mt-2 text-xs leading-5"
+        :class="
+          activeProjectMeta.description
+            ? 'text-[var(--text-secondary)]'
+            : 'italic text-[color-mix(in_srgb,var(--text-secondary)_70%,transparent)]'
+        "
+        data-testid="active-project-description"
+      >
+        {{ activeProjectMeta.description || t("sidebar.noProjectDescription") }}
       </div>
 
       <div
@@ -665,50 +627,6 @@ function slugify(value: string) {
             @click="submitProject"
           >
             {{ t("common.create") }}
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <div
-      v-if="showProjectEditor"
-      data-testid="edit-project-modal"
-      class="absolute inset-0 z-20 flex items-center justify-center bg-black/45 p-4"
-    >
-      <div class="w-full max-w-md rounded-lg border border-[var(--border)] bg-[var(--bg-primary)] p-4 shadow-lg">
-        <div class="mb-4 text-lg font-semibold text-[var(--text-primary)]">
-          {{ t("sidebar.editProject") }}
-        </div>
-
-        <div class="mb-2 text-sm text-[var(--text-secondary)]">
-          {{ t("sidebar.editProjectDescription") }}
-        </div>
-        <textarea
-          v-model="editedDescription"
-          data-testid="edit-project-description"
-          class="min-h-28 w-full rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none transition focus:border-[color-mix(in_srgb,var(--accent)_70%,white)]"
-          :placeholder="t('sidebar.description')"
-        />
-
-        <div v-if="editError" class="mt-3 text-sm text-rose-300">
-          {{ editError }}
-        </div>
-
-        <div class="mt-5 flex justify-end gap-2">
-          <button
-            class="h-8 rounded border border-[var(--border)] px-3 text-sm text-[var(--text-secondary)] transition hover:text-[var(--text-primary)]"
-            type="button"
-            @click="closeProjectEditor"
-          >
-            {{ t("common.cancel") }}
-          </button>
-          <button
-            class="h-8 rounded bg-[var(--accent)] px-3 text-sm font-semibold text-white transition hover:brightness-110"
-            data-testid="edit-project-submit"
-            type="button"
-            @click="submitProjectEdit"
-          >
-            {{ t("common.save") }}
           </button>
         </div>
       </div>

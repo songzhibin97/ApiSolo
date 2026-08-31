@@ -169,14 +169,6 @@ const MATRIX: Record<string, { "zh-CN": string; en: string }> = {
     "zh-CN": "字节在到达界面之前已被这条说明替换，因此这里没有可复制或下载的内容。",
     en: "The bytes were replaced with this note before they reached the interface, so there is nothing here to copy or download.",
   },
-  "sidebar.editProject": {
-    "zh-CN": "编辑项目",
-    en: "Edit project",
-  },
-  "sidebar.editProjectDescription": {
-    "zh-CN": "项目描述",
-    en: "Project description",
-  },
   "sidebar.noProjectDescription": {
     "zh-CN": "还没有描述",
     en: "No description yet",

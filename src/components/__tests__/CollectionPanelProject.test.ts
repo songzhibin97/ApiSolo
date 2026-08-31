@@ -21,7 +21,7 @@ const { invokeMock, state } = vi.hoisted(() => {
 
   return {
     state,
-    invokeMock: vi.fn(async (command: string, args?: Record<string, unknown>) => {
+    invokeMock: vi.fn(async (command: string) => {
       if (command === "list_projects") {
         return state.projects.map((project) => ({
           ...project,
@@ -32,21 +32,6 @@ const { invokeMock, state } = vi.hoisted(() => {
 
       if (command === "get_collection_tree") {
         return []
-      }
-
-      if (command === "update_project_description") {
-        // The backend rewrites the file and the next list_projects reflects it.
-        // Modelling that is the point: a UI that invokes the command and never
-        // re-reads the list would show the old text until the app restarts.
-        const target = state.projects.find((project) => project.name === args?.project)
-        if (target) {
-          target.description = String(args?.description ?? "").trim()
-        }
-        return {
-          ...target,
-          createdAt: "2026-08-31T00:00:00Z",
-          updatedAt: "2026-08-31T00:01:00Z",
-        }
       }
 
       return null
@@ -73,7 +58,7 @@ async function mountPanel() {
   return wrapper
 }
 
-describe("the project description is on screen and can be changed", () => {
+describe("the project description is on screen", () => {
   beforeEach(() => {
     pinia = createPinia()
     setActivePinia(pinia)
@@ -98,8 +83,9 @@ describe("the project description is on screen and can be changed", () => {
     await useProjectsStore().setActiveProject("Beta")
     await settle()
 
-    // A project with no description must still show the row: it is the only
-    // thing that tells the user the field exists and can be filled in.
+    // A project with no description must still show the row, saying so. A blank
+    // line reads as "this project has no description field", and the field is
+    // there — it is filled in when the project is created.
     expect(wrapper.get('[data-testid="active-project-description"]').text()).toBe(
       "sidebar.noProjectDescription",
     )
@@ -116,50 +102,6 @@ describe("the project description is on screen and can be changed", () => {
 
     expect(wrapper.get('[data-testid="active-project-description"]').text()).toBe(
       "The production gateway",
-    )
-  })
-
-  it("opens the edit dialog primed with the current text", async () => {
-    const wrapper = await mountPanel()
-
-    await wrapper.get('[data-testid="edit-project"]').trigger("click")
-
-    const field = wrapper.get('[data-testid="edit-project-description"]')
-      .element as HTMLTextAreaElement
-    expect(field.value).toBe("The staging gateway")
-  })
-
-  it("sends the edited text to the backend and shows the result", async () => {
-    const wrapper = await mountPanel()
-    await wrapper.get('[data-testid="edit-project"]').trigger("click")
-
-    await wrapper
-      .get('[data-testid="edit-project-description"]')
-      .setValue("Rewritten by the user")
-    await wrapper.get('[data-testid="edit-project-submit"]').trigger("click")
-    await settle()
-
-    expect(invokeMock).toHaveBeenCalledWith("update_project_description", {
-      project: "Alpha",
-      description: "Rewritten by the user",
-    })
-    expect(wrapper.find('[data-testid="edit-project-modal"]').exists()).toBe(false)
-    expect(wrapper.get('[data-testid="active-project-description"]').text()).toBe(
-      "Rewritten by the user",
-    )
-  })
-
-  it("keeps the dialog open and shows why when the backend refuses", async () => {
-    const wrapper = await mountPanel()
-    await wrapper.get('[data-testid="edit-project"]').trigger("click")
-    invokeMock.mockRejectedValueOnce(new Error("Project not found: Alpha"))
-
-    await wrapper.get('[data-testid="edit-project-submit"]').trigger("click")
-    await settle()
-
-    expect(wrapper.find('[data-testid="edit-project-modal"]').exists()).toBe(true)
-    expect(wrapper.get('[data-testid="edit-project-modal"]').text()).toContain(
-      "Project not found: Alpha",
     )
   })
 

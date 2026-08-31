@@ -69,25 +69,6 @@ export const useProjectsStore = defineStore("projects", () => {
     }
   }
 
-  async function updateProjectDescription(projectName: string, description: string) {
-    try {
-      const project = await invoke<ProjectMeta>("update_project_description", {
-        project: projectName,
-        description,
-      })
-      await loadProjects()
-      recordConsoleEntry("info", `[app] Project description updated: ${project.name}`, "app")
-      return project
-    } catch (error) {
-      recordConsoleEntry(
-        "error",
-        `[app] Failed to update description for ${projectName}: ${error instanceof Error ? error.message : String(error)}`,
-        "app",
-      )
-      throw error
-    }
-  }
-
   async function setActiveProject(projectName: string | null) {
     activeProject.value = projectName
     await loadCollectionTree()
@@ -279,7 +260,6 @@ export const useProjectsStore = defineStore("projects", () => {
     collectionTree,
     loadProjects,
     createProject,
-    updateProjectDescription,
     setActiveProject,
     loadCollectionTree,
     saveRequest,
@@ -308,20 +288,26 @@ function activeProjectStorage(): Storage | null {
 
 // Both sides are best-effort, and the `try` covers the accessor too: reaching
 // for `window.localStorage` is itself a throwing operation under a restrictive
-// storage policy, as are `getItem` and `setItem` once a quota is reached.
+// storage policy, as are `getItem`, `setItem` and `removeItem` once a quota or
+// a policy says no. All four are inside it.
 //
 // Neither one may throw, because neither one runs on its own behalf. The write
 // runs inside `activeProject.value = x` (sync watcher), so an escaping error
-// aborts the assigning caller — in `setActiveProject` that is the line before
-// `await loadCollectionTree()`, leaving the ref naming the new project while
-// the tree below it still belongs to the old one. Every later command reads the
-// project from one and the path from the other: deleting a collection the user
-// points at in the stale tree deletes the same path in the *new* project. The
-// read runs inside `loadProjects`, which is the app's startup path.
+// aborts the assigning caller — in `setActiveProject` that is the statement
+// before `await loadCollectionTree()`, so the tree reload would simply never
+// run. The read runs inside `loadProjects`, which is the app's startup path.
 //
-// So the cost of storage failing is the stored selection and nothing else. It
-// is not swallowed: the console panel is where this app's own failures are
-// reported, and this is one.
+// What this buys, stated no wider than it is: a failing `localStorage` does not
+// stop a project switch or the tree load that follows it, and does not stop
+// startup. It is not swallowed either — the console panel is where this app
+// reports its own failures, and this is one.
+//
+// What it does *not* buy: `setActiveProject` commits the name and only then
+// awaits the tree, so a tree load that fails or arrives out of order still
+// leaves the two disagreeing. That ordering predates this file's changes and is
+// untouched by them; it is filed as D38. Nothing here claims the selected
+// project and the collection tree are consistent — only that storage is not one
+// of the ways they come apart.
 function readPersistedActiveProject(): string | null {
   try {
     return activeProjectStorage()?.getItem(ACTIVE_PROJECT_KEY) || null

@@ -2939,20 +2939,6 @@ fn create_project(name: String, description: String) -> Result<ProjectMeta, Stri
     Ok(meta)
 }
 
-/// Rewrites only the description. The name is what resolves the project on
-/// disk, so it is read out of the stored metadata and written back untouched:
-/// this command cannot rename a project even if a caller passes a different
-/// one, which is the whole reason renaming is a separate piece of work.
-#[tauri::command]
-fn update_project_description(project: String, description: String) -> Result<ProjectMeta, String> {
-    let resolved = resolve_project(&project)?;
-    let mut meta = read_project_meta(&resolved.dir)?;
-    meta.description = description.trim().to_string();
-    meta.updated_at = now_iso();
-    write_project_meta(&resolved.dir, &meta)?;
-    Ok(meta)
-}
-
 #[tauri::command]
 fn get_collection_tree(project: String) -> Result<Vec<CollectionNode>, String> {
     let resolved = resolve_project(&project)?;
@@ -5142,12 +5128,6 @@ struct CreateProjectArgs {
 }
 
 #[derive(Deserialize)]
-struct UpdateProjectDescriptionArgs {
-    project: String,
-    description: String,
-}
-
-#[derive(Deserialize)]
 struct ProjectArgs {
     project: String,
 }
@@ -5347,12 +5327,6 @@ async fn api_create_project(Json(args): Json<CreateProjectArgs>) -> impl IntoRes
     api_response(create_project(args.name, args.description))
 }
 
-async fn api_update_project_description(
-    Json(args): Json<UpdateProjectDescriptionArgs>,
-) -> impl IntoResponse {
-    api_response(update_project_description(args.project, args.description))
-}
-
 async fn api_get_collection_tree(Json(args): Json<ProjectArgs>) -> impl IntoResponse {
     api_response(get_collection_tree(args.project))
 }
@@ -5512,10 +5486,6 @@ fn dev_bridge_router() -> Router {
         )
         .route("/api/list_projects", post(api_list_projects))
         .route("/api/create_project", post(api_create_project))
-        .route(
-            "/api/update_project_description",
-            post(api_update_project_description),
-        )
         .route("/api/get_collection_tree", post(api_get_collection_tree))
         .route("/api/save_request", post(api_save_request))
         .route("/api/load_request", post(api_load_request))
@@ -5622,7 +5592,6 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + 
         unlock_secret_storage,
         list_projects,
         create_project,
-        update_project_description,
         get_collection_tree,
         save_request,
         load_request,
@@ -6718,49 +6687,6 @@ mod tests {
         assert!(project_dir.join("apisolo.project.json").exists());
         assert!(project_dir.join("collections").is_dir());
         assert!(project_dir.join("environments").is_dir());
-    }
-
-    #[test]
-    fn test_update_project_description() {
-        let _guard = lock_env();
-        let temp_home = tempdir().unwrap();
-        let _home_guard = HomeGuard::set(temp_home.path());
-
-        let created =
-            create_project("Test API".to_string(), "first wording".to_string()).unwrap();
-
-        let updated = update_project_description(
-            "Test API".to_string(),
-            "  second wording  ".to_string(),
-        )
-        .unwrap();
-
-        // Trimmed like create_project trims it, and the name is untouched --
-        // this command must not be a rename in disguise.
-        assert_eq!(updated.description, "second wording");
-        assert_eq!(updated.name, "Test API");
-        assert_eq!(updated.created_at, created.created_at);
-
-        // Read back through the listing the UI actually calls, not through the
-        // return value: a command that returns the new text without writing it
-        // would satisfy the assertions above on their own.
-        let listed = list_projects().unwrap();
-        let stored = listed.iter().find(|item| item.name == "Test API").unwrap();
-        assert_eq!(stored.description, "second wording");
-
-        // An empty description is a real value, not "leave it alone".
-        update_project_description("Test API".to_string(), String::new()).unwrap();
-        let cleared = list_projects().unwrap();
-        assert_eq!(
-            cleared
-                .iter()
-                .find(|item| item.name == "Test API")
-                .unwrap()
-                .description,
-            ""
-        );
-
-        assert!(update_project_description("Missing".to_string(), "x".to_string()).is_err());
     }
 
     #[test]
@@ -15832,21 +15758,31 @@ mod tests {
     }
     // ------------------------------------- D25c (command wiring, P8)
     // A command has to be *reachable*, and nothing in the compiler checks
-    // that. `update_project_description` shipped with a working body, a unit
-    // test over that body, an entry in `generate_handler!` and a route on the
-    // dev bridge - and commenting out either of the last two left every Rust
-    // and every front-end test green, while the button in the UI started
-    // answering `unknown command` / `404`.
+    // that. A command can ship with a working body, a unit test over that
+    // body, an entry in `generate_handler!` and a route on the dev bridge, and
+    // commenting out either of the last two leaves every Rust and every
+    // front-end test green while the UI answers `unknown command` or `404`.
     //
-    // Testing one command's wiring would leave the same hole open for the next
-    // thirty-six, so this reads the two registries out of the file that ships
-    // and requires every `#[tauri::command]` to appear in both. Reading them is
-    // the whole point: a test carrying its own list of commands proves that
-    // list complete, and nothing about the registry.
+    // Checking one command's wiring would leave the same hole open for the
+    // other thirty-five, so this reads the registries out of the file that
+    // ships and requires every `#[tauri::command]` to appear in both. Reading
+    // them is the whole point: a test carrying its own list of commands proves
+    // that list complete and nothing at all about the registry.
+    //
+    // Being *in* the list is not the same as the list being *installed*. The
+    // first version of this check only compared names, and a review killed it
+    // twice over: deleting `.invoke_handler(invoke_handler())` from the builder
+    // left it green, and so did mounting one path on another path's handler.
+    // Both are read here now - the install site inside `run`, and the handler
+    // each route is served by.
     mod command_wiring {
         use syn::punctuated::Punctuated;
         use syn::visit::Visit;
         use syn::{Expr, File, Ident, ItemFn, Lit, Token};
+
+        /// A mounted dev-bridge route: the name after `/api/`, and the handler
+        /// identifier serving it.
+        pub type Route = (String, String);
 
         /// Every function carrying `#[tauri::command]`. `Visit` rather than a
         /// scan of `file.items`, so a command declared inside an inline module
@@ -15937,30 +15873,102 @@ mod tests {
                 .unwrap_or_else(|| Err("invoke_handler contains no generate_handler! call".into()))
         }
 
-        /// The `/api/<name>` paths `dev_bridge_router` mounts. Same fail-closed
-        /// rule as above, and a path that is not a plain string literal is
-        /// reported rather than skipped.
-        pub fn routed(file: &File) -> Result<Vec<String>, String> {
+        /// Whether `run` hands that registry to the builder.
+        ///
+        /// `registered` above proves a name sits inside `invoke_handler`'s
+        /// macro. It says nothing about anyone calling `invoke_handler`, and
+        /// the list is worth exactly nothing until the builder is given it:
+        /// with `.invoke_handler(invoke_handler())` deleted, all thirty-six
+        /// names stay where they are and the packaged app answers `unknown
+        /// command` to every one of them.
+        pub fn installs_handler(file: &File) -> Result<(), String> {
+            #[derive(Default)]
+            struct Collector<'ast> {
+                installs: Vec<Option<&'ast Expr>>,
+            }
+
+            impl<'ast> Visit<'ast> for Collector<'ast> {
+                fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+                    if call.method == "invoke_handler" {
+                        self.installs.push(call.args.first());
+                    }
+
+                    syn::visit::visit_expr_method_call(self, call);
+                }
+            }
+
+            let function = named_function(file, "run")?;
+            let mut collector = Collector::default();
+            collector.visit_item_fn(function);
+
+            let installed = match collector.installs.len() {
+                0 => {
+                    return Err(
+                        "run never calls .invoke_handler, so the app is built with no commands \
+                         registered at all"
+                            .into(),
+                    )
+                }
+                1 => collector.installs[0],
+                count => {
+                    return Err(format!(
+                        "run calls .invoke_handler {count} times, and this check cannot say which \
+                         registry wins"
+                    ))
+                }
+            };
+
+            match installed {
+                Some(Expr::Call(call)) if call.args.is_empty() => {
+                    match last_segment(&call.func).as_deref() {
+                        Some("invoke_handler") => Ok(()),
+                        other => Err(format!(
+                            "run installs {other:?}, not invoke_handler(), so the list this check \
+                             reads is not the list that ships"
+                        )),
+                    }
+                }
+                _ => Err(
+                    "run installs something other than a plain call to invoke_handler(), so this \
+                     check cannot tell which commands ship"
+                        .into(),
+                ),
+            }
+        }
+
+        /// The `/api/<name>` routes `dev_bridge_router` mounts, each with the
+        /// handler serving it. Same fail-closed rule as above, and a route this
+        /// check cannot read is reported rather than skipped - a route it
+        /// cannot read is a route it cannot vouch for.
+        pub fn routed(file: &File) -> Result<Vec<Route>, String> {
             #[derive(Default)]
             struct Collector {
-                paths: Vec<String>,
+                routes: Vec<Route>,
                 problems: Vec<String>,
             }
 
             impl<'ast> Visit<'ast> for Collector {
                 fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
                     if call.method == "route" {
-                        match call.args.first() {
+                        let path = match call.args.first() {
                             Some(Expr::Lit(literal)) => match &literal.lit {
-                                Lit::Str(path) => self.paths.push(path.value()),
-                                _ => self
-                                    .problems
-                                    .push("a route path is not a string literal".into()),
+                                Lit::Str(path) => Some(path.value()),
+                                _ => None,
                             },
-                            _ => self.problems.push(
-                                "a route path is not a literal, so this check cannot read it"
+                            _ => None,
+                        };
+
+                        match path {
+                            None => self.problems.push(
+                                "a route path is not a string literal, so this check cannot read it"
                                     .into(),
                             ),
+                            Some(path) => match route_handler(call.args.iter().nth(1)) {
+                                Ok(handler) => self.routes.push((path, handler)),
+                                Err(problem) => self
+                                    .problems
+                                    .push(format!("route {path} is unreadable: {problem}")),
+                            },
                         }
                     }
 
@@ -15976,21 +15984,52 @@ mod tests {
                 return Err(collector.problems.join("; "));
             }
 
-            if collector.paths.is_empty() {
+            if collector.routes.is_empty() {
                 return Err("dev_bridge_router mounts no routes at all".into());
             }
 
-            let mut names: Vec<String> = collector
-                .paths
+            let mut routes: Vec<Route> = collector
+                .routes
                 .iter()
-                .map(|path| match path.strip_prefix("/api/") {
-                    Some(name) => Ok(name.to_string()),
+                .map(|(path, handler)| match path.strip_prefix("/api/") {
+                    Some(name) => Ok((name.to_string(), handler.clone())),
                     None => Err(format!("route {path} is not under /api/")),
                 })
                 .collect::<Result<_, _>>()?;
-            names.sort();
-            names.dedup();
-            Ok(names)
+            routes.sort();
+            routes.dedup();
+            Ok(routes)
+        }
+
+        /// `post(api_x)` reads as `api_x`.
+        fn route_handler(argument: Option<&Expr>) -> Result<String, String> {
+            let call = match argument {
+                Some(Expr::Call(call)) => call,
+                Some(_) => return Err("the handler is not a `post(..)` call".into()),
+                None => return Err("the route was given no handler at all".into()),
+            };
+
+            match last_segment(&call.func).as_deref() {
+                Some("post") => {}
+                other => return Err(format!("the routing method is {other:?}, not `post`")),
+            }
+
+            match call.args.len() {
+                1 => last_segment(&call.args[0])
+                    .ok_or_else(|| "the handler is not a plain function name".to_string()),
+                count => Err(format!("`post` was given {count} arguments")),
+            }
+        }
+
+        fn last_segment(expr: &Expr) -> Option<String> {
+            match expr {
+                Expr::Path(path) => path
+                    .path
+                    .segments
+                    .last()
+                    .map(|segment| segment.ident.to_string()),
+                _ => None,
+            }
         }
 
         fn named_function<'ast>(file: &'ast File, name: &str) -> Result<&'ast ItemFn, String> {
@@ -16014,99 +16053,153 @@ mod tests {
         }
     }
 
-    const COMMAND_WIRING_FIXTURES: &[(&str, &str, &str)] = &[
-        (
-            "a command missing from the registry",
+    /// A whole miniature crate, so the harness can be shown reporting each
+    /// fault before its silence on the real file is allowed to mean anything.
+    fn wiring_fixture(commands: &str, registry: &str, run_body: &str, routes: &str) -> syn::File {
+        let source = format!(
             r#"
-                #[tauri::command]
-                fn wired() {}
-                #[tauri::command]
-                fn forgotten() {}
-                fn invoke_handler() -> u8 { tauri::generate_handler![wired] }
-                fn dev_bridge_router() -> Router {
-                    Router::new()
-                        .route("/api/wired", post(api_wired))
-                        .route("/api/forgotten", post(api_forgotten))
-                }
-            "#,
-            "forgotten",
-        ),
-        (
-            "a command missing from the dev bridge",
-            r#"
-                #[tauri::command]
-                fn wired() {}
-                #[tauri::command]
-                fn forgotten() {}
-                fn invoke_handler() -> u8 { tauri::generate_handler![wired, forgotten] }
-                fn dev_bridge_router() -> Router {
-                    Router::new().route("/api/wired", post(api_wired))
-                }
-            "#,
-            "forgotten",
-        ),
-        (
-            "everything wired",
-            r#"
-                #[tauri::command]
-                fn wired() {}
-                fn invoke_handler() -> u8 { tauri::generate_handler![wired] }
-                fn dev_bridge_router() -> Router {
-                    Router::new().route("/api/wired", post(api_wired))
-                }
-            "#,
-            "",
-        ),
-    ];
+                {commands}
+                fn invoke_handler() -> u8 {{ {registry} }}
+                fn run() {{ {run_body} }}
+                fn dev_bridge_router() -> Router {{ Router::new(){routes} }}
+            "#
+        );
+        syn::parse_file(&source).unwrap_or_else(|error| panic!("fixture does not parse: {error}"))
+    }
 
-    /// The wiring check itself, plus the self-test that makes its quiet output
-    /// mean something. Reading the shipped file is the last step, deliberately:
-    /// a harness whose evidence is silence has to be shown speaking first.
+    const TWO_COMMANDS: &str = "#[tauri::command] fn alpha() {} #[tauri::command] fn beta() {}";
+    const INSTALLS: &str = "tauri::Builder::default().invoke_handler(invoke_handler()).run(c);";
+    const BOTH_ROUTES: &str =
+        r#".route("/api/alpha", post(api_alpha)).route("/api/beta", post(api_beta))"#;
+
+    /// The wiring check, plus the self-test that makes its quiet output mean
+    /// something. Reading the shipped file is the last step, deliberately: a
+    /// harness whose evidence is silence has to be shown speaking first.
     ///
-    /// **Verification gap, stated rather than papered over.** The dev-bridge
-    /// half also has a live request behind it (below), and the Tauri half does
-    /// not. `tauri::test`'s `MockRuntime` cannot instantiate this registry:
-    /// `ws_connect` takes a `tauri::AppHandle`, which is `AppHandle<Wry>`, so
-    /// `invoke_handler` exists only for `Wry` and `Wry` needs a real window and
-    /// event loop. Making the whole websocket chain generic over the runtime to
-    /// buy a mock IPC round trip was judged the wrong trade against a check
-    /// that reads the registry the compiler is given. What this test proves is
-    /// that the name is in that list - not that the command answers over IPC.
+    /// **Verification gaps, stated rather than papered over.**
+    ///
+    /// 1. The dev-bridge half has a live request behind it (below); the Tauri
+    ///    half does not. `tauri::test`'s `MockRuntime` cannot instantiate this
+    ///    registry: `ws_connect` takes a `tauri::AppHandle`, which is
+    ///    `AppHandle<Wry>`, so `invoke_handler` exists only for `Wry` and `Wry`
+    ///    needs a real window and event loop. Making the whole websocket chain
+    ///    generic over the runtime to buy a mock IPC round trip was judged the
+    ///    wrong trade. What is proved here is that the name is in the list and
+    ///    that the list is installed - not that the command answers over IPC.
+    /// 2. A route is checked as far as the handler it names. That
+    ///    `api_list_projects` calls `list_projects` and not something else is
+    ///    checked for one route only, by the live request below; for the other
+    ///    thirty-five it is not checked at all. Reading it out of the source
+    ///    needs an exception for `api_ws_connect`, which calls
+    ///    `ws_connect_inner`, and a rule with a hand-written exception list is
+    ///    the sort of check that stops meaning anything.
     #[test]
     fn test_every_command_is_reachable_from_both_front_ends() {
-        for (label, source, expected) in COMMAND_WIRING_FIXTURES {
-            let file = syn::parse_file(source)
-                .unwrap_or_else(|error| panic!("fixture {label} does not parse: {error}"));
+        // (i) A command missing from the registry.
+        let file = wiring_fixture(
+            TWO_COMMANDS,
+            "tauri::generate_handler![alpha]",
+            INSTALLS,
+            BOTH_ROUTES,
+        );
+        assert_eq!(
+            unreachable_commands(&file),
+            vec!["beta".to_string()],
+            "a command left out of generate_handler! must be named"
+        );
 
-            let declared = command_wiring::declared(&file);
-            let registered = command_wiring::registered(&file)
-                .unwrap_or_else(|error| panic!("fixture {label}: {error}"));
-            let routed = command_wiring::routed(&file)
-                .unwrap_or_else(|error| panic!("fixture {label}: {error}"));
+        // (ii) A command missing from the dev bridge.
+        let file = wiring_fixture(
+            TWO_COMMANDS,
+            "tauri::generate_handler![alpha, beta]",
+            INSTALLS,
+            r#".route("/api/alpha", post(api_alpha))"#,
+        );
+        assert_eq!(
+            unreachable_commands(&file),
+            vec!["beta".to_string()],
+            "a command left off the dev bridge must be named"
+        );
 
-            let missing: Vec<&String> = declared
-                .iter()
-                .filter(|name| !registered.contains(name) || !routed.contains(name))
-                .collect();
+        // (iii) Everything wired: the harness has to be able to say yes, or
+        // every assertion above passes for the trivial reason.
+        let file = wiring_fixture(
+            TWO_COMMANDS,
+            "tauri::generate_handler![alpha, beta]",
+            INSTALLS,
+            BOTH_ROUTES,
+        );
+        assert!(unreachable_commands(&file).is_empty());
+        assert!(command_wiring::installs_handler(&file).is_ok());
+        assert!(misrouted_paths(&file).is_empty());
 
-            if expected.is_empty() {
-                assert!(
-                    missing.is_empty(),
-                    "fixture {label} should have been accepted, got {missing:?}"
-                );
-            } else {
-                assert!(
-                    missing.iter().any(|name| name.as_str() == *expected),
-                    "fixture {label} should have named {expected:?}, got {missing:?}"
-                );
-            }
+        // (iv) The registry exists and is complete, and nobody installs it.
+        // This is the shape the name comparison alone called green.
+        for (label, run_body) in [
+            ("no install at all", "tauri::Builder::default().run(c);"),
+            (
+                "somebody else's registry",
+                "tauri::Builder::default().invoke_handler(other_handler()).run(c);",
+            ),
+            (
+                "an expression that is not a call",
+                "tauri::Builder::default().invoke_handler(HANDLER).run(c);",
+            ),
+        ] {
+            let file = wiring_fixture(
+                TWO_COMMANDS,
+                "tauri::generate_handler![alpha, beta]",
+                run_body,
+                BOTH_ROUTES,
+            );
+            assert!(
+                unreachable_commands(&file).is_empty(),
+                "{label}: the names are all present, which is exactly the problem"
+            );
+            assert!(
+                command_wiring::installs_handler(&file).is_err(),
+                "{label} must not read as an installed registry"
+            );
         }
 
-        // Absent registries are errors, not empty lists - otherwise deleting
-        // `invoke_handler` outright would read as "no command is unwired".
+        // (v) Every name in both lists, installed - and a path mounted on
+        // another path's handler.
+        let file = wiring_fixture(
+            TWO_COMMANDS,
+            "tauri::generate_handler![alpha, beta]",
+            INSTALLS,
+            r#".route("/api/alpha", post(api_beta)).route("/api/beta", post(api_beta))"#,
+        );
+        assert!(unreachable_commands(&file).is_empty());
+        assert!(command_wiring::installs_handler(&file).is_ok());
+        assert_eq!(misrouted_paths(&file), vec!["/api/alpha -> api_beta"]);
+
+        // (vi) A route this check cannot read is an error, not a route it
+        // quietly drops.
+        for routes in [
+            r#".route("/api/alpha", post(api_alpha)).route("/api/beta", api_beta)"#,
+            r#".route("/api/alpha", post(api_alpha)).route("/api/beta", get(api_beta))"#,
+            r#".route("/api/alpha", post(api_alpha)).route(PATH, post(api_beta))"#,
+        ] {
+            let file = wiring_fixture(
+                TWO_COMMANDS,
+                "tauri::generate_handler![alpha, beta]",
+                INSTALLS,
+                routes,
+            );
+            assert!(
+                command_wiring::routed(&file).is_err(),
+                "an unreadable route must be reported: {routes}"
+            );
+        }
+
+        // (vii) Absent registries are errors, not empty lists - otherwise
+        // deleting `invoke_handler` outright would read as "no command is
+        // unwired".
         let empty = syn::parse_file("fn main() {}").unwrap();
         assert!(command_wiring::registered(&empty).is_err());
         assert!(command_wiring::routed(&empty).is_err());
+        assert!(command_wiring::installs_handler(&empty).is_err());
 
         // Now the file that ships.
         let source =
@@ -16115,12 +16208,12 @@ mod tests {
 
         let declared = command_wiring::declared(&file);
         let registered = command_wiring::registered(&file).unwrap();
-        let routed = command_wiring::routed(&file).unwrap();
+        let routes = command_wiring::routed(&file).unwrap();
 
         // Guards the vacuous pass: an empty `declared` satisfies every
         // assertion below without a single command having been looked at.
         assert!(
-            declared.contains(&"update_project_description".to_string()),
+            declared.contains(&"list_projects".to_string()),
             "the command list did not come out of lib.rs at all: {declared:?}"
         );
 
@@ -16134,6 +16227,11 @@ mod tests {
              `unknown command`: {unregistered:?}"
         );
 
+        // And the list is handed to the builder. Without this the one above is
+        // a statement about a list nobody reads.
+        command_wiring::installs_handler(&file).expect("run must install invoke_handler()");
+
+        let routed: Vec<String> = routes.iter().map(|(path, _)| path.clone()).collect();
         let unrouted: Vec<&String> = declared
             .iter()
             .filter(|name| !routed.contains(name))
@@ -16142,6 +16240,15 @@ mod tests {
             unrouted.is_empty(),
             "declared but not mounted by dev_bridge_router, so `npm run dev:web` \
              answers 404: {unrouted:?}"
+        );
+
+        // Every path is served by the handler named for it. Without this,
+        // moving `/api/list_projects` onto `api_get_data_dir` leaves every name
+        // in every list and silently changes what the path answers.
+        assert!(
+            misrouted_paths(&file).is_empty(),
+            "a dev-bridge path is mounted on another path's handler: {:?}",
+            misrouted_paths(&file)
         );
 
         // The other direction: a registry entry or a route with no command
@@ -16159,17 +16266,47 @@ mod tests {
         assert!(orphan_routes.is_empty(), "{orphan_routes:?}");
     }
 
+    /// Declared commands that either front end cannot reach.
+    fn unreachable_commands(file: &syn::File) -> Vec<String> {
+        let registered = command_wiring::registered(file).unwrap();
+        let routed: Vec<String> = command_wiring::routed(file)
+            .unwrap()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+
+        command_wiring::declared(file)
+            .into_iter()
+            .filter(|name| !registered.contains(name) || !routed.contains(name))
+            .collect()
+    }
+
+    /// Paths served by a handler that is not the one named for them.
+    fn misrouted_paths(file: &syn::File) -> Vec<String> {
+        command_wiring::routed(file)
+            .unwrap()
+            .into_iter()
+            .filter(|(path, handler)| handler != &format!("api_{path}"))
+            .map(|(path, handler)| format!("/api/{path} -> {handler}"))
+            .collect()
+    }
+
     /// The dev bridge half, driven for real: a request over TCP into the router
-    /// the bridge serves. `update_project_description` is the command D25c
-    /// added, and its route is the one whose removal left every test green.
+    /// the bridge serves, on the exact path a review moved onto another
+    /// handler to show that nothing noticed. Nothing about the answer below is
+    /// satisfiable by `api_get_data_dir`.
+    ///
+    /// This is also the one place the third link is checked - that
+    /// `api_list_projects` calls `list_projects` rather than some other
+    /// command. The static check above stops at the handler's name.
     #[tokio::test]
-    async fn test_dev_bridge_route_updates_a_project_description() {
+    async fn test_dev_bridge_serves_the_handler_its_path_is_named_for() {
         let _guard = lock_env();
         let temp_home = tempdir().unwrap();
         let _home_guard = HomeGuard::set(temp_home.path());
         let _token = EnvVarGuard::set(DEV_BRIDGE_TOKEN_ENV, "d25c-test-token");
 
-        create_project("Test API".to_string(), "first wording".to_string()).unwrap();
+        create_project("Test API".to_string(), "the staging gateway".to_string()).unwrap();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -16179,12 +16316,9 @@ mod tests {
 
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let response = client
-            .post(format!("http://{addr}/api/update_project_description"))
+            .post(format!("http://{addr}/api/list_projects"))
             .header("x-apisolo-dev-token", "d25c-test-token")
-            .json(&serde_json::json!({
-                "project": "Test API",
-                "description": "second wording",
-            }))
+            .json(&serde_json::json!({}))
             .send()
             .await
             .unwrap();
@@ -16194,25 +16328,21 @@ mod tests {
         assert_eq!(
             response.status().as_u16(),
             200,
-            "the dev bridge did not serve /api/update_project_description"
+            "the dev bridge did not serve /api/list_projects"
         );
 
         let body: serde_json::Value = response.json().await.unwrap();
         assert_eq!(body["ok"], serde_json::json!(true), "{body}");
-        assert_eq!(body["data"]["description"], "second wording");
 
-        // Read back through `list_projects` rather than through the response: a
-        // route wired to a handler that answers without writing would satisfy
-        // every assertion above.
-        let stored = list_projects().unwrap();
-        assert_eq!(
-            stored
-                .iter()
-                .find(|project| project.name == "Test API")
-                .unwrap()
-                .description,
-            "second wording"
-        );
+        // The project list, not a data directory and not any other command's
+        // answer: `data` is an array whose entries carry the metadata
+        // `list_projects` produces.
+        let projects = body["data"]
+            .as_array()
+            .unwrap_or_else(|| panic!("/api/list_projects did not answer with a list: {body}"));
+        assert_eq!(projects.len(), 1, "{body}");
+        assert_eq!(projects[0]["name"], "Test API");
+        assert_eq!(projects[0]["description"], "the staging gateway");
 
         server.abort();
     }
