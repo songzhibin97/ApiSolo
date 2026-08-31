@@ -1,7 +1,6 @@
 import { getCurrentInstance, onMounted, onUnmounted } from "vue";
 
 import i18n from "../i18n";
-import { useProjectsStore } from "../stores/projects";
 import { useRequestStore } from "../stores/request";
 import { useTabsStore } from "../stores/tabs";
 import { useUIStore } from "../stores/ui";
@@ -11,19 +10,36 @@ const SIDEBAR_ITEMS = ["collections", "history", "environments"] as const;
 export function useKeyboard() {
   const tabsStore = useTabsStore();
   const requestStore = useRequestStore();
-  const projectsStore = useProjectsStore();
   const uiStore = useUIStore();
 
   async function handleKeydown(event: KeyboardEvent) {
-    if (shouldIgnoreEvent(event)) {
-      return;
-    }
-
     if (!event.metaKey && !event.ctrlKey) {
       return;
     }
 
     const key = event.key.toLowerCase();
+
+    if (key === "s") {
+      event.preventDefault();
+      // Handled ahead of the editable guard below, and the only one that is.
+      // The guard exists because a focused field owns Cmd+A, Cmd+C and the
+      // rest — taking those away from it would break text editing. Cmd+S has
+      // no such meaning inside an input, and the moment it is most likely to
+      // be pressed is right after pasting a curl command, with the caret still
+      // in the URL field: dropping it there was the single most common way for
+      // this shortcut to do nothing at all.
+      //
+      // No project check either. This layer used to hold a second copy of the
+      // save button's condition, and a copy that swallows the keystroke is
+      // worse than no shortcut: the panel now owns the decision, so the
+      // shortcut and the button cannot answer differently.
+      window.dispatchEvent(new CustomEvent("apisolo:save-request"));
+      return;
+    }
+
+    if (shouldIgnoreEvent(event)) {
+      return;
+    }
 
     if (key === "enter") {
       event.preventDefault();
@@ -58,14 +74,6 @@ export function useKeyboard() {
     if (key === "w") {
       event.preventDefault();
       await tabsStore.removeTab(tabsStore.activeTab.id);
-      return;
-    }
-
-    if (key === "s") {
-      event.preventDefault();
-      if (projectsStore.activeProject) {
-        window.dispatchEvent(new CustomEvent("apisolo:save-request"));
-      }
       return;
     }
 

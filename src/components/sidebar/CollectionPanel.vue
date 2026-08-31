@@ -49,6 +49,13 @@ const panelMenuItems = computed<ContextMenuItem[]>(() => [
   },
 ])
 
+// Straight off the list `list_projects` returned, not a copy kept beside it.
+// The description used to be write-only: `create_project` took it, the store
+// mapped it, and no component ever read it back.
+const activeProjectMeta = computed(
+  () => projects.value.find((project) => project.name === activeProject.value) ?? null,
+)
+
 const folderOptions = computed(() => {
   const folders = flattenFolders(collectionTree.value)
   return [{ label: t("common.rootCollection"), value: "" }, ...folders]
@@ -429,6 +436,30 @@ function slugify(value: string) {
           <Download :size="14" />
         </button>
       </div>
+      <!--
+        Read-only. A native <option> renders one flat string, so the description
+        cannot be secondary text inside the dropdown itself; it sits under the
+        selector instead, where it can be styled as secondary and can wrap.
+
+        There is no edit control here on purpose: the project metadata file is
+        written by an unlocked read-modify-write, so an edit made through the UI
+        can be silently rolled back by a concurrent writer. Offering the field
+        for editing before that is fixed would be offering an edit that may not
+        stick. Filed as D39, together with the editing entry point.
+      -->
+      <div
+        v-if="activeProjectMeta"
+        class="mt-2 text-xs leading-5"
+        :class="
+          activeProjectMeta.description
+            ? 'text-[var(--text-secondary)]'
+            : 'italic text-[color-mix(in_srgb,var(--text-secondary)_70%,transparent)]'
+        "
+        data-testid="active-project-description"
+      >
+        {{ activeProjectMeta.description || t("sidebar.noProjectDescription") }}
+      </div>
+
       <div
         v-if="feedbackMessage"
         class="mt-3 text-xs"
