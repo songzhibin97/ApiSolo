@@ -5560,14 +5560,15 @@ pub async fn run_dev_server() {
 }
 
 /// The application's one and only command registry, extracted out of the
-/// builder chain so the wiring check has a named place to read it from - the
+/// builder chain so the registry check has a named place to read it from - the
 /// same reason `dev_bridge_router` is a function. A test that listed the
 /// commands again would only ever prove its own copy complete.
 ///
 /// It cannot be generic over the runtime: `ws_connect` takes a
 /// `tauri::AppHandle`, which is `AppHandle<Wry>`, so the registry only exists
 /// for `Wry`. That is what puts a real IPC round trip out of reach here - see
-/// the note on `test_every_command_is_reachable_from_both_front_ends`.
+/// the note on
+/// `test_every_command_is_registered_and_every_path_matches_its_wrapper`.
 fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
         ws_prepare,
@@ -15756,15 +15757,15 @@ mod tests {
             );
         }
     }
-    // ------------------------------------- D25c (command wiring, P8)
-    // A command has to be *reachable*, and nothing in the compiler checks
-    // that. A command can ship with a working body, a unit test over that
-    // body, an entry in `generate_handler!` and a route on the dev bridge, and
-    // commenting out either of the last two leaves every Rust and every
-    // front-end test green while the UI answers `unknown command` or `404`.
+    // ------------------------------------- D25c (command registry, P8)
+    // Nothing in the compiler checks that a command was wired up. A command can
+    // ship with a working body, a unit test over that body, an entry in
+    // `generate_handler!` and a route on the dev bridge, and commenting out
+    // either of the last two leaves every Rust and every front-end test green
+    // while the UI answers `unknown command` or `404`.
     //
-    // Checking one command's wiring would leave the same hole open for the
-    // other thirty-five, so this reads the registries out of the file that
+    // Checking one command's registration would leave the same hole open for
+    // the other thirty-five, so this reads the registries out of the file that
     // ships and requires every `#[tauri::command]` to appear in both. Reading
     // them is the whole point: a test carrying its own list of commands proves
     // that list complete and nothing at all about the registry.
@@ -15775,6 +15776,15 @@ mod tests {
     // left it green, and so did mounting one path on another path's handler.
     // Both are read here now - the install site inside `run`, and the handler
     // each route is served by.
+    //
+    // **This is registration, not reachability, and the difference is not
+    // cosmetic.** A second review made `api_clear_history` answer `Ok(())`
+    // without calling `clear_history`; every assertion below stayed green and
+    // an HTTP probe returned 200 with the history still on disk. The check
+    // reads as far as the handler a path *names*. Whether that handler calls
+    // the command it is named after is checked for exactly one route, by
+    // `test_the_dev_bridge_answers_from_the_command_its_path_names`, and for the
+    // other thirty-five it is not checked at all - see the note on this test.
     mod command_wiring {
         use syn::punctuated::Punctuated;
         use syn::visit::Visit;
@@ -16072,29 +16082,40 @@ mod tests {
     const BOTH_ROUTES: &str =
         r#".route("/api/alpha", post(api_alpha)).route("/api/beta", post(api_beta))"#;
 
-    /// The wiring check, plus the self-test that makes its quiet output mean
-    /// something. Reading the shipped file is the last step, deliberately: a
+    /// Three things, and no more than three: every `#[tauri::command]` appears
+    /// in `generate_handler!`, that registry is installed on the builder, and
+    /// every `/api/<name>` route is mounted on the handler named `api_<name>`.
+    /// Plus the self-test that makes the check's quiet output mean something -
+    /// reading the shipped file is the last step, deliberately, because a
     /// harness whose evidence is silence has to be shown speaking first.
     ///
-    /// **Verification gaps, stated rather than papered over.**
+    /// **What it is not: a reachability check.** The name says registry on
+    /// purpose. The three facts above are all statically readable; whether a
+    /// command *answers* is not, and an earlier version of this test claimed it
+    /// did. Two gaps sit between these assertions and reachability, and both
+    /// are open:
     ///
-    /// 1. The dev-bridge half has a live request behind it (below); the Tauri
-    ///    half does not. `tauri::test`'s `MockRuntime` cannot instantiate this
-    ///    registry: `ws_connect` takes a `tauri::AppHandle`, which is
-    ///    `AppHandle<Wry>`, so `invoke_handler` exists only for `Wry` and `Wry`
-    ///    needs a real window and event loop. Making the whole websocket chain
-    ///    generic over the runtime to buy a mock IPC round trip was judged the
-    ///    wrong trade. What is proved here is that the name is in the list and
-    ///    that the list is installed - not that the command answers over IPC.
-    /// 2. A route is checked as far as the handler it names. That
-    ///    `api_list_projects` calls `list_projects` and not something else is
-    ///    checked for one route only, by the live request below; for the other
-    ///    thirty-five it is not checked at all. Reading it out of the source
+    /// 1. **Tauri IPC is never exercised.** `tauri::test`'s `MockRuntime`
+    ///    cannot instantiate this registry: `ws_connect` takes a
+    ///    `tauri::AppHandle`, which is `AppHandle<Wry>`, so `invoke_handler`
+    ///    exists only for `Wry` and `Wry` needs a real window and event loop.
+    ///    Making the whole websocket chain generic over the runtime to buy a
+    ///    mock IPC round trip was judged the wrong trade. So: the name is in
+    ///    the installed list, and nothing here says the command answers over
+    ///    IPC.
+    /// 2. **The wrapper body is unread.** A route is checked as far as the
+    ///    handler it *names*. A review rewrote `api_clear_history` to answer
+    ///    `Ok(())` without calling `clear_history`; this test stayed green and
+    ///    an HTTP probe returned 200 with the history still on disk. That link
+    ///    is covered for exactly one route, by
+    ///    `test_the_dev_bridge_answers_from_the_command_its_path_names`, and for
+    ///    the other thirty-five it is not covered. Reading it out of the source
     ///    needs an exception for `api_ws_connect`, which calls
-    ///    `ws_connect_inner`, and a rule with a hand-written exception list is
-    ///    the sort of check that stops meaning anything.
+    ///    `ws_connect_inner`, and a rule carrying a hand-written exception list
+    ///    is the sort of check that stops meaning anything - so it stays a
+    ///    registered gap rather than a weaker assertion.
     #[test]
-    fn test_every_command_is_reachable_from_both_front_ends() {
+    fn test_every_command_is_registered_and_every_path_matches_its_wrapper() {
         // (i) A command missing from the registry.
         let file = wiring_fixture(
             TWO_COMMANDS,
@@ -16103,7 +16124,7 @@ mod tests {
             BOTH_ROUTES,
         );
         assert_eq!(
-            unreachable_commands(&file),
+            unregistered_commands(&file),
             vec!["beta".to_string()],
             "a command left out of generate_handler! must be named"
         );
@@ -16116,7 +16137,7 @@ mod tests {
             r#".route("/api/alpha", post(api_alpha))"#,
         );
         assert_eq!(
-            unreachable_commands(&file),
+            unregistered_commands(&file),
             vec!["beta".to_string()],
             "a command left off the dev bridge must be named"
         );
@@ -16129,7 +16150,7 @@ mod tests {
             INSTALLS,
             BOTH_ROUTES,
         );
-        assert!(unreachable_commands(&file).is_empty());
+        assert!(unregistered_commands(&file).is_empty());
         assert!(command_wiring::installs_handler(&file).is_ok());
         assert!(misrouted_paths(&file).is_empty());
 
@@ -16153,7 +16174,7 @@ mod tests {
                 BOTH_ROUTES,
             );
             assert!(
-                unreachable_commands(&file).is_empty(),
+                unregistered_commands(&file).is_empty(),
                 "{label}: the names are all present, which is exactly the problem"
             );
             assert!(
@@ -16170,7 +16191,7 @@ mod tests {
             INSTALLS,
             r#".route("/api/alpha", post(api_beta)).route("/api/beta", post(api_beta))"#,
         );
-        assert!(unreachable_commands(&file).is_empty());
+        assert!(unregistered_commands(&file).is_empty());
         assert!(command_wiring::installs_handler(&file).is_ok());
         assert_eq!(misrouted_paths(&file), vec!["/api/alpha -> api_beta"]);
 
@@ -16266,8 +16287,8 @@ mod tests {
         assert!(orphan_routes.is_empty(), "{orphan_routes:?}");
     }
 
-    /// Declared commands that either front end cannot reach.
-    fn unreachable_commands(file: &syn::File) -> Vec<String> {
+    /// Declared commands missing from either registry.
+    fn unregistered_commands(file: &syn::File) -> Vec<String> {
         let registered = command_wiring::registered(file).unwrap();
         let routed: Vec<String> = command_wiring::routed(file)
             .unwrap()
@@ -16292,15 +16313,17 @@ mod tests {
     }
 
     /// The dev bridge half, driven for real: a request over TCP into the router
-    /// the bridge serves, on the exact path a review moved onto another
-    /// handler to show that nothing noticed. Nothing about the answer below is
+    /// the bridge serves, on the exact path a review moved onto another handler
+    /// to show that nothing noticed. Nothing about the answer below is
     /// satisfiable by `api_get_data_dir`.
     ///
-    /// This is also the one place the third link is checked - that
-    /// `api_list_projects` calls `list_projects` rather than some other
-    /// command. The static check above stops at the handler's name.
+    /// This is the one route where reachability is actually established - the
+    /// path is mounted, the wrapper behind it calls `list_projects`, and the
+    /// answer carries what that command produces. The static check above stops
+    /// at the handler's name; gap 2 in its doc comment is this test's scope,
+    /// and it is one route wide.
     #[tokio::test]
-    async fn test_dev_bridge_serves_the_handler_its_path_is_named_for() {
+    async fn test_the_dev_bridge_answers_from_the_command_its_path_names() {
         let _guard = lock_env();
         let temp_home = tempdir().unwrap();
         let _home_guard = HomeGuard::set(temp_home.path());
