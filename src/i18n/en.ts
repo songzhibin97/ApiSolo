@@ -66,6 +66,9 @@ export default {
     save: "Save",
     curlCopied: "cURL copied",
     saveRequest: "Save Request",
+    saveNeedsProject:
+      "There is no project yet. A saved request lives inside a project, so create one first in the Collections panel — then save this request.",
+    saveNeedsProjectAction: "Open the Collections panel",
     requestName: "Request name",
     requestNameExample: "For example: Get user info",
     saveLocation: "Save location",
@@ -191,6 +194,7 @@ export default {
     createProject: "Create project",
     projectName: "Project name",
     description: "Description",
+    noProjectDescription: "No description yet",
     newCollection: "New Collection",
     createCollection: "Create collection",
     collectionName: "Collection name",
