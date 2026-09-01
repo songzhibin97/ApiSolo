@@ -435,7 +435,7 @@ describe("D32 the response body action bar", () => {
 
       expect(wrapper.find(STATUS).exists()).toBe(false)
       expect(wrapper.find(COPY).attributes("title")).toBe(
-        "Copy and download give the complete body (5 characters); the view above may be formatted or cut short.",
+        "Copy and download give the complete body (5 characters); the view on screen may be formatted or cut short.",
       )
     })
 
@@ -443,7 +443,7 @@ describe("D32 the response body action bar", () => {
       const wrapper = mountBody({ body: "z".repeat(OVER_CAP), contentType: "text/plain" })
 
       expect(wrapper.find(STATUS).text()).toBe(
-        "Copy and download give the complete body (500001 characters); the view above may be formatted or cut short.",
+        "Copy and download give the complete body (500001 characters); the view on screen may be formatted or cut short.",
       )
     })
 
@@ -626,13 +626,74 @@ describe("D32 the response body action bar", () => {
     it("counts an astral character once", () => {
       const wrapper = mountBody({ body: "😀", contentType: "text/plain", bodyTruncated: true })
 
-      expect(wrapper.find(STATUS).text()).toContain("(1 characters)")
+      expect(wrapper.find(STATUS).text()).toContain("(1 character)")
     })
 
     it("counts an ordinary character once as well", () => {
       const wrapper = mountBody({ body: "ab", contentType: "text/plain", bodyTruncated: true })
 
       expect(wrapper.find(STATUS).text()).toContain("(2 characters)")
+    })
+  })
+
+  /**
+   * D41 defect B: all three counted sentences read "1 characters" for a
+   * one-code-point body. Every state that names a count is exercised, because
+   * the count reaches them through one shared key and a fix applied to one
+   * call site would look identical from any single state.
+   *
+   * `(1 character)` is asserted with its closing bracket on purpose: without
+   * it the string is a prefix of `(1 characters)` and the assertion would pass
+   * on the bug it exists to catch.
+   */
+  describe("a one-character body reads as one character", () => {
+    // No cut of any kind, so there is no visible note -- the sentence is only
+    // reachable here through the button tooltip that carries it.
+    it("says character, singular, when the whole body is one code point", () => {
+      const wrapper = mountBody({ body: "z", contentType: "text/plain" })
+
+      expect(wrapper.find(COPY).attributes("title")).toBe(
+        "Copy and download give the complete body (1 character); the view on screen may be formatted or cut short.",
+      )
+    })
+
+    it("says character, singular, when one code point is all that arrived", () => {
+      const wrapper = mountBody({
+        body: "z",
+        contentType: "text/plain",
+        bodyTruncated: true,
+      })
+
+      expect(wrapper.find(STATUS).text()).toBe(
+        "Copy and download give the part of the body that was received (1 character); the rest was never read from the network.",
+      )
+    })
+
+    it("says character, singular, for a one code point replayed body", () => {
+      const wrapper = mountBody({
+        body: "z",
+        contentType: "text/plain",
+        bodySource: "history",
+      })
+
+      expect(wrapper.find(STATUS).text()).toContain("(1 character)")
+    })
+
+    // Chinese has no singular form to pick. The shared key must stay a plain
+    // sentence there rather than acquiring an English-shaped `|` split, which
+    // would silently cut the Chinese count in half.
+    it("leaves the other locale reading the same at one as at two", () => {
+      const one = mountBody(
+        { body: "z", contentType: "text/plain", bodyTruncated: true },
+        "zh-CN",
+      )
+      const two = mountBody(
+        { body: "zz", contentType: "text/plain", bodyTruncated: true },
+        "zh-CN",
+      )
+
+      expect(one.find(STATUS).text()).toContain("（1 个字符）")
+      expect(two.find(STATUS).text()).toContain("（2 个字符）")
     })
   })
 })
