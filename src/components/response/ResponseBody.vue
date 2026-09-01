@@ -159,15 +159,21 @@ const actionScopeText = computed(() => {
     return t("response.bodyScopeEmpty");
   }
 
+  // The count is rendered by its own key so English can carry a singular form
+  // without every sentence around it existing twice. Sentences that hold two
+  // near-identical copies of themselves are kept in agreement by nothing but
+  // care, and `bodyScopeStored` is fifty words long.
+  const characters = t("response.bodyCharacterCount", bodyLength.value);
+
   if (props.bodySource !== "network") {
-    return t("response.bodyScopeStored", { count: bodyLength.value });
+    return t("response.bodyScopeStored", { characters });
   }
 
   if (isNetworkTruncated.value) {
-    return t("response.bodyScopeReceived", { count: bodyLength.value });
+    return t("response.bodyScopeReceived", { characters });
   }
 
-  return t("response.bodyScopeFull", { count: bodyLength.value });
+  return t("response.bodyScopeFull", { characters });
 });
 
 /**

@@ -149,17 +149,21 @@ const MATRIX: Record<string, { "zh-CN": string; en: string }> = {
     "zh-CN": "下载",
     en: "Download",
   },
+  "response.bodyCharacterCount": {
+    "zh-CN": "{count} 个字符",
+    en: "{count} character | {count} characters",
+  },
   "response.bodyScopeFull": {
-    "zh-CN": "复制与下载给出完整正文（{count} 个字符）；上面的视图可能已格式化或已截断。",
-    en: "Copy and download give the complete body ({count} characters); the view above may be formatted or cut short.",
+    "zh-CN": "复制与下载给出完整正文（{characters}）；显示的视图可能已格式化或已截断。",
+    en: "Copy and download give the complete body ({characters}); the view on screen may be formatted or cut short.",
   },
   "response.bodyScopeReceived": {
-    "zh-CN": "复制与下载给出已接收的正文（{count} 个字符）；其余部分从未从网络读到。",
-    en: "Copy and download give the part of the body that was received ({count} characters); the rest was never read from the network.",
+    "zh-CN": "复制与下载给出已接收的正文（{characters}）；其余部分从未从网络读到。",
+    en: "Copy and download give the part of the body that was received ({characters}); the rest was never read from the network.",
   },
   "response.bodyScopeStored": {
-    "zh-CN": "复制与下载给出 ApiSolo 手里的这份正文（{count} 个字符）。ApiSolo 无法确认它就是完整响应：只有直接从网络读到的正文才能被担保，而历史在保存时会把过长的正文截短。",
-    en: "Copy and download give this body as ApiSolo holds it ({count} characters). ApiSolo cannot confirm it is the whole response: only a body read straight off the network can be vouched for, and history shortens long bodies when it saves them.",
+    "zh-CN": "复制与下载给出 ApiSolo 手里的这份正文（{characters}）。ApiSolo 无法确认它就是完整响应：只有直接从网络读到的正文才能被担保，而历史在保存时会把过长的正文截短。",
+    en: "Copy and download give this body as ApiSolo holds it ({characters}). ApiSolo cannot confirm it is the whole response: only a body read straight off the network can be vouched for, and history shortens long bodies when it saves them.",
   },
   "response.bodyScopeEmpty": {
     "zh-CN": "响应体为空，没有可复制或下载的内容。",
@@ -219,6 +223,38 @@ describe("§59 every key this slice touches matches the spec table word for word
     for (const locale of ["zh-CN", "en"] as const) {
       i18n.global.locale.value = locale
       expect(`${locale}: ${i18n.global.t(key)}`).not.toBe(`${locale}: ${key}`)
+    }
+  })
+})
+/**
+ * D41 defect A: `bodyScopeFull` said "the view above" while the view renders
+ * after the note in `ResponseBody.vue`. A sentence naming a layout position is
+ * a second copy of the template's ordering kept in agreement by nothing but
+ * care, and the same sentence is also served as the Copy/Download `title`,
+ * where a tooltip floating over the cursor has no "above" to point at.
+ *
+ * The rule this pins is that the family says *what* the view is, never where
+ * it sits. It reads the family out of the catalog instead of listing it, so a
+ * fifth scope sentence is covered on the day someone adds it -- the verbatim
+ * matrix above only guards the four that exist today.
+ */
+const POSITIONAL: Record<string, RegExp> = {
+  en: /\b(above|below|beneath|underneath|upper|lower|top|bottom|left|right)\b/i,
+  "zh-CN": /上面|下面|上方|下方|左边|右边|左侧|右侧|顶部|底部/,
+}
+
+const SCOPE_KEY = /^body(Scope|CharacterCount)/
+
+describe("§59 the scope copy never says where the view sits", () => {
+  it.each(["zh-CN", "en"] as const)("%s scope sentences name no position", (locale) => {
+    const response = (SOURCES[locale] as { response: Record<string, string> }).response
+    const keys = Object.keys(response).filter((key) => SCOPE_KEY.test(key))
+
+    // Guards the guard: a renamed family would otherwise make this vacuous.
+    expect(keys).toHaveLength(5)
+
+    for (const key of keys) {
+      expect(`${key}: ${POSITIONAL[locale].test(response[key])}`).toBe(`${key}: false`)
     }
   })
 })
