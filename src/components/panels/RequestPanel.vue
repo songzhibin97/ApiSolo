@@ -250,6 +250,22 @@ async function cancelRequest() {
 }
 
 function openSaveDialog() {
+  // Re-entry into a dialog that is already on screen is not an open. Every
+  // line below this point re-derives the dialog's fields from the tab, and the
+  // user is looking at those fields: the name they are part-way through typing
+  // and the collection they picked are exactly what would be overwritten.
+  //
+  // The guard is here rather than in the keyboard layer because the caller is
+  // the thing that multiplies. Cmd+S reaches this function through the same
+  // event whether the caret is in the URL field or in this dialog's own name
+  // field -- deliberately, since D25c -- and no layer above can tell those two
+  // apart without being told which dialog is open and which of its fields
+  // belong to it. Asked at the destination the question needs neither: an open
+  // dialog has nothing to initialise.
+  if (showSaveDialog.value) {
+    return;
+  }
+
   // The one place that decides what "save with no project" does. The button
   // used to disappear and the shortcut used to return in silence — two
   // independent copies of the same condition, in two files, and only one of
@@ -612,6 +628,7 @@ onUnmounted(() => {
             </div>
             <select
               v-model="saveCollection"
+              data-testid="request-save-collection"
               class="h-9 w-full rounded border border-[var(--border)] bg-[var(--bg-secondary)] px-3 text-sm text-[var(--text-primary)] outline-none transition focus:border-[color-mix(in_srgb,var(--accent)_70%,white)]"
             >
               <option v-for="option in collectionOptions" :key="option.value || 'root'" :value="option.value">
@@ -621,6 +638,7 @@ onUnmounted(() => {
 
             <input
               v-model="saveName"
+              data-testid="request-save-name"
               class="h-9 w-full rounded border border-[var(--border)] bg-[var(--bg-secondary)] px-3 text-sm text-[var(--text-primary)] outline-none transition focus:border-[color-mix(in_srgb,var(--accent)_70%,white)]"
               type="text"
               :placeholder="t('request.requestNameExample')"
