@@ -243,8 +243,16 @@ function flatten(node: unknown, prefix = ""): Array<[string, string]> {
  * The raw matrix above cannot see this defect -- "{count} requests" is what it
  * is -- so these read the *rendered* sentence at one and at two.
  *
- * Chinese has no form to pick, so its row is one plain sentence, asserted at
- * one: a `|` carried into it by mistake would render half the sentence.
+ * Chinese has no form to pick, so its row is one plain sentence. Three things
+ * are asserted about it: the rendering at one equals the column; the rendering
+ * at two equals the column with its single `1` (the count) swapped for `2`; and
+ * the source carries no `|`. A `|` that splits the sentence into two different
+ * halves reddens both the rendering at two and the source check; identical
+ * halves (`X | X`) render whole at two and only the source check sees them. No
+ * catalog edit reddens the rendering at two on its own -- vue-i18n has nothing
+ * to choose from in a one-form message -- so that assertion is redundant with
+ * the source check for catalog mutations and is kept because it pins the text
+ * the user sees, not the character.
  *
  * `named` marks the one key whose placeholder is not `{count}`. vue-i18n reads
  * the choice from a named `count`/`n` or from the plural argument, nothing
@@ -330,15 +338,105 @@ describe("D44 a counted sentence agrees with its count", () => {
     )
   })
 
-  // Guards the guard. The class is read out of the catalog -- every English
-  // message with a plural split -- so a counted key added without a row here
-  // fails instead of going unasserted, and a row left behind after its key
-  // lost the split fails too.
-  it("has a row for every English message that carries a plural split", () => {
+  it.each(Object.entries(COUNTED))("%s reads the same sentence at two in zh-CN", (key, expected) => {
+    expect(`zh-CN@2: ${rendered("zh-CN", key, 2, expected.named)}`).toBe(
+      `zh-CN@2: ${expected["zh-CN"].replace("1", "2")}`,
+    )
+  })
+
+  it.each(Object.keys(COUNTED))("%s carries no plural split in its zh-CN source", (key) => {
+    const source = rawMessage("zh-CN", key)
+    expect(typeof source).toBe("string")
+    expect(`${key}: ${source}`).not.toContain("|")
+  })
+})
+
+/**
+ * Every placeholder in the English catalog, sorted by what a caller puts in it.
+ * The inventory was read out of the catalog, not from memory:
+ *
+ *   grep -oE '\{[A-Za-z_][A-Za-z0-9_]*\}' src/i18n/en.ts | sort | uniq -c
+ *
+ * `count`, `starred` and `index` take a number. The rest take a field name, a
+ * URL, a method, a timestamp, a file path, a format name, a size already
+ * formatted with its unit (`{limit}`, `{size}`), or a sentence already rendered
+ * (`{characters}` is `bodyCharacterCount` at its count). Which side a name
+ * belongs on is a reading of its call sites, done by hand; that the inventory
+ * is complete is asserted, so a new placeholder fails until it is sorted.
+ */
+const PLACEHOLDERS = {
+  numeric: ["count", "starred", "index"],
+  text: ["at", "characters", "field", "fields", "format", "key", "limit", "method", "name", "path", "size", "url", "variable"],
+}
+
+const PLACEHOLDER = /\{([A-Za-z_][A-Za-z0-9_]*)\}/g
+const NUMERIC_PLACEHOLDER = new RegExp(`\\{(${PLACEHOLDERS.numeric.join("|")})\\}`)
+
+/**
+ * English messages that interpolate a number but set no noun beside it, so
+ * there is no form to agree. An exception is granted to a sentence, not to a
+ * key: the text is pinned, and a rewrite that puts a noun after the number
+ * ("{count} dropped messages") fails here until the sentence is split and given
+ * a COUNTED row, or the pin is moved on purpose. An entry whose key is not in
+ * the catalog, whose text carries no number, or whose text carries a `|` fails
+ * too, so the list cannot go stale.
+ */
+const NO_NOUN: Record<string, { text: string; reason: string }> = {
+  "ws.droppedMessages": {
+    text: "{count} dropped",
+    reason: "the count stands alone; nothing follows it to agree with",
+  },
+  "tabs.untitled": {
+    text: "Untitled {index}",
+    reason: "a serial suffix (Untitled 3), not a count of anything",
+  },
+}
+
+/**
+ * Guards the guard, and says how far it reaches. The class is derived from the
+ * catalog two ways: every English message that carries a `|` must have a
+ * COUNTED row and every row must have a `|` message (so a row cannot outlive
+ * its split, and a split cannot go unasserted); and every English message that
+ * interpolates a number must either carry a `|` or be pinned in NO_NOUN (so a
+ * counted sentence written without a split fails instead of shipping as
+ * "1 requests").
+ *
+ * What this does not reach: a sentence that concatenates a number to a
+ * translated noun in the template, with no placeholder in the catalog.
+ * `response.items` is that shape -- `JsonTreeView.vue` renders
+ * `${entries.length} ${t("response.items", entries.length)}` -- and it has a row
+ * only because a person read the call site. The catalog carries no number for
+ * it, so no scan of the catalog can find the next one. That gap is registered
+ * here, not closed.
+ */
+describe("D44 the counted class is read out of the catalog", () => {
+  it("sorts every placeholder in the English catalog as a number or as text", () => {
+    const found = new Set(
+      flatten(en).flatMap(([, text]) => [...text.matchAll(PLACEHOLDER)].map((match) => match[1])),
+    )
+    expect([...found].sort()).toEqual([...PLACEHOLDERS.numeric, ...PLACEHOLDERS.text].sort())
+  })
+
+  it("has a row for every English message that carries a plural split, and no other", () => {
     const split = flatten(en)
       .filter(([, text]) => text.includes("|"))
       .map(([key]) => key)
     expect(split.sort()).toEqual(Object.keys(COUNTED).sort())
+  })
+
+  it("splits every English message that interpolates a number, unless it is pinned as noun-free", () => {
+    const unsplit = flatten(en)
+      .filter(([key, text]) => NUMERIC_PLACEHOLDER.test(text) && !text.includes("|") && !(key in NO_NOUN))
+      .map(([key]) => key)
+    expect(unsplit).toEqual([])
+  })
+
+  it.each(Object.entries(NO_NOUN))("%s is excepted for exactly the noun-free sentence it was granted for", (key, exception) => {
+    expect(`${key}: ${rawMessage("en", key)}`).toBe(`${key}: ${exception.text}`)
+    expect(`${key} interpolates a number: ${NUMERIC_PLACEHOLDER.test(exception.text)}`).toBe(
+      `${key} interpolates a number: true`,
+    )
+    expect(`${key}: ${exception.text}`).not.toContain("|")
   })
 })
 
