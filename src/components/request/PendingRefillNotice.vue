@@ -53,7 +53,7 @@ function toggle(value: boolean) {
       data-testid="pending-group-refill"
       class="rounded border border-amber-500/40 bg-amber-500/10 p-3 text-xs leading-5 text-amber-200"
     >
-      <div class="font-semibold">{{ t(titleKey("refill"), { count: refill.length }) }}</div>
+      <div class="font-semibold">{{ t(titleKey("refill"), refill.length) }}</div>
       <ul class="mt-2 max-h-32 space-y-1 overflow-auto">
         <!--
           Keyed by position, not by text: the same key redacted twice is two
@@ -78,7 +78,7 @@ function toggle(value: boolean) {
       class="rounded border border-amber-500/40 bg-amber-500/10 p-3 text-xs leading-5 text-amber-200"
     >
       <div class="font-semibold">
-        {{ t(titleKey("refill-unverifiable"), { count: unverifiable.length }) }}
+        {{ t(titleKey("refill-unverifiable"), unverifiable.length) }}
       </div>
       <ul class="mt-2 max-h-32 space-y-1 overflow-auto">
         <li v-for="(field, index) in unverifiable" :key="`unverifiable-${index}`" class="font-mono">
@@ -93,7 +93,7 @@ function toggle(value: boolean) {
       class="rounded border border-sky-500/40 bg-sky-500/10 p-3 text-xs leading-5 text-sky-200"
     >
       <div class="font-semibold">
-        {{ t(titleKey("reselect-file"), { count: reselect.length }) }}
+        {{ t(titleKey("reselect-file"), reselect.length) }}
       </div>
       <ul class="mt-2 max-h-32 space-y-1 overflow-auto">
         <li v-for="(field, index) in reselect" :key="`reselect-${index}`" class="font-mono">

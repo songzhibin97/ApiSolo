@@ -673,7 +673,7 @@ function slugify(value: string) {
             {{ importPreview.name }}
           </div>
           <div class="text-[var(--text-secondary)]">
-            {{ t("import.requestCount", { count: importPreview.requests.length }) }}
+            {{ t("import.requestCount", importPreview.requests.length) }}
           </div>
         </div>
 

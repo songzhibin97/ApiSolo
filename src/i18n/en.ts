@@ -154,7 +154,7 @@ export default {
     bodyScopeReceived: "Copy and download give the part of the body that was received ({characters}); the rest was never read from the network.",
     bodyScopeStored: "Copy and download give this body as ApiSolo holds it ({characters}). ApiSolo cannot confirm it is the whole response: only a body read straight off the network can be vouched for, and history shortens long bodies when it saves them.",
     bodyScopeEmpty: "The response body is empty — there is nothing to copy or download.",
-    items: "items",
+    items: "item | items",
     headers: "Headers",
     cookies: "Cookies",
     tests: "Tests",
@@ -208,7 +208,7 @@ export default {
     selectFile: "Select File",
     supportedFormats: "Supported formats: Postman Collection (JSON), OpenAPI 3.0 (JSON)",
     detected: "Detected {format} format",
-    requestCount: "Will import {count} requests",
+    requestCount: "Will import {count} request | Will import {count} requests",
     import: "Import",
     success: "Import successful",
     error: "Import failed",
@@ -238,25 +238,28 @@ export default {
     depth: "Depth",
     securityNotice:
       "History redacts by field name: values of cookie / authorization / token / password fields are never written to disk; anything under other field names is saved as-is. A request opened from history needs those values re-entered before it will succeed.",
-    legacySanitized: "Removed plaintext credentials from {count} history entries.",
+    legacySanitized:
+      "Removed plaintext credentials from {count} history entry. | Removed plaintext credentials from {count} history entries.",
     empty: "History is empty",
     emptyDescription: "Sent requests will appear here with grouping, search, and quick reopen actions.",
     clearHistory: "Clear History",
-    clearConfirm: "Clear all {count} history entries? This action cannot be undone.",
-    clearWithStarred: "This includes {starred} starred entries, which will be deleted as well.",
+    clearConfirm:
+      "Clear {count} history entry? This action cannot be undone. | Clear all {count} history entries? This action cannot be undone.",
+    clearWithStarred:
+      "This includes {starred} starred entry, which will be deleted as well. | This includes {starred} starred entries, which will be deleted as well.",
     saveToCollection: "Save to collection",
     saveNeedsProject: "Select a project first — collections live inside a project.",
     refillTitle:
-      "These {count} fields were redacted in history and will be saved empty. They must be re-entered:",
+      "This field was redacted in history and will be saved empty. It must be re-entered: | These {count} fields were redacted in history and will be saved empty. They must be re-entered:",
     refillUnparseableBody:
-      "The request body is not valid JSON, so ApiSolo cannot tell whether the {count} redacted fields in it have been re-entered. Make the body valid JSON, or switch the body type, and this notice goes away.",
+      "The request body is not valid JSON, so ApiSolo cannot tell whether the redacted field in it has been re-entered. Make the body valid JSON, or switch the body type, and this notice goes away. | The request body is not valid JSON, so ApiSolo cannot tell whether the {count} redacted fields in it have been re-entered. Make the body valid JSON, or switch the body type, and this notice goes away.",
     reselectFileTitle:
-      "These {count} files must be re-selected — history does not store file contents:",
+      "This file must be re-selected — history does not store file contents: | These {count} files must be re-selected — history does not store file contents:",
     refillAck: "I understand the saved request needs these fields re-entered",
     deleteEntry: "Delete this entry",
     deleteConfirm: "Delete the history entry for {method} {url}?",
     healthBadRows:
-      "{count} history lines cannot be parsed and are not shown in the list. Clear History still works.",
+      "{count} history line cannot be parsed and is not shown in the list. Clear History still works. | {count} history lines cannot be parsed and are not shown in the list. Clear History still works.",
     note: "Note",
     notePlaceholder: "Note why this one is worth keeping",
     star: "Star",
@@ -306,9 +309,10 @@ export default {
     showSecretValues: "Show secret values",
     deleteConfirm: "Delete environment \"{name}\"?",
     nameRequired: "Environment name",
-    collisionTitle: "{count} secret values were shared by two environments",
+    collisionTitle:
+      "{count} secret value was shared by two environments | {count} secret values were shared by two environments",
     collisionConsequence:
-      "Before the upgrade these environment names produced the same secret identifier, so whichever value was saved later overwrote the earlier one. The overwritten value is not on disk, is not backed up, and cannot be recovered — re-enter this variable in each environment listed below. ApiSolo does not guess what it was, and does not put an empty value in its place.",
+      "Before the upgrade these environment names produced the same secret identifier, so whichever value was saved later overwrote the earlier one. The overwritten value is not on disk, is not backed up, and cannot be recovered — re-enter this variable in each environment that shared the slot. ApiSolo does not guess what it was, and does not put an empty value in its place.",
     collisionVariable: "Variable {name}",
     collisionShared:
       "Environments that shared one slot (project directory / environment file name on disk, which can differ from the project's display name):",

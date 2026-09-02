@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { createPinia, setActivePinia } from "pinia"
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }))
@@ -6,6 +6,9 @@ const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }))
 vi.mock("../../utils/invoke", () => ({ invoke: invokeMock }))
 
 import { useHistoryStore } from "../history"
+import { useConsoleStore } from "../console"
+import appPinia from "../index"
+import i18n from "../../i18n"
 import { REDACTION_SENTINEL } from "../../utils/redaction"
 import type { HistoryEntry } from "../../types"
 
@@ -199,5 +202,47 @@ describe("loadHistory reaches every field of sanitizeHistoryEntry", () => {
     expect(entry.responseHeaders).toEqual([["set-cookie", REDACTION_SENTINEL]])
     expect(JSON.stringify(entry)).not.toContain("abcdef123456")
     expect(JSON.stringify(entry)).not.toContain("hunter2")
+  })
+})
+
+/**
+ * D44 (PROCESS.md P8). `history.legacySanitized` carries "from {count} history
+ * entry. | ... entries." in the catalog and the locale matrix pins that; what it
+ * cannot see is whether this store hands `changed.length` over as the plural
+ * argument when it writes the console line. Dropping it left the suite green.
+ * The line lands in the console store on the app's own pinia (that is where
+ * `recordConsoleEntry` writes), so it is read back from there, in English.
+ */
+describe("D44 the sanitize notice counts its rows in English", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    invokeMock.mockReset()
+    useConsoleStore(appPinia).clear()
+    i18n.global.locale.value = "en"
+  })
+
+  afterEach(() => {
+    i18n.global.locale.value = "zh-CN"
+  })
+
+  it.each([
+    [1, "Removed plaintext credentials from 1 history entry."],
+    [2, "Removed plaintext credentials from 2 history entries."],
+  ])("after cleaning %i legacy row(s) the console says \"%s\"", async (count, expected) => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "load_history") {
+        return Array.from({ length: count }, (_unused, index) => legacyEntry({ id: `legacy-${index}` }))
+      }
+
+      if (command === "update_history_entries") {
+        return null
+      }
+
+      throw new Error(`Unexpected invoke: ${command}`)
+    })
+
+    await useHistoryStore().loadHistory()
+
+    expect(useConsoleStore(appPinia).entries.map((line) => line.message)).toContain(expected)
   })
 })

@@ -165,7 +165,7 @@ describe("§10 the list of pending fields is complete, and says how many there a
   it("tells the translator the real count", () => {
     mount(PendingRefillNotice, { props: { fields: thirty }, global: { plugins: [pinia] } })
 
-    expect(tMock).toHaveBeenCalledWith("history.refillTitle", { count: 30 })
+    expect(tMock).toHaveBeenCalledWith("history.refillTitle", 30)
   })
 })
 
@@ -217,7 +217,7 @@ describe("§12 the confirmation appears exactly when there is something to confi
     })
 
     expect(wrapper.find("[data-testid=\"refill-acknowledge\"]").exists()).toBe(true)
-    expect(tMock).toHaveBeenCalledWith("history.reselectFileTitle", { count: 1 })
+    expect(tMock).toHaveBeenCalledWith("history.reselectFileTitle", 1)
     expect(tMock).not.toHaveBeenCalledWith("history.refillTitle", expect.anything())
   })
 })

@@ -49,7 +49,9 @@ const entries = computed(() => {
   return [];
 });
 
-const itemCountLabel = computed(() => `${entries.value.length} ${t("response.items")}`);
+const itemCountLabel = computed(
+  () => `${entries.value.length} ${t("response.items", entries.value.length)}`,
+);
 const linePadding = computed(() => ({ paddingLeft: `${props.depth * 20}px` }));
 
 function toggleExpanded() {

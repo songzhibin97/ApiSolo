@@ -7,7 +7,7 @@ const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }))
 
 vi.mock("../../utils/invoke", () => ({ invoke: invokeMock }))
 
-const passthroughT = (key: string, _params?: Record<string, unknown>) => key
+const passthroughT = (key: string, ..._args: unknown[]) => key
 const tMock = vi.fn(passthroughT)
 
 // Partial: the store chain pulls in src/i18n/index.ts, which needs the real
@@ -395,7 +395,7 @@ describe("§23/§24/§25/§26 the health of the file is read, shown, and re-read
     const wrapper = await mountPanel([])
 
     expect(wrapper.find("[data-testid=\"history-health-notice\"]").exists()).toBe(true)
-    expect(tMock).toHaveBeenCalledWith("history.healthBadRows", { count: 3 })
+    expect(tMock).toHaveBeenCalledWith("history.healthBadRows", 3)
   })
 
   // The escape hatch. With every line unreadable the list is empty, and a clear
@@ -467,7 +467,7 @@ describe("§48/§49 the clear confirmation counts what it is about to delete", (
 
     await mountPanel([entry({ id: "a" }), entry({ id: "b", url: "https://api.example.com/b" })])
 
-    expect(tMock).toHaveBeenCalledWith("history.clearConfirm", { count: 4 })
+    expect(tMock).toHaveBeenCalledWith("history.clearConfirm", 4)
   })
 
   it("§48 says three, not zero, for a file with three bad lines and nothing else", async () => {
@@ -478,9 +478,10 @@ describe("§48/§49 the clear confirmation counts what it is about to delete", (
     // The first render happens before the health counts come back, so what
     // matters is the count standing once they have: that is the number on
     // screen when the confirmation is read.
+    // The count is the plural argument, so English can say "entry" for one.
     const counts = tMock.mock.calls
       .filter(([key]) => key === "history.clearConfirm")
-      .map(([, params]) => (params as { count: number }).count)
+      .map(([, count]) => count as number)
     expect(counts.length).toBeGreaterThan(0)
     expect(counts[counts.length - 1]).toBe(3)
   })
@@ -492,13 +493,18 @@ describe("§48/§49 the clear confirmation counts what it is about to delete", (
       entry({ id: "c", url: "https://api.example.com/c" }),
     ])
 
-    expect(tMock).toHaveBeenCalledWith("history.clearWithStarred", { starred: 2 })
+    // `{starred}` is not a name vue-i18n reads the plural choice from, so the
+    // number travels twice: once for the sentence, once to pick "entry" or
+    // "entries".
+    expect(tMock).toHaveBeenCalledWith("history.clearWithStarred", { starred: 2 }, 2)
   })
 
   it("§49 says nothing about starred entries when there are none", async () => {
     await mountPanel([entry({ id: "a" })])
 
-    expect(tMock).not.toHaveBeenCalledWith("history.clearWithStarred", expect.anything())
+    // Matched on the key alone: a `not.toHaveBeenCalledWith` pinned to one
+    // argument shape passes vacuously the day the call grows an argument.
+    expect(tMock.mock.calls.some(([key]) => key === "history.clearWithStarred")).toBe(false)
   })
 })
 

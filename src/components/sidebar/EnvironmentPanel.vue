@@ -285,7 +285,7 @@ async function confirmDeleteEnvironment() {
         class="mt-3 rounded border border-amber-400/50 bg-[color-mix(in_srgb,#f59e0b_10%,transparent)] p-3"
       >
         <div class="text-sm font-semibold text-amber-300">
-          {{ t("environment.collisionTitle", { count: collisions.length }) }}
+          {{ t("environment.collisionTitle", collisions.length) }}
         </div>
         <div class="mt-2 text-sm leading-6 text-[var(--text-secondary)]">
           {{ t("environment.collisionConsequence") }}

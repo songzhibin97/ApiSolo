@@ -63,12 +63,15 @@ const depthOptions = computed(() => [1, 2, 3, 4])
 const clearBlocked = computed(() => entries.value.length === 0 && badRows.value === 0)
 
 const clearMessage = computed(() => {
-  const total = t("history.clearConfirm", { count: clearableCount.value })
+  // Counts go in as vue-i18n's plural argument so English can pick "entry" or
+  // "entries"; `{starred}` is not a name vue-i18n reads the choice from, so
+  // that sentence gets the number twice.
+  const total = t("history.clearConfirm", clearableCount.value)
 
   // No "including 0 starred" filler: a clause that is always there stops being
   // read.
   return starredCount.value > 0
-    ? `${total} ${t("history.clearWithStarred", { starred: starredCount.value })}`
+    ? `${total} ${t("history.clearWithStarred", { starred: starredCount.value }, starredCount.value)}`
     : total
 })
 
@@ -347,7 +350,7 @@ async function clearHistory() {
         class="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-200"
       >
         <AlertTriangle :size="14" class="mt-0.5 shrink-0" />
-        <span>{{ t("history.healthBadRows", { count: badRows }) }}</span>
+        <span>{{ t("history.healthBadRows", badRows) }}</span>
       </div>
 
       <div

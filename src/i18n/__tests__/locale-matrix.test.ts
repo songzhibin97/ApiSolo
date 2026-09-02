@@ -30,11 +30,11 @@ const MATRIX: Record<string, { "zh-CN": string; en: string }> = {
   },
   "history.refillTitle": {
     "zh-CN": "以下 {count} 个字段在历史中已脱敏，保存后为空，需要重新填写：",
-    en: "These {count} fields were redacted in history and will be saved empty. They must be re-entered:",
+    en: "This field was redacted in history and will be saved empty. It must be re-entered: | These {count} fields were redacted in history and will be saved empty. They must be re-entered:",
   },
   "history.reselectFileTitle": {
     "zh-CN": "以下 {count} 个文件需要重新选择——历史不保存文件内容：",
-    en: "These {count} files must be re-selected — history does not store file contents:",
+    en: "This file must be re-selected — history does not store file contents: | These {count} files must be re-selected — history does not store file contents:",
   },
   "history.refillAck": {
     "zh-CN": "我知道保存下来的请求需要重填这些字段",
@@ -50,7 +50,7 @@ const MATRIX: Record<string, { "zh-CN": string; en: string }> = {
   },
   "history.healthBadRows": {
     "zh-CN": "有 {count} 行历史记录无法解析，它们不会显示在列表里。清空历史仍然可用。",
-    en: "{count} history lines cannot be parsed and are not shown in the list. Clear History still works.",
+    en: "{count} history line cannot be parsed and is not shown in the list. Clear History still works. | {count} history lines cannot be parsed and are not shown in the list. Clear History still works.",
   },
   "history.note": {
     "zh-CN": "备注",
@@ -74,7 +74,7 @@ const MATRIX: Record<string, { "zh-CN": string; en: string }> = {
   },
   "history.clearWithStarred": {
     "zh-CN": "其中有 {starred} 条是收藏，将一并删除。",
-    en: "This includes {starred} starred entries, which will be deleted as well.",
+    en: "This includes {starred} starred entry, which will be deleted as well. | This includes {starred} starred entries, which will be deleted as well.",
   },
   "response.binaryBody": {
     "zh-CN": "这是二进制响应体，不能作为文本显示。",
@@ -82,12 +82,12 @@ const MATRIX: Record<string, { "zh-CN": string; en: string }> = {
   },
   "environment.collisionTitle": {
     "zh-CN": "有 {count} 个密钥值曾被两个环境共用",
-    en: "{count} secret values were shared by two environments",
+    en: "{count} secret value was shared by two environments | {count} secret values were shared by two environments",
   },
   "environment.collisionConsequence": {
     "zh-CN":
-      "这些环境名在升级前生成了相同的密钥标识，后保存的值覆盖了先保存的。被覆盖的那个值不在磁盘上，也没有备份，无法恢复——请在下面列出的每个环境里重新填写这个变量。ApiSolo 不会猜它是什么，也不会用空值顶替。",
-    en: "Before the upgrade these environment names produced the same secret identifier, so whichever value was saved later overwrote the earlier one. The overwritten value is not on disk, is not backed up, and cannot be recovered — re-enter this variable in each environment listed below. ApiSolo does not guess what it was, and does not put an empty value in its place.",
+      "这些环境名在升级前生成了相同的密钥标识，后保存的值覆盖了先保存的。被覆盖的那个值不在磁盘上，也没有备份，无法恢复——请在共用过这个格子的每个环境里重新填写这个变量。ApiSolo 不会猜它是什么，也不会用空值顶替。",
+    en: "Before the upgrade these environment names produced the same secret identifier, so whichever value was saved later overwrote the earlier one. The overwritten value is not on disk, is not backed up, and cannot be recovered — re-enter this variable in each environment that shared the slot. ApiSolo does not guess what it was, and does not put an empty value in its place.",
   },
   "environment.collisionVariable": {
     "zh-CN": "变量 {name}",
@@ -226,35 +226,302 @@ describe("§59 every key this slice touches matches the spec table word for word
     }
   })
 })
+
+/** Every leaf of a catalog as `[dotted key, message]`, in source order. */
+function flatten(node: unknown, prefix = ""): Array<[string, string]> {
+  if (typeof node === "string") {
+    return [[prefix, node]]
+  }
+  return Object.entries(node as Record<string, unknown>).flatMap(([key, child]) =>
+    flatten(child, prefix ? `${prefix}.${key}` : key),
+  )
+}
+
+/**
+ * D44: an English sentence that sets a noun beside a runtime count carries both
+ * forms, split on vue-i18n's `|`, and the count goes in as the plural argument.
+ * The raw matrix above cannot see this defect -- "{count} requests" is what it
+ * is -- so these read the *rendered* sentence at one and at two.
+ *
+ * Chinese has no form to pick, so its row is one plain sentence. Three things
+ * are asserted about it: the rendering at one equals the column; the rendering
+ * at two equals the column with its single `1` (the count) swapped for `2`; and
+ * the source carries no `|`. Which of the three catches an edit depends on the
+ * edit. A wording change (项 → 项目) reddens the rendering at one and at two
+ * while the source check stays green. A `|` that splits the sentence into two
+ * different halves reddens the rendering at two and the source check while the
+ * rendering at one stays green. Identical halves (`X | X`) render whole at both
+ * counts and only the source check sees them. A placeholder written out as a
+ * digit (`{count}` → `1`) renders the same sentence at both counts, so the
+ * rendering at one still matches and the source still has no `|`: only the
+ * rendering at two reddens. That last edit -- a translator hard-coding the
+ * number -- is the defect the rendering at two alone catches, and the reason it
+ * is kept. For `response.items` the column is `项`, which carries no `1`, so
+ * the `1` → `2` swap is an identity on that row and the renderings at one and
+ * at two are held to the same text.
+ *
+ * `named` marks the one key whose placeholder is not `{count}`. vue-i18n reads
+ * the choice from a named `count`/`n` or from the plural argument, nothing
+ * else, so that call has to pass the number both ways.
+ */
+const COUNTED: Record<string, { one: string; many: string; "zh-CN": string; named?: string }> = {
+  "response.bodyCharacterCount": {
+    one: "1 character",
+    many: "2 characters",
+    "zh-CN": "1 个字符",
+  },
+  "response.items": {
+    one: "item",
+    many: "items",
+    "zh-CN": "项",
+  },
+  "import.requestCount": {
+    one: "Will import 1 request",
+    many: "Will import 2 requests",
+    "zh-CN": "将导入 1 个请求",
+  },
+  "history.legacySanitized": {
+    one: "Removed plaintext credentials from 1 history entry.",
+    many: "Removed plaintext credentials from 2 history entries.",
+    "zh-CN": "已清理 1 条历史记录中的明文凭据。",
+  },
+  "history.clearConfirm": {
+    one: "Clear 1 history entry? This action cannot be undone.",
+    many: "Clear all 2 history entries? This action cannot be undone.",
+    "zh-CN": "清除全部 1 条历史记录？此操作无法撤销。",
+  },
+  "history.clearWithStarred": {
+    named: "starred",
+    one: "This includes 1 starred entry, which will be deleted as well.",
+    many: "This includes 2 starred entries, which will be deleted as well.",
+    "zh-CN": "其中有 1 条是收藏，将一并删除。",
+  },
+  "history.refillTitle": {
+    one: "This field was redacted in history and will be saved empty. It must be re-entered:",
+    many: "These 2 fields were redacted in history and will be saved empty. They must be re-entered:",
+    "zh-CN": "以下 1 个字段在历史中已脱敏，保存后为空，需要重新填写：",
+  },
+  "history.refillUnparseableBody": {
+    one: "The request body is not valid JSON, so ApiSolo cannot tell whether the redacted field in it has been re-entered. Make the body valid JSON, or switch the body type, and this notice goes away.",
+    many: "The request body is not valid JSON, so ApiSolo cannot tell whether the 2 redacted fields in it have been re-entered. Make the body valid JSON, or switch the body type, and this notice goes away.",
+    "zh-CN":
+      "请求体不是合法 JSON，无法确认其中 1 个已脱敏的字段是否已经重新填写。把请求体改成合法 JSON，或换一个请求体类型，这条提示就会消失。",
+  },
+  "history.reselectFileTitle": {
+    one: "This file must be re-selected — history does not store file contents:",
+    many: "These 2 files must be re-selected — history does not store file contents:",
+    "zh-CN": "以下 1 个文件需要重新选择——历史不保存文件内容：",
+  },
+  "history.healthBadRows": {
+    one: "1 history line cannot be parsed and is not shown in the list. Clear History still works.",
+    many: "2 history lines cannot be parsed and are not shown in the list. Clear History still works.",
+    "zh-CN": "有 1 行历史记录无法解析，它们不会显示在列表里。清空历史仍然可用。",
+  },
+  "environment.collisionTitle": {
+    one: "1 secret value was shared by two environments",
+    many: "2 secret values were shared by two environments",
+    "zh-CN": "有 1 个密钥值曾被两个环境共用",
+  },
+}
+
+function rendered(locale: "zh-CN" | "en", key: string, count: number, named?: string): string {
+  i18n.global.locale.value = locale
+  return named ? i18n.global.t(key, { [named]: count }, count) : i18n.global.t(key, count)
+}
+
+describe("D44 a counted sentence agrees with its count", () => {
+  it.each(Object.entries(COUNTED))("%s reads singular at one in English", (key, expected) => {
+    expect(`en@1: ${rendered("en", key, 1, expected.named)}`).toBe(`en@1: ${expected.one}`)
+  })
+
+  it.each(Object.entries(COUNTED))("%s reads plural at two in English", (key, expected) => {
+    expect(`en@2: ${rendered("en", key, 2, expected.named)}`).toBe(`en@2: ${expected.many}`)
+  })
+
+  it.each(Object.entries(COUNTED))("%s reads as one plain sentence in zh-CN", (key, expected) => {
+    expect(`zh-CN@1: ${rendered("zh-CN", key, 1, expected.named)}`).toBe(
+      `zh-CN@1: ${expected["zh-CN"]}`,
+    )
+  })
+
+  it.each(Object.entries(COUNTED))("%s reads the same sentence at two in zh-CN", (key, expected) => {
+    expect(`zh-CN@2: ${rendered("zh-CN", key, 2, expected.named)}`).toBe(
+      `zh-CN@2: ${expected["zh-CN"].replace("1", "2")}`,
+    )
+  })
+
+  it.each(Object.keys(COUNTED))("%s carries no plural split in its zh-CN source", (key) => {
+    const source = rawMessage("zh-CN", key)
+    expect(typeof source).toBe("string")
+    expect(`${key}: ${source}`).not.toContain("|")
+  })
+})
+
+/**
+ * Every placeholder in the English catalog, sorted by what a caller puts in it.
+ * The inventory was read out of the catalog, not from memory:
+ *
+ *   grep -oE '\{[A-Za-z_][A-Za-z0-9_]*\}' src/i18n/en.ts | sort | uniq -c
+ *
+ * `count`, `starred` and `index` take a number. The rest take a field name, a
+ * URL, a method, a timestamp, a file path, a format name, a size already
+ * formatted with its unit (`{limit}`, `{size}`), or a sentence already rendered
+ * (`{characters}` is `bodyCharacterCount` at its count). Which side a name
+ * belongs on is a reading of its call sites, done by hand; that the inventory
+ * is complete is asserted, so a new placeholder fails until it is sorted.
+ */
+const PLACEHOLDERS = {
+  numeric: ["count", "starred", "index"],
+  text: ["at", "characters", "field", "fields", "format", "key", "limit", "method", "name", "path", "size", "url", "variable"],
+}
+
+const PLACEHOLDER = /\{([A-Za-z_][A-Za-z0-9_]*)\}/g
+const NUMERIC_PLACEHOLDER = new RegExp(`\\{(${PLACEHOLDERS.numeric.join("|")})\\}`)
+
+/**
+ * English messages that interpolate a number but set no noun beside it, so
+ * there is no form to agree. An exception is granted to a sentence, not to a
+ * key: the text is pinned, and a rewrite that puts a noun after the number
+ * ("{count} dropped messages") fails here until the sentence is split and given
+ * a COUNTED row, or the pin is moved on purpose. An entry whose key is not in
+ * the catalog, whose text carries no number, or whose text carries a `|` fails
+ * too, so the list cannot go stale.
+ */
+const NO_NOUN: Record<string, { text: string; reason: string }> = {
+  "ws.droppedMessages": {
+    text: "{count} dropped",
+    reason: "the count stands alone; nothing follows it to agree with",
+  },
+  "tabs.untitled": {
+    text: "Untitled {index}",
+    reason: "a serial suffix (Untitled 3), not a count of anything",
+  },
+}
+
+/**
+ * Guards the guard, and says how far it reaches. The class is derived from the
+ * catalog two ways: every English message that carries a `|` must have a
+ * COUNTED row and every row must have a `|` message (so a row cannot outlive
+ * its split, and a split cannot go unasserted); and every English message that
+ * interpolates a number must either carry a `|` or be pinned in NO_NOUN (so a
+ * counted sentence written without a split fails instead of shipping as
+ * "1 requests").
+ *
+ * What this does not reach: a sentence that concatenates a number to a
+ * translated noun in the template, with no placeholder in the catalog.
+ * `response.items` is that shape -- `JsonTreeView.vue` renders
+ * `${entries.length} ${t("response.items", entries.length)}` -- and it has a row
+ * only because a person read the call site. The catalog carries no number for
+ * it, so no scan of the catalog can find the next one. That gap is registered
+ * here, not closed.
+ */
+describe("D44 the counted class is read out of the catalog", () => {
+  it("sorts every placeholder in the English catalog as a number or as text", () => {
+    const found = new Set(
+      flatten(en).flatMap(([, text]) => [...text.matchAll(PLACEHOLDER)].map((match) => match[1])),
+    )
+    expect([...found].sort()).toEqual([...PLACEHOLDERS.numeric, ...PLACEHOLDERS.text].sort())
+  })
+
+  it("has a row for every English message that carries a plural split, and no other", () => {
+    const split = flatten(en)
+      .filter(([, text]) => text.includes("|"))
+      .map(([key]) => key)
+    expect(split.sort()).toEqual(Object.keys(COUNTED).sort())
+  })
+
+  it("splits every English message that interpolates a number, unless it is pinned as noun-free", () => {
+    const unsplit = flatten(en)
+      .filter(([key, text]) => NUMERIC_PLACEHOLDER.test(text) && !text.includes("|") && !(key in NO_NOUN))
+      .map(([key]) => key)
+    expect(unsplit).toEqual([])
+  })
+
+  it.each(Object.entries(NO_NOUN))("%s is excepted for exactly the noun-free sentence it was granted for", (key, exception) => {
+    expect(`${key}: ${rawMessage("en", key)}`).toBe(`${key}: ${exception.text}`)
+    expect(`${key} interpolates a number: ${NUMERIC_PLACEHOLDER.test(exception.text)}`).toBe(
+      `${key} interpolates a number: true`,
+    )
+    expect(`${key}: ${exception.text}`).not.toContain("|")
+  })
+})
+
 /**
  * D41 defect A: `bodyScopeFull` said "the view above" while the view renders
- * after the note in `ResponseBody.vue`. A sentence naming a layout position is
+ * after the note in `ResponseBody.vue`. D44 defect 2: `collisionConsequence`
+ * said "each environment listed below". A sentence naming a layout position is
  * a second copy of the template's ordering kept in agreement by nothing but
- * care, and the same sentence is also served as the Copy/Download `title`,
- * where a tooltip floating over the cursor has no "above" to point at.
+ * care -- reorder the template and the copy lies with no test turning red --
+ * and the scope sentence is also served as a tooltip, where a box floating
+ * over the cursor has no "above" to point at.
  *
- * The rule this pins is that the family says *what* the view is, never where
- * it sits. It reads the family out of the catalog instead of listing it, so a
- * fifth scope sentence is covered on the day someone adds it -- the verbatim
- * matrix above only guards the four that exist today.
+ * The rule this pins is that copy says *what* something is, never where it
+ * sits. It reads the whole catalog rather than one key family, so the next
+ * sentence to name a position fails here whichever section it lands in. The
+ * places a listed word is not a position are named with their reason, and an
+ * entry that stops matching fails too, so the list cannot go stale.
+ *
+ * A word list is a cost barrier, not a proof: a sentence can encode layout
+ * without using any of these words ("the panel that opens next"), and Chinese
+ * 以下 / 以上 are left out on purpose -- they name reading order, and the
+ * three catalog uses are a same-sentence referent and two colon lead-ins.
  */
 const POSITIONAL: Record<string, RegExp> = {
   en: /\b(above|below|beneath|underneath|upper|lower|top|bottom|left|right)\b/i,
   "zh-CN": /上面|下面|上方|下方|左边|右边|左侧|右侧|顶部|底部/,
 }
 
-const SCOPE_KEY = /^body(Scope|CharacterCount)/
+/**
+ * An exception is granted to a sentence, not to a key -- the NO_NOUN shape. A
+ * key-only exception waves through any listed word under that key, so "Close
+ * Tabs to the Right" rewritten as "Close Tabs to the Left" would pass while the
+ * command still closes to the right. The text is pinned instead, and the pinned
+ * text must itself carry a listed word, so an entry whose sentence stops naming
+ * a position fails too and the list cannot go stale.
+ */
+const NOT_A_POSITION: Record<string, Record<string, { text: string; reason: string }>> = {
+  en: {
+    "request.historyRedactedBanner": {
+      text: "This request came from history. These were redacted when it was saved and need re-entering: {fields}. Left empty, they are sent empty.",
+      reason: "'Left empty' is the verb leave, not a side",
+    },
+    "tabs.closeToRight": {
+      text: "Close Tabs to the Right",
+      reason: "tab order is what the command does",
+    },
+  },
+  "zh-CN": {
+    "tabs.closeToRight": {
+      text: "关闭右侧标签页",
+      reason: "标签顺序就是这条命令的语义",
+    },
+  },
+}
 
-describe("§59 the scope copy never says where the view sits", () => {
-  it.each(["zh-CN", "en"] as const)("%s scope sentences name no position", (locale) => {
-    const response = (SOURCES[locale] as { response: Record<string, string> }).response
-    const keys = Object.keys(response).filter((key) => SCOPE_KEY.test(key))
+const POSITIONAL_EXCEPTIONS: Array<[string, string, { text: string; reason: string }]> =
+  Object.entries(NOT_A_POSITION).flatMap(([locale, exceptions]) =>
+    Object.entries(exceptions).map(
+      ([key, exception]): [string, string, { text: string; reason: string }] => [locale, key, exception],
+    ),
+  )
 
-    // Guards the guard: a renamed family would otherwise make this vacuous.
-    expect(keys).toHaveLength(5)
+describe("§59 / D44 the copy never says where anything sits", () => {
+  it.each(["zh-CN", "en"] as const)("%s names no position outside the listed exceptions", (locale) => {
+    const exceptions = NOT_A_POSITION[locale]
 
-    for (const key of keys) {
-      expect(`${key}: ${POSITIONAL[locale].test(response[key])}`).toBe(`${key}: false`)
+    for (const [key, text] of flatten(SOURCES[locale])) {
+      const expected = key in exceptions
+      expect(`${key}: ${POSITIONAL[locale].test(text)}`).toBe(`${key}: ${expected}`)
     }
   })
+
+  it.each(POSITIONAL_EXCEPTIONS)(
+    "%s %s is excepted for exactly the sentence it was granted for",
+    (locale, key, exception) => {
+      expect(`${locale} ${key}: ${rawMessage(locale, key)}`).toBe(`${locale} ${key}: ${exception.text}`)
+      expect(`${key} names a listed word: ${POSITIONAL[locale].test(exception.text)}`).toBe(
+        `${key} names a listed word: true`,
+      )
+    },
+  )
 })
