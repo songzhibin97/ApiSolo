@@ -121,7 +121,7 @@ export const useHistoryStore = defineStore("history", () => {
       await invoke("update_history_entries", { entries: changed })
       recordConsoleEntry(
         "info",
-        i18n.global.t("history.legacySanitized", { count: changed.length }),
+        i18n.global.t("history.legacySanitized", changed.length),
         "app",
       )
     } catch (error) {

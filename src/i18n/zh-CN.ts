@@ -300,7 +300,7 @@ export default {
     nameRequired: "环境名称",
     collisionTitle: "有 {count} 个密钥值曾被两个环境共用",
     collisionConsequence:
-      "这些环境名在升级前生成了相同的密钥标识，后保存的值覆盖了先保存的。被覆盖的那个值不在磁盘上，也没有备份，无法恢复——请在下面列出的每个环境里重新填写这个变量。ApiSolo 不会猜它是什么，也不会用空值顶替。",
+      "这些环境名在升级前生成了相同的密钥标识，后保存的值覆盖了先保存的。被覆盖的那个值不在磁盘上，也没有备份，无法恢复——请在共用过这个格子的每个环境里重新填写这个变量。ApiSolo 不会猜它是什么，也不会用空值顶替。",
     collisionVariable: "变量 {name}",
     collisionShared: "共用同一个格子的环境（磁盘上的项目目录名 / 环境文件名，可能与项目显示名不同）：",
     collisionDetectedAt: "发现于 {at}",

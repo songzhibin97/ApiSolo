@@ -461,7 +461,7 @@ onUnmounted(() => {
         {{ t("request.historyRedactedBanner", { fields: refillFieldLabels }) }}
       </p>
       <div v-if="unverifiableNotice.length > 0" data-testid="history-redacted-banner-unverifiable">
-        <p>{{ t("history.refillUnparseableBody", { count: unverifiableNotice.length }) }}</p>
+        <p>{{ t("history.refillUnparseableBody", unverifiableNotice.length) }}</p>
         <!--
           The names still get listed. The user needs to know which fields the
           message is about, and the sentence above only carries how many.
