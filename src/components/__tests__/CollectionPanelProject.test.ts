@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { mount } from "@vue/test-utils"
 import { createPinia, setActivePinia } from "pinia"
 
@@ -41,8 +41,11 @@ const { invokeMock, state } = vi.hoisted(() => {
 
 vi.mock("../../utils/invoke", () => ({ invoke: invokeMock }))
 
+import { createI18n } from "vue-i18n"
+
 import CollectionPanel from "../sidebar/CollectionPanel.vue"
 import { useProjectsStore } from "../../stores/projects"
+import en from "../../i18n/en"
 
 let pinia: ReturnType<typeof createPinia>
 
@@ -110,5 +113,73 @@ describe("the project description is on screen", () => {
     const wrapper = await mountPanel()
 
     expect(wrapper.find('[data-testid="active-project-description"]').exists()).toBe(false)
+  })
+})
+
+/**
+ * D44 (PROCESS.md P8). `import.requestCount` carries "Will import {count}
+ * request | ... requests" in the catalog and the locale matrix pins that; what
+ * it cannot see is whether this panel hands `importPreview.requests.length`
+ * over as the plural argument. Dropping it left the suite green. The real
+ * English catalog goes behind the spy (a numeric second argument forwarded as
+ * the plural), a Postman file is picked through the dialog's own input, and the
+ * preview line is read as the user would read it.
+ */
+describe("D44 the import preview counts its requests in English", () => {
+  const realEn = createI18n({
+    legacy: false,
+    locale: "en",
+    fallbackLocale: false as const,
+    messages: { en },
+  })
+
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+    invokeMock.mockClear()
+    window.localStorage.clear()
+    // One project, so the import button is enabled.
+    state.projects = [{ name: "Alpha", description: "" }]
+    t.mockImplementation((key: string, arg?: number | Record<string, unknown>) =>
+      typeof arg === "number" ? realEn.global.t(key, arg) : realEn.global.t(key, arg ?? {}),
+    )
+  })
+
+  afterEach(() => {
+    t.mockImplementation((key: string) => key)
+  })
+
+  function postmanCollection(requestCount: number) {
+    return JSON.stringify({
+      info: {
+        name: "Imported",
+        schema: "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+      },
+      item: Array.from({ length: requestCount }, (_unused, index) => ({
+        name: `Request ${index}`,
+        request: { method: "GET", url: { raw: `https://api.example.com/${index}` }, header: [] },
+      })),
+    })
+  }
+
+  it.each([
+    [1, "Will import 1 request"],
+    [2, "Will import 2 requests"],
+  ])("a file with %i request(s) previews as \"%s\"", async (count, expected) => {
+    const wrapper = await mountPanel()
+    await wrapper.get(`button[aria-label="${en.import.import}"]`).trigger("click")
+
+    const input = wrapper.get('input[type="file"]')
+    Object.defineProperty(input.element, "files", {
+      value: [new File([postmanCollection(count)], "collection.json", { type: "application/json" })],
+      configurable: true,
+    })
+    await input.trigger("change")
+
+    // The file is read through FileReader, which completes off the microtask
+    // queue; poll until the preview is on screen or the timeout says it never was.
+    await vi.waitFor(() => {
+      expect(wrapper.findAll("div").map((node) => node.text())).toContain(expected)
+    })
   })
 })

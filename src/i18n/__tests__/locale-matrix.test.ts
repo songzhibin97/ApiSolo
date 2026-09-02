@@ -246,13 +246,18 @@ function flatten(node: unknown, prefix = ""): Array<[string, string]> {
  * Chinese has no form to pick, so its row is one plain sentence. Three things
  * are asserted about it: the rendering at one equals the column; the rendering
  * at two equals the column with its single `1` (the count) swapped for `2`; and
- * the source carries no `|`. A `|` that splits the sentence into two different
- * halves reddens both the rendering at two and the source check; identical
- * halves (`X | X`) render whole at two and only the source check sees them. No
- * catalog edit reddens the rendering at two on its own -- vue-i18n has nothing
- * to choose from in a one-form message -- so that assertion is redundant with
- * the source check for catalog mutations and is kept because it pins the text
- * the user sees, not the character.
+ * the source carries no `|`. No catalog edit reddens the rendering at two on its
+ * own, and which assertion it is redundant with depends on the edit. A wording
+ * change (项 → 项目) reddens the rendering at one and at two while the source
+ * check stays green, so for that edit it is redundant with the rendering at
+ * one. A `|` that splits the sentence into two different halves reddens the
+ * rendering at two and the source check while the rendering at one stays
+ * green, so only for that edit is it redundant with the source check.
+ * Identical halves (`X | X`) render whole at two and only the source check sees
+ * them. It is kept because it pins the text the user sees at two, not the
+ * character. For `response.items` the column is `项`, which carries no `1`, so
+ * the `1` → `2` swap is an identity on that row and the renderings at one and
+ * at two are held to the same text.
  *
  * `named` marks the one key whose placeholder is not `{count}`. vue-i18n reads
  * the choice from a named `count`/`n` or from the plural argument, nothing
@@ -465,15 +470,39 @@ const POSITIONAL: Record<string, RegExp> = {
   "zh-CN": /上面|下面|上方|下方|左边|右边|左侧|右侧|顶部|底部/,
 }
 
-const NOT_A_POSITION: Record<string, Record<string, string>> = {
+/**
+ * An exception is granted to a sentence, not to a key -- the NO_NOUN shape. A
+ * key-only exception waves through any listed word under that key, so "Close
+ * Tabs to the Right" rewritten as "Close Tabs to the Left" would pass while the
+ * command still closes to the right. The text is pinned instead, and the pinned
+ * text must itself carry a listed word, so an entry whose sentence stops naming
+ * a position fails too and the list cannot go stale.
+ */
+const NOT_A_POSITION: Record<string, Record<string, { text: string; reason: string }>> = {
   en: {
-    "request.historyRedactedBanner": "'Left empty' is the verb leave, not a side",
-    "tabs.closeToRight": "tab order is what the command does",
+    "request.historyRedactedBanner": {
+      text: "This request came from history. These were redacted when it was saved and need re-entering: {fields}. Left empty, they are sent empty.",
+      reason: "'Left empty' is the verb leave, not a side",
+    },
+    "tabs.closeToRight": {
+      text: "Close Tabs to the Right",
+      reason: "tab order is what the command does",
+    },
   },
   "zh-CN": {
-    "tabs.closeToRight": "标签顺序就是这条命令的语义",
+    "tabs.closeToRight": {
+      text: "关闭右侧标签页",
+      reason: "标签顺序就是这条命令的语义",
+    },
   },
 }
+
+const POSITIONAL_EXCEPTIONS: Array<[string, string, { text: string; reason: string }]> =
+  Object.entries(NOT_A_POSITION).flatMap(([locale, exceptions]) =>
+    Object.entries(exceptions).map(
+      ([key, exception]): [string, string, { text: string; reason: string }] => [locale, key, exception],
+    ),
+  )
 
 describe("§59 / D44 the copy never says where anything sits", () => {
   it.each(["zh-CN", "en"] as const)("%s names no position outside the listed exceptions", (locale) => {
@@ -484,4 +513,14 @@ describe("§59 / D44 the copy never says where anything sits", () => {
       expect(`${key}: ${POSITIONAL[locale].test(text)}`).toBe(`${key}: ${expected}`)
     }
   })
+
+  it.each(POSITIONAL_EXCEPTIONS)(
+    "%s %s is excepted for exactly the sentence it was granted for",
+    (locale, key, exception) => {
+      expect(`${locale} ${key}: ${rawMessage(locale, key)}`).toBe(`${locale} ${key}: ${exception.text}`)
+      expect(`${key} names a listed word: ${POSITIONAL[locale].test(exception.text)}`).toBe(
+        `${key} names a listed word: true`,
+      )
+    },
+  )
 })

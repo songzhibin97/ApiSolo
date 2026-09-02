@@ -7,7 +7,12 @@ import { createI18n } from "vue-i18n"
 import RequestPanel from "../panels/RequestPanel.vue"
 import PendingRefillNotice from "../request/PendingRefillNotice.vue"
 import { useTabsStore } from "../../stores/tabs"
-import { pendingRefillFields, type PendingField, type PendingKind } from "../../utils/pending-refill"
+import {
+  pendingRefillFields,
+  type NonAuthSource,
+  type PendingField,
+  type PendingKind,
+} from "../../utils/pending-refill"
 import { REDACTION_SENTINEL } from "../../utils/redaction"
 import en from "../../i18n/en"
 import zhCN from "../../i18n/zh-CN"
@@ -69,6 +74,15 @@ function entry(overrides: Partial<HistoryEntry> = {}): HistoryEntry {
  */
 const UNPARSEABLE_JSON_BODY = `{\n  token: ${REDACTION_SENTINEL}\n}`
 
+function kindsOf(tab: Parameters<typeof pendingRefillFields>[0]): PendingKind[] {
+  return pendingRefillFields(tab).map((field) => field.kind)
+}
+
+/** Every node the selector matches, as the text it shows, to exact-match one of. */
+function texts(root: { findAll(selector: string): Array<{ text(): string }> }, selector: string) {
+  return root.findAll(selector).map((node) => node.text())
+}
+
 describe("§8 §10 §11 §17 the standing notice tells the user which state the request is in", () => {
   beforeEach(() => {
     pinia = createPinia()
@@ -83,10 +97,6 @@ describe("§8 §10 §11 §17 the standing notice tells the user which state the 
       tabs,
       wrapper: shallowMount(RequestPanel, { global: { plugins: [pinia, i18nFor(locale)] } }),
     }
-  }
-
-  function kindsOf(tab: Parameters<typeof pendingRefillFields>[0]): PendingKind[] {
-    return pendingRefillFields(tab).map((field) => field.kind)
   }
 
   // Mutating `formatPendingField(field, t)` to a bare `field.name` in the panel
@@ -237,4 +247,79 @@ describe("§8 §17 the save dialog's list keeps the classes apart on screen", ()
 
     expect(rows).toEqual(expected)
   })
+})
+
+/**
+ * D44 (PROCESS.md P8). The catalog side -- that each counted sentence carries a
+ * singular and a plural -- is pinned in `locale-matrix.test.ts`, which reads the
+ * catalog through a `t()` call of its own and so cannot see whether a component
+ * hands its count over as the plural argument. Dropping that argument at
+ * `RequestPanel.vue`'s banner and at each `PendingRefillNotice.vue` heading left
+ * the whole suite green. These read what the component puts on screen at one
+ * and at two. vue-i18n falls back to the first form when no count is given, so
+ * the row at two is the one that catches a dropped argument; the row at one
+ * pins the other direction, a heading that says "these" over a single field.
+ */
+describe("D44 the counted headings agree with their count on screen", () => {
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+  })
+
+  const UNVERIFIABLE_ONE =
+    "The request body is not valid JSON, so ApiSolo cannot tell whether the redacted field in it has been re-entered. Make the body valid JSON, or switch the body type, and this notice goes away."
+  const UNVERIFIABLE_TWO =
+    "The request body is not valid JSON, so ApiSolo cannot tell whether the 2 redacted fields in it have been re-entered. Make the body valid JSON, or switch the body type, and this notice goes away."
+
+  // Two sensitive keys, each on its own line with the placeholder bare after the
+  // colon, no comma between them: the text fallback reads both names and the
+  // body still does not parse.
+  const TWO_UNPARSEABLE_JSON_BODY = `{\n  token: ${REDACTION_SENTINEL}\n  secret: ${REDACTION_SENTINEL}\n}`
+
+  it.each([
+    [1, UNPARSEABLE_JSON_BODY, ["refill-unverifiable"], UNVERIFIABLE_ONE],
+    [2, TWO_UNPARSEABLE_JSON_BODY, ["refill-unverifiable", "refill-unverifiable"], UNVERIFIABLE_TWO],
+  ] as Array<[number, string, PendingKind[], string]>)(
+    "the banner over %i unverifiable field(s) counts them in English",
+    (_count, body, kinds, expected) => {
+      const tabs = useTabsStore()
+      tabs.openHistoryEntry(entry({ requestBodyType: "json", requestBodyContent: body }))
+      // Fixture check first: the sentence is only worth reading if the tab really
+      // carries this many fields of this class.
+      expect(kindsOf(tabs.activeTab)).toEqual(kinds)
+
+      const wrapper = shallowMount(RequestPanel, { global: { plugins: [pinia, i18nFor("en")] } })
+
+      const banner = wrapper.get("[data-testid=\"history-redacted-banner-unverifiable\"]")
+      expect(texts(banner, "p")).toContain(expected)
+    },
+  )
+
+  // The group's test id is not derived from the kind (the unverifiable group is
+  // `pending-group-unverifiable`), so each row names the node it reads.
+  it.each([
+    ["refill", 1, "header", "pending-group-refill", "This field was redacted in history and will be saved empty. It must be re-entered:"],
+    ["refill", 2, "header", "pending-group-refill", "These 2 fields were redacted in history and will be saved empty. They must be re-entered:"],
+    ["refill-unverifiable", 1, "body", "pending-group-unverifiable", UNVERIFIABLE_ONE],
+    ["refill-unverifiable", 2, "body", "pending-group-unverifiable", UNVERIFIABLE_TWO],
+    ["reselect-file", 1, "file", "pending-group-reselect-file", "This file must be re-selected — history does not store file contents:"],
+    ["reselect-file", 2, "file", "pending-group-reselect-file", "These 2 files must be re-selected — history does not store file contents:"],
+  ] as Array<[PendingKind, number, NonAuthSource, string, string]>)(
+    "the %s heading over %i field(s) counts them in English",
+    (kind, count, source, testId, expected) => {
+      const fields: PendingField[] = Array.from({ length: count }, (_unused, index) => ({
+        kind,
+        source,
+        name: `field-${index}`,
+      }))
+
+      const wrapper = mount(PendingRefillNotice, {
+        props: { fields },
+        global: { plugins: [pinia, i18nFor("en")] },
+      })
+
+      const group = wrapper.get(`[data-testid="${testId}"]`)
+      expect(texts(group, "div")).toContain(expected)
+    },
+  )
 })

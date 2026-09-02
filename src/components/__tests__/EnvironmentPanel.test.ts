@@ -26,6 +26,7 @@ import ConfirmDialog from "../ui/ConfirmDialog.vue"
 import InlineError from "../ui/InlineError.vue"
 import { useEnvironmentsStore } from "../../stores/environments"
 import { useProjectsStore } from "../../stores/projects"
+import en from "../../i18n/en"
 import zhCN from "../../i18n/zh-CN"
 import type { EnvVariable, SecretKeyCollision } from "../../types"
 
@@ -544,5 +545,46 @@ describe("D08 §10 a rejected draft's reason is visible on the panel", () => {
     expect(wrapper.findComponent(InlineError).props("message")).toBe(
       "Environment already exists: staging",
     )
+  })
+})
+
+/**
+ * D44 (PROCESS.md P8). `environment.collisionTitle` carries "1 secret value
+ * was | 2 secret values were" in the catalog, and the locale matrix pins that;
+ * what it cannot see is whether this panel hands `collisions.length` over as
+ * the plural argument. Dropping the argument at the call site left the suite
+ * green. Same device as D13 §14: the real catalog behind the spy, English this
+ * time, forwarding a numeric second argument as the plural so the call is
+ * rendered exactly as vue-i18n would render it in the app.
+ */
+describe("D44 the collision title counts its records in English", () => {
+  function useEnglishCatalog() {
+    const realEn = createI18n({
+      legacy: false,
+      locale: "en",
+      fallbackLocale: false as const,
+      messages: { en },
+    })
+    t.mockImplementation((key: string, arg?: number | Record<string, unknown>) =>
+      typeof arg === "number" ? realEn.global.t(key, arg) : realEn.global.t(key, arg ?? {}),
+    )
+  }
+
+  const second = collisionRecord({
+    legacyVaultKey: "my-api:__:c2Vzc2lvbg",
+    variableKey: "session",
+  })
+
+  it.each([
+    [1, "1 secret value was shared by two environments"],
+    [2, "2 secret values were shared by two environments"],
+  ])("over %i record(s) the title reads \"%s\"", async (count, expected) => {
+    useEnglishCatalog()
+    stubBackend({ collisions: [collisionRecord(), second].slice(0, count) })
+    const wrapper = mountPanel()
+    await settle()
+
+    const section = wrapper.get('[data-testid="collision-section"]')
+    expect(section.findAll("div").map((node) => node.text())).toContain(expected)
   })
 })
