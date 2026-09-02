@@ -246,16 +246,17 @@ function flatten(node: unknown, prefix = ""): Array<[string, string]> {
  * Chinese has no form to pick, so its row is one plain sentence. Three things
  * are asserted about it: the rendering at one equals the column; the rendering
  * at two equals the column with its single `1` (the count) swapped for `2`; and
- * the source carries no `|`. No catalog edit reddens the rendering at two on its
- * own, and which assertion it is redundant with depends on the edit. A wording
- * change (项 → 项目) reddens the rendering at one and at two while the source
- * check stays green, so for that edit it is redundant with the rendering at
- * one. A `|` that splits the sentence into two different halves reddens the
- * rendering at two and the source check while the rendering at one stays
- * green, so only for that edit is it redundant with the source check.
- * Identical halves (`X | X`) render whole at two and only the source check sees
- * them. It is kept because it pins the text the user sees at two, not the
- * character. For `response.items` the column is `项`, which carries no `1`, so
+ * the source carries no `|`. Which of the three catches an edit depends on the
+ * edit. A wording change (项 → 项目) reddens the rendering at one and at two
+ * while the source check stays green. A `|` that splits the sentence into two
+ * different halves reddens the rendering at two and the source check while the
+ * rendering at one stays green. Identical halves (`X | X`) render whole at both
+ * counts and only the source check sees them. A placeholder written out as a
+ * digit (`{count}` → `1`) renders the same sentence at both counts, so the
+ * rendering at one still matches and the source still has no `|`: only the
+ * rendering at two reddens. That last edit -- a translator hard-coding the
+ * number -- is the defect the rendering at two alone catches, and the reason it
+ * is kept. For `response.items` the column is `项`, which carries no `1`, so
  * the `1` → `2` swap is an identity on that row and the renderings at one and
  * at two are held to the same text.
  *
